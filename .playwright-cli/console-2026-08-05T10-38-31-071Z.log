@@ -1,0 +1,42 @@
+[   49814ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse-panel
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[   49815ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[   59835ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse-panel
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[   59836ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[  134716ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse-panel
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[  134716ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[  149194ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse-panel
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[  149194ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[  307550ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse-panel
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[  307550ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[  325252ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse-panel
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[  325252ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[  386679ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse-panel
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528
+[  386679ms] [WARNING] [Vue warn]: Failed to resolve component: a-collapse
+If this is a native custom element, make sure to exclude it from component resolution via compilerOptions.isCustomElement. 
+  at <App> @ http://127.0.0.1:5175/@vite/client:528

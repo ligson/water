@@ -1,0 +1,68 @@
+- main [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: 水
+      - generic [ref=e7]:
+        - heading "Water" [level=1] [ref=e8]
+        - paragraph [ref=e9]: 私有 AI 编程工作台
+    - generic [ref=e10]:
+      - tablist [ref=e11]:
+        - generic [ref=e13]:
+          - tab "工作区" [selected] [ref=e15] [cursor=pointer]
+          - tab "模型" [ref=e17] [cursor=pointer]
+      - tabpanel "工作区" [ref=e20]:
+        - generic [ref=e21]:
+          - combobox [ref=e26] [cursor=pointer]
+          - textbox "名称" [ref=e29]: Water
+          - textbox "绝对路径" [ref=e31]
+          - generic [ref=e34]:
+            - generic [ref=e35] [cursor=pointer]:
+              - radio "请求审批" [checked]
+              - generic [ref=e36]: 请求审批
+            - generic [ref=e37] [cursor=pointer]:
+              - radio "完全访问"
+              - generic [ref=e38]: 完全访问
+          - button "保存工作区" [ref=e40] [cursor=pointer]
+          - separator [ref=e45]
+          - generic [ref=e47]:
+            - generic [ref=e49] [cursor=pointer]:
+              - combobox [ref=e51]
+              - generic [ref=e52]: 目录
+            - generic [ref=e54] [cursor=pointer]:
+              - combobox [ref=e56]
+              - generic [ref=e57]: 读
+            - button "授 权" [ref=e58] [cursor=pointer]
+          - textbox "外部绝对路径" [ref=e61]
+          - paragraph [ref=e75]: No data
+  - generic [ref=e76]:
+    - generic [ref=e77]:
+      - generic [ref=e78]:
+        - heading "未选择工作区" [level=2] [ref=e79]
+        - paragraph [ref=e80]: 先创建或选择一个工作区
+      - generic [ref=e81]:
+        - generic [ref=e82]: 实时未连接
+        - button [ref=e85] [cursor=pointer]
+    - generic [ref=e91]:
+      - generic [ref=e92]:
+        - generic [ref=e93]:
+          - generic [ref=e94]: 任务
+          - generic [ref=e95]: "0"
+        - generic [ref=e97]:
+          - textbox "新任务标题" [ref=e98]
+          - button "创 建" [ref=e100] [cursor=pointer]
+        - paragraph [ref=e114]: No data
+      - generic [ref=e115]:
+        - generic [ref=e116]:
+          - generic [ref=e117]: 任务事件
+          - generic [ref=e118]:
+            - button [disabled] [ref=e120]
+            - generic [ref=e123]: 0 events
+        - paragraph [ref=e140]: 等待任务事件
+        - generic [ref=e141]:
+          - textbox "输入给 Agent 的任务" [ref=e142]
+          - button "发送" [disabled] [ref=e143]
+      - generic [ref=e148]:
+        - generic [ref=e149]:
+          - generic [ref=e150]: 审批
+          - generic [ref=e151]: "0"
+        - paragraph [ref=e166]: 暂无待审批

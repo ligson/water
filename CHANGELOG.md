@@ -1,0 +1,126 @@
+# Changelog
+
+所有对本仓库的文件改动都必须记录在这里。文档优先中文，记录应包含日期、改动内容和影响范围。
+
+## 2026-08-06
+
+- 前端聊天头部控制区改为连接状态点与紧凑图标按钮，弱化“实时 / 打断 / 刷新”控件的视觉噪音。
+- Provider 新增 `contextWindowTokens` 上下文窗口配置，默认 8192；Agent 按当前 Provider 生成 Context Pack 预算并写入 `context.pack.built` 事件，前端在 Provider 列表、弹框和执行过程里展示上下文长度与估算用量。
+- Agent 对“生成/整理/保存报告或文档”类请求增加默认 Markdown 保存路径提示，未指定路径时建议使用工作区内 `reports/<任务标题>-turn-<轮次>.md`，减少模型反复追问路径。
+- 后端 Turn 状态机新增显式 `waiting_approval` 与 `interrupted` 状态，用户取消运行中的任务时写入 `turn.interrupted` 事件而不是误记为失败；前端同步展示“已中断”。
+- 后端 OpenAI-compatible 流式读取在上下文取消时主动关闭响应体，避免模型服务长时间不返回数据时打断无法及时生效。
+- 前端设置页 Provider 卡片改为自定义紧凑布局，分离标题状态、地址、模型、密钥和操作按钮，避免窄栏内文字与按钮互相挤压。
+- 前端智能体执行过程的运行中标题改为动态显示“正在思考 / 正在调用工具 / 等待审批”与实时耗时，完成后再保留最终耗时，避免只剩静态时间看不出进度。
+- 后端任务 WebSocket 增加 ping/pong 心跳、读写 deadline 和 `afterSequence` 续接参数，支持重连时只回放缺失事件。
+- 前端任务 WebSocket 增加自动退避重连，重连时携带最后收到的事件序号，并继续按 `eventId` 去重避免重复消息。
+- 更新后端 README，记录 WebSocket 心跳、断线重连和消息补偿语义。
+- 新增 `docs/harness-architecture.md`，把 Water 的 Harness 拆成入口、上下文、规划、执行、观测五层，并明确默认文档落盘与通用工具策略。
+- 前端为当前 Turn 增加运行时长与总耗时展示，运行中显示“已运行 X”，完成后显示“耗时 X”，并在聊天头部与执行过程标题同步呈现。
+- 前端聊天头部新增当前任务最近一轮状态展示，左侧当前任务行同步显示本轮进度，便于判断每次提问是否已经结束。
+- 修复前端 WebSocket 实时状态反复显示离线的问题：历史审批事件回放不再触发工作区全量刷新和重连，并避免旧连接关闭覆盖新连接状态。
+- 修正前端任务状态判断，顶部状态只根据最新 Turn 显示，并将历史缺失完成事件的旧执行轮次标记为已停止，避免误显示长期运行中。
+- 前端助手回复接入 Markdown 渲染，支持标题、列表、代码块、表格等基础排版，并新增预览/原文切换与复制 Markdown 快捷按钮。
+- 前端助手回复新增打字机式渐进渲染，基于 WebSocket delta 持续推进显示文本，并增加生成中光标效果。
+- 新增 `scripts/` 开发脚本，支持一键启动前后端、分别启动后端/前端、停止服务、查看状态，并记录 PID 与日志路径。
+- 前端 Provider 列表增强当前激活模型标识，按当前工作区默认 Provider 优先、全局默认 Provider 兜底的逻辑高亮激活行，并用标签区分激活、默认、启用和停用状态。
+
+## 2026-08-05
+
+- 前端工作台右侧栏改为默认折叠，首屏优先展示任务列表与聊天区，需要审批、上下文或设置时再手动展开。
+- 前端设置页改为分类折叠结构，按“外观 / Provider / 工作区”分组展示，并启用一次只展开一个设置分类的交互，便于后续扩展更多设置项。
+- 前端统一自定义滚动条样式，任务列表、聊天区、执行过程、设置列表和弹层滚动区域会跟随主题色展示细滚动条。
+- 前端执行过程过滤 `agent.message.delta` 等流式文本碎片，改为单行动态状态展示，并仅保留工具调用、工具结果、审批和失败等有审计价值的事件。
+- 前端将智能体执行过程从右侧“活动”页移动到聊天窗口内，按对应用户轮次内联展示并支持折叠，右侧栏保留审批、上下文和设置入口。
+- 前端聊天输入框改为 Enter 直接发送、Shift+Enter 换行，并调整为更接近 Codex 的简洁输入面板与图标发送按钮。
+- 前端设置页新增界面主题选择，提供若水、青瓷、宣纸、朱砂、玄墨五套预制主题，并通过统一 CSS 变量联动三栏布局、消息、执行过程、输入框和 Ant Design 主色。
+- 前端显式注册 Ant Design Vue `Collapse` 组件，保障右侧执行过程面板稳定渲染。
+- 前端聊天区在切换任务、用户发送消息和流式回复更新时自动滚动到底部，默认展示最新对话内容。
+- 右侧活动页改为“智能体执行过程”视图，按 Turn 折叠展示输入、工具调用、工具结果、审批、完成或失败状态，历史结果可折叠查看。
+- 工具输出在执行过程面板中只展示摘要，避免长命令输出撑爆右侧栏。
+- 前端任务新增按钮精简为单个加号图标，任务行编辑和删除操作改为鼠标悬停或键盘聚焦时显示。
+- 新增任务标题编辑接口 `PUT /api/tasks/{taskId}`，前端任务编辑弹框接入该接口，并补充回归测试和 README 说明。
+- 前端中文品牌展示统一为“若水”，修正 logo、助手头像、空态和输入占位中误用“水”或纯 `Water` 的问题，并调整主色与界面质感以体现“可驾驭、柔和、可控”的产品气质。
+- Agent 系统身份调整为“若水（Water）”，并同步修正后端启动/停止日志中的品牌表述。
+- 合并聊天输入框快捷键处理，消除 Ant Design Vue `onKeydown` 数组 prop 警告，降低前端控制台噪声。
+- macOS CPU 查询推荐命令改为 `top -l 1 -s 0 -n 0`，只返回系统摘要，避免把完整进程表回填给本地模型。
+- Agent 工具结果回填给 LLM 时增加输出长度限制，事件日志仍保留完整工具输出，减少长命令输出导致的模型超时。
+- 扩展通用 `run_command` 只读 CPU 查询能力，支持 macOS `top -l 1 -s 0`、Linux `top -bn1`/`mpstat 1 1`、Windows `wmic cpu get loadpercentage /Value`，并补充回归测试。
+- 更新 Agent 工具提示词和设计文档，明确 CPU 使用率仍走通用工具规划与 Harness 白名单，不新增问题专用工具。
+- 前端任务区去掉搜索式输入框，标题栏新增按钮改为弹框创建任务，任务列表支持删除任务并在删除当前任务后自动切换到相邻任务。
+- 后端删除任务前会先取消该任务当前运行中的 Agent Turn，并补充删除任务级联清理历史的回归测试和 README 说明。
+- `run_command` 执行层改为按平台选择 shell：Windows 使用 `cmd /C`，类 Unix 使用 `sh -c`，避免换到 Windows 后命令执行直接失效。
+- 扩展 Windows 只读系统信息白名单，支持 `wmic` 内存/磁盘查询和受限 PowerShell 查询，并补充跨平台执行测试。
+- 前端工作台左右侧边栏支持折叠与拖拽调整宽度，中间聊天区会自动占用剩余空间。
+- Agent System Prompt 增加当前后端 `os/arch` 信息，并要求命令不适合当前系统时继续尝试对应系统的替代只读命令。
+- `run_command` 工具结果增加 `os`、`arch` 和命令不存在时的纠错提示，改善本地模型把 macOS 内存查询误选成 Linux `free -h` 后无法恢复的问题。
+- 扩展通用 `run_command` 只读系统检查能力，放行 `vm_stat`、`sysctl hw.memsize`、`free -h`、`cat /proc/meminfo` 等内存查询命令，并补充回归测试。
+- 更新 Agent 工具提示词和设计文档，明确内存使用等系统信息仍走通用工具规划，不新增问题专用工具。
+- 前端任务列表改为纵向堆叠，修复单任务时卡片被拉伸成大空块的问题，左侧栏更接近 Codex 的紧凑列表感。
+- 前端设置页 Provider 管理改为列表样式，新增和编辑都通过弹框完成，并支持列表内测试、编辑、删除操作。
+- 工作区列表新增编辑弹框，创建与编辑复用同一套参数表单，减少设置页常驻输入项。
+- 前端工作台继续瘦身：任务区保持滚动列表，聊天输入固定在底部不再随消息流动，整体改为更紧凑的单页布局。
+- 设置页改为工作区列表管理：支持在列表内直接删除工作区，新建工作区改为弹框填写参数，减少常驻表单占位。
+- 补充前端 `deleteWorkspace` API client，并同步工作区列表刷新和选中项修正逻辑。
+- Agent Loop 改成通用工具规划模式：模型通过 `list_dir`、`read_file`、`write_file`、`run_command` 自行决定取证路径，不再为磁盘容量等问题预置专用工具。
+- `run_command` 只读白名单收紧，保持对 `df -h /`、`pwd`、`ls`、`git status`、`git branch` 等检查命令的自动放行，同时避免 shell 拼接绕过。
+- Agent 多轮工具回填链路补齐，支持流式 `tool_calls` 分片合并后继续推理，工具结果会回填给模型直到 turn 正常结束。
+- 重构前端工作台为 Codex 风格三栏布局：左侧工作区/任务，中间对话，右侧活动/审批/上下文/设置。
+- 调整任务对话展示，`turn.started` 事件新增 `userInput`，前端按用户消息和 Agent 回复分组展示。
+- 调整 Agent 启动逻辑，没有配置 Provider 时只记录 Turn，不启动后台 Agent，避免无模型配置时产生不清晰的失败流程。
+- 新增后端本地开发 CORS 中间件，允许 `localhost` / `127.0.0.1` 前端访问 API，并支持 OPTIONS 预检。
+- Agent Loop 接入 Context Pack 基础信息，并支持模型 `tool_calls` 通过 Harness 执行工具或生成审批请求。
+- 新增任务取消接口 `POST /api/tasks/{taskId}/cancel`，前端工作台增加当前任务打断按钮。
+- 前端工作台新增工作区外部路径授权管理，支持创建、查看和撤销授权路径。
+- 前端审批列表增加目标、风险说明和预期影响展示。
+- 更新 `.gitignore`，忽略 `water-fe/dist/` 和 `water-fe/node_modules/`。
+- 后端测试扩展到 30 个用例，覆盖 Agent 工具调用、任务取消、完全访问写文件和命令审批执行。
+- 初始化 `water-fe` 前端工程，采用 Vue 3 + TypeScript + Vite + Ant Design Vue。
+- 新增前端 API client，统一解析后端 HTTP envelope，并支持任务 WebSocket URL 构造。
+- 新增 Water 前端工作台，支持 Provider 创建/测试、Workspace 创建/切换、Task 创建、Turn 发送、任务事件流展示和审批批准/拒绝。
+- 新增 `water-fe/README.md`，记录前端启动、构建和 `VITE_API_BASE` 配置。
+- 更新实施路线图，将前端 MVP 标记为已完成，并记录仍需增强的外部路径授权、审批详情、打断和 Context Pack 接入。
+- 新增 OpenAI-compatible LLM Client，支持 `/chat/completions` 非流式请求、SSE 流式解析、Provider 自定义 Header 和 `tool_calls` 字段解析。
+- 调整 Provider 连接测试，复用真实 LLM Chat Client，避免连接测试与实际调用行为分叉。
+- 新增最小 Agent Loop，创建 Turn 后异步调用工作区默认 Provider，并写入 `agent.message.delta`、`agent.message.completed`、`turn.completed` 或 `turn.failed` 事件。
+- 新增 Harness/Tool/Approval 后端基础能力，支持 `list_dir`、`read_file`、`write_file`、`run_command`，并按工作区权限模式与外部路径授权判断执行或请求审批。
+- 新增审批接口，支持工作区审批列表和 `/api/approvals/{approvalId}/resolve` 决策，审批请求和决策会写入任务事件流。
+- 新增 `internal/contextpack`，支持文件摘要、任务摘要缓存和按 80% 上下文预算构建 Context Pack。
+- 更新后端 README 与实施路线图，记录 LLM、Agent Loop、工具审批和 Context Pack 当前实现状态。
+- 后端测试扩展到 26 个用例，覆盖 LLM、Agent Loop、工具审批和 Context Pack。
+- 新增 WebSocket 任务事件流，支持 `GET /ws/tasks/{taskId}` 连接、历史事件回放和实时事件推送。
+- 新增 `internal/realtime` hub 接线与 WebSocket 测试，覆盖历史回放、实时广播和多客户端订阅。
+- 调整 Task / Turn 事件写入流程，事件落库后会广播给对应任务的实时订阅者。
+- 更新后端 README 与实施路线图，记录 WebSocket 任务事件流的接口、事件结构和完成状态。
+- 更新实施路线图，将 Task / Turn / Event 标记为已完成，并把下一步切换到 WebSocket 任务事件流。
+- 新增 Task / Turn / Event 后端主链路，支持工作区任务列表、创建任务、任务详情、删除任务、创建 Turn 和读取任务事件历史。
+- 新增 `internal/task` 与 `internal/event` 包，创建 Task / Turn 时自动写入 `task.started`、`turn.started` 事件。
+- 更新 `water-be/README.md`，补充 Task API 使用说明。
+- 新增 `docs/implementation-roadmap.md`，把 Water MVP 从当前状态到完成拆成后端、前端、接口、测试和验收级别的具体施工清单。
+- 新增 Workspace 后端管理接口，支持工作区列表、创建、详情、更新、删除。
+- 新增工作区外部路径授权接口，支持授权列表、创建和撤销，校验绝对路径、文件/目录类型和读写权限。
+- 新增 `internal/workspace` 包和 `internal/dbutil` 共享数据库工具，更新后端 README 的 Workspace API 说明。
+- 调整 Provider 和 Workspace 列表查询，空列表稳定返回 `[]` 而不是 `null`。
+- 调整外部路径授权响应，可空时间字段不再输出 `0001-01-01T00:00:00Z`。
+- 新增 Provider 后端管理接口，支持列表、创建、详情、更新、删除、设置默认 Provider 和连接测试。
+- 新增 `internal/provider`、`internal/llm`、`internal/uid` 包，Provider 响应默认脱敏 API Key，仅返回 `apiKeyConfigured`。
+- 更新 `water-be/README.md`，补充 Provider API 使用说明。
+- 初始化 `water-be` Go 后端，新增最小 HTTP 服务入口、配置加载、requestId 中间件、统一 JSON envelope 和 `/api/health` 健康检查。
+- 接入 SQLite 与 `github.com/pressly/goose/v3` migration，新增首个 migration，创建 Provider、Workspace、Task、Turn、Event、Approval、上下文摘要和外部路径授权等基础表。
+- 新增 `water-be/README.md`，记录后端启动方式、环境变量和健康检查接口。
+- 新增 `.gitignore`，忽略后端运行态数据库和构建产物；新增 API router 测试，覆盖健康检查和 404 envelope。
+- 更新本地模型优化设计，明确 Context Pack 使用 80% 上下文预算、压缩模板系统预置、钉住上下文超预算时参考 Codex 的按需加载和压缩思路裁剪。
+- 更新设计与 MVP 计划，明确 SQLite migration 使用 `github.com/pressly/goose/v3`，服务启动时自动迁移。
+- 更新 `docs/open-questions.md`，标记当前暂无阻塞 MVP 初始化的设计问题。
+- 新增 `docs/local-model-optimization.md`，记录短上下文本地模型的 Context Pack、摘要缓存、任务压缩、钉住上下文和工具意图兼容策略。
+- 更新 `docs/design-decisions.md`，明确 WebSocket 事件包含 `eventId`/`sequence`/`createdAt`，外部路径授权放在工作区设置页，支持文件/目录和读写权限。
+- 更新 `docs/mvp-plan.md`，加入本地模型上下文优化阶段，以及上下文缓存相关 SQLite 表和前端入口。
+- 精简 `docs/open-questions.md`，移除已拍板的模型能力画像、命令推荐策略、事件协议、文件预览和外部路径授权展示问题。
+- 新增 `docs/open-questions.md`，集中记录当前仍未拍板的模型、上下文压缩、命令策略、外部路径授权、事件协议和文件预览问题。
+- 更新设计文档，明确外部路径授权按工作区持久保存，并需要支持查看和撤销。
+- 更新 MVP 计划，明确第一版写文件审批只做简单变更摘要或文本 diff，不做复杂 Diff 编辑器。
+- 新增 `docs/mvp-plan.md`，拆解 Water MVP 的阶段目标、任务、验收标准、后端包边界和前端模块建议。
+- 更新 `docs/design-decisions.md`，明确 API Key 第一版明文存 SQLite、HTTP JSON envelope、WebSocket 事件结构、外部路径访问授权和命令执行策略。
+- 更新 `AGENTS.md`，加入统一 HTTP 响应规范、API Key 存储规则和外部路径访问规则。
+- 重写 `AGENTS.md`，移除外层说明文字，固化 Water 当前技术栈、目录约定、权限模式、Provider 配置、WebSocket 通信和变更记录规则。
+- 新增 `docs/design-decisions.md`，记录当前产品定位、工程结构、Provider 页面配置、通信方式、单用户多工作区、审批模式、工具调用原则和第一阶段范围。
+- 本次仅调整文档，不初始化 `water-be` / `water-fe` 项目骨架。

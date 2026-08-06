@@ -1,0 +1,66 @@
+- main [ref=e3]:
+  - complementary [ref=e4]:
+    - button "折叠左侧栏" [ref=e5] [cursor=pointer]
+    - generic [ref=e9]:
+      - generic [ref=e10]: 若
+      - generic [ref=e12]:
+        - heading "若水" [level=1] [ref=e13]
+        - paragraph [ref=e14]: 可驾驭的私有 AI 编程助手
+    - generic [ref=e15]:
+      - generic [ref=e16]: 工作区
+      - generic [ref=e18] [cursor=pointer]:
+        - combobox [ref=e20]
+        - generic [ref=e21]: Water Demo
+      - generic [ref=e22]:
+        - generic [ref=e23]: 完全访问
+        - generic [ref=e24]: Local Model
+    - generic [ref=e25]:
+      - generic [ref=e26]:
+        - generic [ref=e27]:
+          - generic [ref=e28]: 任务
+          - button "新增任务" [ref=e30] [cursor=pointer]
+        - generic [ref=e32]: "1"
+      - generic [ref=e34] [cursor=pointer]:
+        - generic [ref=e35]:
+          - generic [ref=e36]: 重构 Water UI
+          - generic [ref=e37]: active
+        - generic:
+          - generic:
+            - button "编辑任务"
+          - generic:
+            - button "删除任务"
+    - generic [ref=e38]:
+      - generic [ref=e39]:
+        - generic [ref=e40]: 待审批
+        - generic [ref=e41]: "0"
+      - generic [ref=e42]: 无待处理动作
+  - button "拖动调整左侧栏宽度" [ref=e43]
+  - generic [ref=e51]:
+    - generic [ref=e52]:
+      - generic [ref=e53]:
+        - generic [ref=e54]: Water Demo
+        - heading "重构 Water UI" [level=2] [ref=e55]
+      - generic [ref=e56]:
+        - generic [ref=e57]: 离线
+        - generic [ref=e59]: 等待输入
+        - button "打断" [ref=e62] [cursor=pointer]
+        - button [ref=e67] [cursor=pointer]
+    - generic [ref=e74]:
+      - heading "把任务交给若水" [level=3] [ref=e75]
+      - paragraph [ref=e76]: 创建任务后直接输入需求。工具调用、审批和事件会在右侧同步出现，保持可观测、可打断。
+    - generic [ref=e77]:
+      - textbox "让若水修改、解释或规划你的项目" [ref=e78]
+      - button "发送" [ref=e79] [cursor=pointer]
+  - button "拖动调整右侧栏宽度" [ref=e84]
+  - complementary [ref=e92]:
+    - button "折叠右侧栏" [ref=e93] [cursor=pointer]
+    - generic [ref=e97]:
+      - tablist [ref=e98]:
+        - generic [ref=e100]:
+          - tab "活动" [selected] [ref=e102] [cursor=pointer]
+          - tab "审批" [ref=e104] [cursor=pointer]
+          - tab "上下文" [ref=e106] [cursor=pointer]
+          - tab "设置" [ref=e108] [cursor=pointer]
+      - tabpanel "活动" [ref=e111]:
+        - list [ref=e112]
+        - paragraph [ref=e127]: 暂无事件

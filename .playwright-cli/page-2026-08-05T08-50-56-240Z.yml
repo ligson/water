@@ -1,0 +1,51 @@
+- main [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: 水
+      - generic [ref=e7]:
+        - heading "Water" [level=1] [ref=e8]
+        - paragraph [ref=e9]: 本地编程智能体
+    - generic [ref=e10]:
+      - generic [ref=e11]: 工作区
+      - combobox [ref=e15] [cursor=pointer]
+    - generic [ref=e17]:
+      - generic [ref=e18]:
+        - generic [ref=e19]: 任务
+        - generic [ref=e20]: "0"
+      - generic [ref=e22]:
+        - textbox "新建任务" [ref=e23]
+        - button [ref=e25] [cursor=pointer]:
+          - img "search" [ref=e26]
+      - paragraph [ref=e44]: 暂无任务
+    - generic [ref=e45]:
+      - generic [ref=e46]:
+        - generic [ref=e47]: 待审批
+        - generic [ref=e48]: "0"
+      - generic [ref=e49]: 无待处理动作
+  - generic [ref=e50]:
+    - generic [ref=e51]:
+      - generic [ref=e52]:
+        - generic [ref=e53]: Water
+        - heading "选择任务开始" [level=2] [ref=e54]
+      - generic [ref=e55]:
+        - generic [ref=e56]: 离线
+        - generic [ref=e58]: 未选择工作区
+        - button "打断" [disabled] [ref=e61]
+        - button [ref=e66] [cursor=pointer]
+    - generic [ref=e73]:
+      - heading "把任务交给 Water" [level=3] [ref=e74]
+      - paragraph [ref=e75]: 创建任务后直接输入需求。工具调用、审批和事件会在右侧同步出现。
+    - generic [ref=e76]:
+      - textbox "让 Water 修改、解释或规划你的项目" [ref=e77]
+      - button "发送" [disabled] [ref=e78]
+  - complementary [ref=e83]:
+    - generic [ref=e84]:
+      - tablist [ref=e85]:
+        - generic [ref=e87]:
+          - tab "活动" [selected] [ref=e89] [cursor=pointer]
+          - tab "审批" [ref=e91] [cursor=pointer]
+          - tab "上下文" [ref=e93] [cursor=pointer]
+          - tab "设置" [ref=e95] [cursor=pointer]
+      - tabpanel "活动" [ref=e98]:
+        - list [ref=e99]
+        - paragraph [ref=e114]: 暂无事件

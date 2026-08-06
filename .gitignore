@@ -1,0 +1,13 @@
+# Runtime data
+/water-be/data/
+/scripts/run/
+/scripts/logs/
+
+# Build outputs
+/water-be/bin/
+/water-be/water
+/water-fe/dist/
+/water-fe/node_modules/
+
+# OS/editor noise
+.DS_Store
