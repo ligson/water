@@ -25,6 +25,7 @@
 - 后端任务打断改为持久化生效：`/cancel` 会直接把当前 active turn 标成 `interrupted` 并写入事件，Agent 也会在每轮和每个工具前检查 turn 状态，避免只靠内存 cancel 句柄导致界面继续 loop。
 - 后端 `run_command` 新增 Vite 脚手架路径护栏：禁止把工作区绝对路径作为 `npm create vite` / `create-vite` 的目标目录，避免生成 `Users/...` 这类嵌套镜像目录。
 - 后端 `run_command` 禁止裸 shell 后台命令 `&`，避免 `npm run dev &` / `mvn spring-boot:run &` 这类长驻进程继承输出管道导致工具调用长期卡住。
+- 后端 `run_command` 增加长驻开发服务命令拦截与独立进程组清理，禁止 `npm run dev`、`vite`、`mvn spring-boot:run` 等前台服务命令卡住工具调用，并在超时或打断时清理子进程。
 - 同一任务新增单 active turn 约束：后端在已有 `created/running/waiting_approval` turn 时拒绝创建下一轮，前端在任务执行或等待审批期间允许编辑草稿但禁用发送按钮。
 - 前端聊天消息给最终回复补上“已完成 / 已中断”结果标签，并把“任务产物”卡片进一步收成更轻的折叠摘要，减少它抢占主回复视觉焦点。
 - 工作区文件预览改为带行号的代码弹窗，新增单文件下载；设置页工作区列表新增打包下载，界面改为更紧凑的列表行。

@@ -92,6 +92,42 @@ func TestBackgroundOperatorDetection(t *testing.T) {
 	}
 }
 
+func TestLongRunningDevServerCommandDetection(t *testing.T) {
+	rejected := []string{
+		"npm run dev",
+		"cd /workspace/demo-fe && npm run dev",
+		"npm run dev -- --host 127.0.0.1",
+		"pnpm dev",
+		"yarn start",
+		"npx vite --host 127.0.0.1",
+		"vite --host 127.0.0.1",
+		"mvn spring-boot:run",
+		"cd demo-be && mvn spring-boot:run 2>&1 | tail -30",
+		"./mvnw spring-boot:run",
+		"./gradlew bootRun",
+		"python3 -m http.server 5173",
+	}
+	for _, command := range rejected {
+		if !isLongRunningDevServerCommand(command) {
+			t.Fatalf("expected %q to be rejected as long-running dev server command", command)
+		}
+	}
+
+	allowed := []string{
+		"npm run build",
+		"npm test",
+		"mvn test",
+		"mvn -q test",
+		"cd demo-be && mvn compile",
+		"npm run lint 2>&1 | tail -30",
+	}
+	for _, command := range allowed {
+		if isLongRunningDevServerCommand(command) {
+			t.Fatalf("expected %q not to be treated as long-running dev server command", command)
+		}
+	}
+}
+
 func TestValidateScaffoldCommandRejectsAbsoluteViteTarget(t *testing.T) {
 	command := "rm -rf /workspace/demo-fe-new && npm create vite@latest /workspace/demo-fe -- --template vue-ts"
 	if err := validateScaffoldCommand(command, "/workspace"); err == nil {
