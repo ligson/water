@@ -1,9 +1,13 @@
 package api
 
 import (
+	"archive/zip"
+	"bytes"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -157,6 +161,109 @@ func TestWorkspaceExternalPathValidation(t *testing.T) {
 	}
 }
 
+func TestWorkspaceFilesListAndRead(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "docs"), 0o755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("# Water\n"), 0o644); err != nil {
+		t.Fatalf("write readme: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "docs", "guide.md"), []byte("guide"), 0o644); err != nil {
+		t.Fatalf("write guide: %v", err)
+	}
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws := createWorkspaceForTest(t, handler, "Water", root, "request_approval")
+
+	listRec := performJSON(handler, http.MethodGet, "/api/workspaces/"+ws.ID+"/files", "")
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", listRec.Code, listRec.Body.String())
+	}
+	var listed workspaceFileListEnvelope
+	decodeTestEnvelope(t, listRec, &listed)
+	if len(listed.Data.Items) != 2 {
+		t.Fatalf("expected two items, got %d", len(listed.Data.Items))
+	}
+	if !listed.Data.Items[0].IsDir || listed.Data.Items[0].Name != "docs" {
+		t.Fatalf("expected directory first, got %#v", listed.Data.Items[0])
+	}
+
+	readRec := performJSON(handler, http.MethodGet, "/api/workspaces/"+ws.ID+"/files/content?path=README.md", "")
+	if readRec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", readRec.Code, readRec.Body.String())
+	}
+	var content workspaceFileContentEnvelope
+	decodeTestEnvelope(t, readRec, &content)
+	if content.Data.Content != "# Water\n" {
+		t.Fatalf("expected file content, got %q", content.Data.Content)
+	}
+}
+
+func TestWorkspaceFileAndArchiveDownload(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "app.java"), []byte("class App {}\n"), 0o644); err != nil {
+		t.Fatalf("write app: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("# Demo\n"), 0o644); err != nil {
+		t.Fatalf("write readme: %v", err)
+	}
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws := createWorkspaceForTest(t, handler, "Water Demo", root, "request_approval")
+
+	fileRec := performJSON(handler, http.MethodGet, "/api/workspaces/"+ws.ID+"/files/download?path=src/app.java", "")
+	if fileRec.Code != http.StatusOK {
+		t.Fatalf("expected file download 200, got %d: %s", fileRec.Code, fileRec.Body.String())
+	}
+	if fileRec.Body.String() != "class App {}\n" {
+		t.Fatalf("unexpected file download body %q", fileRec.Body.String())
+	}
+	if !strings.Contains(fileRec.Header().Get("Content-Disposition"), "app.java") {
+		t.Fatalf("expected attachment filename, got %q", fileRec.Header().Get("Content-Disposition"))
+	}
+
+	archiveRec := performJSON(handler, http.MethodGet, "/api/workspaces/"+ws.ID+"/archive", "")
+	if archiveRec.Code != http.StatusOK {
+		t.Fatalf("expected archive download 200, got %d: %s", archiveRec.Code, archiveRec.Body.String())
+	}
+	reader, err := zip.NewReader(bytes.NewReader(archiveRec.Body.Bytes()), int64(archiveRec.Body.Len()))
+	if err != nil {
+		t.Fatalf("open zip: %v", err)
+	}
+	entries := make(map[string]bool)
+	for _, file := range reader.File {
+		entries[file.Name] = true
+	}
+	for _, expected := range []string{"README.md", "src/app.java"} {
+		if !entries[expected] {
+			t.Fatalf("expected archive entry %q, got %#v", expected, entries)
+		}
+	}
+}
+
+func TestWorkspaceFilesRejectPathEscape(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws := createWorkspaceForTest(t, handler, "Water", t.TempDir(), "request_approval")
+
+	rec := performJSON(handler, http.MethodGet, "/api/workspaces/"+ws.ID+"/files?path=../", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func createWorkspaceForTest(t *testing.T, handler http.Handler, name string, rootPath string, permissionMode string) workspaceResponse {
 	t.Helper()
 
@@ -221,4 +328,32 @@ type externalPathListEnvelope struct {
 	Data    struct {
 		Items []externalPathResponse `json:"items"`
 	} `json:"data"`
+}
+
+type workspaceFileResponse struct {
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	IsDir      bool   `json:"isDir"`
+	Size       int64  `json:"size"`
+	ModifiedAt string `json:"modifiedAt"`
+}
+
+type workspaceFileListEnvelope struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Path  string                  `json:"path"`
+		Items []workspaceFileResponse `json:"items"`
+	} `json:"data"`
+}
+
+type workspaceFileContentResponse struct {
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+	Size      int64  `json:"size"`
+	Truncated bool   `json:"truncated"`
+}
+
+type workspaceFileContentEnvelope struct {
+	Success bool                         `json:"success"`
+	Data    workspaceFileContentResponse `json:"data"`
 }

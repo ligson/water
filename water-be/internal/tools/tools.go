@@ -88,7 +88,7 @@ func Definitions() []llm.Tool {
 			Type: "function",
 			Function: llm.ToolFunction{
 				Name:        NameRunCommand,
-				Description: "在工作区目录执行命令。用于查看系统信息、运行测试或构建；高风险命令会进入审批流程。常见只读系统信息示例：磁盘 df -h /，macOS 内存 vm_stat 与 sysctl hw.memsize，Linux 内存 free -h，Windows 内存 wmic OS get FreePhysicalMemory,TotalVisibleMemorySize /Value，CPU 使用率 macOS top -l 1 -s 0 -n 0，Linux top -bn1，Windows wmic cpu get loadpercentage /Value。",
+				Description: "在工作区目录执行有明确结束条件的命令。用于查看系统信息、运行测试或构建；不要用它启动长驻开发服务，例如 npm run dev、vite、mvn spring-boot:run。高风险命令会进入审批流程。常见只读系统信息示例：磁盘 df -h /，macOS 内存 vm_stat 与 sysctl hw.memsize，Linux 内存 free -h，Windows 内存 wmic OS get FreePhysicalMemory,TotalVisibleMemorySize /Value，CPU 使用率 macOS top -l 1 -s 0 -n 0，Linux top -bn1，Windows wmic cpu get loadpercentage /Value。",
 				Parameters:  json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"要执行的 shell 命令"},"workingDir":{"type":"string","description":"执行目录，默认为工作区根目录"},"timeoutMs":{"type":"integer","description":"超时时间，单位毫秒"}},"required":["command"],"additionalProperties":false}`),
 			},
 		},
@@ -174,13 +174,86 @@ func (e *Executor) writeFile(ctx context.Context, toolCtx Context, req Request) 
 		return Result{}, err
 	}
 
+	previousContent, readErr := os.ReadFile(path)
+	created := false
+	if readErr != nil {
+		if !errors.Is(readErr, os.ErrNotExist) {
+			return Result{}, fmt.Errorf("read existing file: %w", readErr)
+		}
+		created = true
+	}
+	additions, deletions := lineDiffStats(string(previousContent), args.Content, created)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return Result{}, fmt.Errorf("create parent directory: %w", err)
 	}
 	if err := os.WriteFile(path, []byte(args.Content), 0o644); err != nil {
 		return Result{}, fmt.Errorf("write file: %w", err)
 	}
-	return Result{Name: NameWriteFile, Approved: true, Output: map[string]interface{}{"path": path, "bytes": len([]byte(args.Content))}}, nil
+	action := "modified"
+	if created {
+		action = "created"
+	}
+	return Result{Name: NameWriteFile, Approved: true, Output: map[string]interface{}{
+		"path":      path,
+		"bytes":     len([]byte(args.Content)),
+		"action":    action,
+		"additions": additions,
+		"deletions": deletions,
+	}}, nil
+}
+
+func lineDiffStats(oldContent string, newContent string, created bool) (int, int) {
+	newLines := splitComparableLines(newContent)
+	if created {
+		return len(newLines), 0
+	}
+	oldLines := splitComparableLines(oldContent)
+	if oldContent == newContent {
+		return 0, 0
+	}
+	if len(oldLines) == 0 {
+		return len(newLines), 0
+	}
+	if len(newLines) == 0 {
+		return 0, len(oldLines)
+	}
+	if len(oldLines) > 2000 || len(newLines) > 2000 {
+		return len(newLines), len(oldLines)
+	}
+	common := longestCommonSubsequenceLineCount(oldLines, newLines)
+	return len(newLines) - common, len(oldLines) - common
+}
+
+func splitComparableLines(content string) []string {
+	if content == "" {
+		return nil
+	}
+	normalized := strings.TrimSuffix(content, "\n")
+	if normalized == "" {
+		return nil
+	}
+	return strings.Split(normalized, "\n")
+}
+
+func longestCommonSubsequenceLineCount(a []string, b []string) int {
+	previous := make([]int, len(b)+1)
+	current := make([]int, len(b)+1)
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			if a[i-1] == b[j-1] {
+				current[j] = previous[j-1] + 1
+			} else if previous[j] >= current[j-1] {
+				current[j] = previous[j]
+			} else {
+				current[j] = current[j-1]
+			}
+		}
+		previous, current = current, previous
+		for j := range current {
+			current[j] = 0
+		}
+	}
+	return previous[len(b)]
 }
 
 func (e *Executor) runCommand(ctx context.Context, toolCtx Context, req Request) (Result, error) {
@@ -191,6 +264,19 @@ func (e *Executor) runCommand(ctx context.Context, toolCtx Context, req Request)
 	args.Command = strings.TrimSpace(args.Command)
 	if args.Command == "" {
 		return Result{}, errors.New("command is required")
+	}
+
+	if hasBackgroundOperator(args.Command) {
+		return Result{}, errors.New("background commands using '&' are not supported; use a managed dev-server tool or run a bounded foreground command")
+	}
+	if isLongRunningDevServerCommand(args.Command) {
+		return Result{}, errors.New("普通 run_command 不支持长驻开发服务命令；请使用受管理的 dev-server 工具，或改为 npm run build / mvn test 这类有明确结束条件的命令")
+	}
+	if err := validateScaffoldCommand(args.Command, toolCtx.Workspace.RootPath); err != nil {
+		return Result{}, err
+	}
+	if err := e.validateCommandPaths(ctx, toolCtx, args.Command); err != nil {
+		return Result{}, err
 	}
 
 	workingDir := toolCtx.Workspace.RootPath
@@ -224,6 +310,11 @@ func (e *Executor) runCommand(ctx context.Context, toolCtx Context, req Request)
 	shellName, shellArgs := shellCommand(runtime.GOOS, args.Command)
 	cmd := exec.CommandContext(runCtx, shellName, shellArgs...)
 	cmd.Dir = workingDir
+	configureCommandProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		return terminateCommandProcessGroup(cmd)
+	}
+	cmd.WaitDelay = 2 * time.Second
 	output, err := cmd.CombinedOutput()
 	truncated := false
 	if len(output) > 64*1024 {
@@ -245,6 +336,199 @@ func (e *Executor) runCommand(ctx context.Context, toolCtx Context, req Request)
 		}
 	}
 	return Result{Name: NameRunCommand, Approved: true, Output: result}, nil
+}
+
+func hasBackgroundOperator(command string) bool {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasSuffix(trimmed, "&") && !strings.HasSuffix(trimmed, "&&") {
+		return true
+	}
+	for _, field := range strings.Fields(trimmed) {
+		if field == "&" {
+			return true
+		}
+	}
+	return false
+}
+
+func isLongRunningDevServerCommand(command string) bool {
+	fields := normalizedCommandFields(command)
+	for i := 0; i < len(fields); i++ {
+		if isShellControlToken(fields[i]) {
+			continue
+		}
+		if matchesLongRunningDevServer(fields[i:]) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesLongRunningDevServer(fields []string) bool {
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "npm":
+		return len(fields) >= 3 && fields[1] == "run" && isDevServerScript(fields[2]) ||
+			len(fields) >= 2 && fields[1] == "start"
+	case "pnpm":
+		return len(fields) >= 2 && isDevServerScript(fields[1]) ||
+			len(fields) >= 3 && fields[1] == "run" && isDevServerScript(fields[2])
+	case "yarn":
+		return len(fields) >= 2 && isDevServerScript(fields[1]) ||
+			len(fields) >= 3 && fields[1] == "run" && isDevServerScript(fields[2])
+	case "vite":
+		return true
+	case "npx":
+		return len(fields) >= 2 && fields[1] == "vite"
+	case "mvn", "mvnw", "./mvnw":
+		return containsField(fields[1:], "spring-boot:run")
+	case "gradle", "./gradlew", "gradlew":
+		return containsField(fields[1:], "bootrun")
+	case "python", "python3":
+		return len(fields) >= 4 && fields[1] == "-m" && fields[2] == "http.server" ||
+			len(fields) >= 3 && fields[1] == "-m" && fields[2] == "uvicorn"
+	case "uvicorn":
+		return true
+	case "flask":
+		return len(fields) >= 2 && fields[1] == "run"
+	case "streamlit":
+		return len(fields) >= 2 && fields[1] == "run"
+	case "next", "nuxt":
+		return len(fields) >= 2 && fields[1] == "dev"
+	}
+	return false
+}
+
+func normalizedCommandFields(command string) []string {
+	rawFields := strings.Fields(strings.ToLower(command))
+	fields := make([]string, 0, len(rawFields))
+	for _, field := range rawFields {
+		field = strings.Trim(field, `"'`)
+		field = strings.TrimSuffix(field, ";")
+		if field != "" {
+			fields = append(fields, field)
+		}
+	}
+	return fields
+}
+
+func isShellControlToken(field string) bool {
+	switch field {
+	case "cd", "&&", "||", ";", "|", "2>&1", ">", ">>", "<":
+		return true
+	default:
+		return false
+	}
+}
+
+func isDevServerScript(script string) bool {
+	script = strings.Trim(script, `"'`)
+	switch script {
+	case "dev", "start", "serve", "preview":
+		return true
+	default:
+		return false
+	}
+}
+
+func containsField(fields []string, target string) bool {
+	for _, field := range fields {
+		if strings.Trim(field, `"'`) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func validateScaffoldCommand(command string, workspaceRoot string) error {
+	root := filepath.Clean(workspaceRoot)
+	for _, target := range viteScaffoldTargets(command) {
+		if !filepath.IsAbs(target) {
+			continue
+		}
+		cleaned := filepath.Clean(target)
+		if cleaned == root || strings.HasPrefix(cleaned, root+string(os.PathSeparator)) {
+			return fmt.Errorf("scaffold target must be a relative path inside the working directory; avoid passing workspace absolute path %q to create-vite because it can create nested Users/... directories", target)
+		}
+	}
+	return nil
+}
+
+func viteScaffoldTargets(command string) []string {
+	rawFields := strings.Fields(command)
+	fields := make([]string, 0, len(rawFields))
+	for _, field := range rawFields {
+		fields = append(fields, strings.Trim(field, `"'`))
+	}
+	targets := make([]string, 0, 1)
+	for i, field := range fields {
+		field = strings.ToLower(field)
+		switch field {
+		case "create-vite":
+			targets = appendScaffoldTarget(targets, fields, i+1)
+		case "npm", "pnpm", "yarn":
+			if i+2 >= len(fields) {
+				continue
+			}
+			action := strings.ToLower(fields[i+1])
+			template := strings.ToLower(fields[i+2])
+			if (action == "create" || action == "init") && (template == "vite" || strings.HasPrefix(template, "vite@")) {
+				targets = appendScaffoldTarget(targets, fields, i+3)
+			}
+		case "npx":
+			if i+1 >= len(fields) {
+				continue
+			}
+			template := strings.ToLower(fields[i+1])
+			if template == "create-vite" || strings.HasPrefix(template, "create-vite@") {
+				targets = appendScaffoldTarget(targets, fields, i+2)
+			}
+		}
+	}
+	return targets
+}
+
+func appendScaffoldTarget(targets []string, fields []string, start int) []string {
+	for i := start; i < len(fields); i++ {
+		field := fields[i]
+		if field == "" || field == "--" {
+			return targets
+		}
+		if field == "&&" || field == "||" || field == ";" || field == "|" {
+			return targets
+		}
+		if strings.HasPrefix(field, "-") {
+			continue
+		}
+		return append(targets, field)
+	}
+	return targets
+}
+
+func (e *Executor) validateCommandPaths(ctx context.Context, toolCtx Context, command string) error {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return errors.New("command is required")
+	}
+	switch fields[0] {
+	case "df":
+		return nil
+	}
+	for _, field := range fields[1:] {
+		if !filepath.IsAbs(strings.Trim(field, `"'`)) {
+			continue
+		}
+		cleaned := strings.Trim(field, `"'`)
+		if _, err := e.permissions.CheckPath(ctx, toolCtx.Workspace, cleaned, sandbox.AccessRead); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func shellCommand(goos string, command string) (string, []string) {

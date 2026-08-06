@@ -207,6 +207,7 @@ water/
 - [Harness 架构](docs/harness-architecture.md)
 - [MVP 实施路线图](docs/implementation-roadmap.md)
 - [本地模型优化](docs/local-model-optimization.md)
+- [本地模型可用性增强清单](docs/local-model-usability-checklist.md)
 - [开放问题](docs/open-questions.md)
 - [后端说明](water-be/README.md)
 - [前端说明](water-fe/README.md)

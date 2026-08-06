@@ -16,11 +16,32 @@ if [[ ! -d "$PROJECT_ROOT/water-fe/node_modules" ]]; then
   (cd "$PROJECT_ROOT/water-fe" && npm install)
 fi
 
-nohup bash -c 'cd "$1" && exec env VITE_API_BASE="$2" npm run dev -- --host "$3" --port "$4"' \
-  bash "$PROJECT_ROOT/water-fe" "${VITE_API_BASE:-$(backend_url)}" "$(frontend_host)" "$(frontend_port)" \
-  >"$FRONTEND_LOG_FILE" 2>&1 &
+python3 - "$FRONTEND_PID_FILE" "$FRONTEND_LOG_FILE" "$PROJECT_ROOT/water-fe" "${VITE_API_BASE:-$(backend_url)}" "$(frontend_host)" "$(frontend_port)" <<'PY'
+import os
+import subprocess
+import sys
 
-printf '%s\n' "$!" > "$FRONTEND_PID_FILE"
+pid_file, log_file, project_root, api_base, host, port = sys.argv[1:7]
+cmd = [
+    "bash",
+    "-lc",
+    f'cd "{project_root}" && exec env VITE_API_BASE="{api_base}" npm run dev -- --host "{host}" --port "{port}"',
+]
+
+pid = os.fork()
+if pid > 0:
+    sys.exit(0)
+
+os.setsid()
+pid = os.fork()
+if pid > 0:
+    sys.exit(0)
+
+with open(log_file, "ab", buffering=0) as log, open(os.devnull, "rb") as devnull:
+    proc = subprocess.Popen(cmd, stdin=devnull, stdout=log, stderr=log, close_fds=True)
+    with open(pid_file, "w", encoding="utf-8") as fh:
+        fh.write(str(proc.pid))
+PY
 
 if wait_for_url "$(frontend_url)" 40 0.25; then
   printf '前端已启动：pid=%s, %s\n' "$(pid_from_file "$FRONTEND_PID_FILE")" "$(frontend_url)"

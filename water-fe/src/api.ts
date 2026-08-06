@@ -68,6 +68,21 @@ export interface ExternalPath {
   sourceTaskId?: string
 }
 
+export interface WorkspaceFileItem {
+  name: string
+  path: string
+  isDir: boolean
+  size: number
+  modifiedAt: string
+}
+
+export interface WorkspaceFileContent {
+  path: string
+  content: string
+  size: number
+  truncated: boolean
+}
+
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -123,6 +138,14 @@ export const api = {
     request<Record<string, never>>(`/api/workspaces/${workspaceId}/external-paths/${pathId}`, {
       method: 'DELETE',
     }),
+  listWorkspaceFiles: (workspaceId: string, path = '') =>
+    request<{ path: string; items: WorkspaceFileItem[] }>(
+      `/api/workspaces/${workspaceId}/files?path=${encodeURIComponent(path)}`,
+    ),
+  readWorkspaceFile: (workspaceId: string, path: string) =>
+    request<WorkspaceFileContent>(
+      `/api/workspaces/${workspaceId}/files/content?path=${encodeURIComponent(path)}`,
+    ),
 
   listTasks: (workspaceId: string) =>
     request<{ items: Task[] }>(`/api/workspaces/${workspaceId}/tasks`),
@@ -159,6 +182,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ status, message }),
     }),
+}
+
+export function workspaceFileDownloadURL(workspaceId: string, path: string): string {
+  return `${API_BASE}/api/workspaces/${workspaceId}/files/download?path=${encodeURIComponent(path)}`
+}
+
+export function workspaceArchiveDownloadURL(workspaceId: string): string {
+  return `${API_BASE}/api/workspaces/${workspaceId}/archive`
 }
 
 export function taskWebSocketURL(taskId: string, afterSequence = 0): string {

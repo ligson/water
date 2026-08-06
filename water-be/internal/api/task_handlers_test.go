@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ligson/water/water-be/internal/config"
+	"github.com/ligson/water/water-be/internal/task"
 )
 
 func TestTaskTurnEventFlow(t *testing.T) {
@@ -194,6 +196,185 @@ func TestAgentLoopExecutesReadOnlyToolCall(t *testing.T) {
 	if !hasEventType(events, "tool.completed") {
 		t.Fatalf("expected tool.completed event, got %#v", events)
 	}
+	summary := summaryPayloadFromEvents(t, events)
+	commands, ok := summary["commands"].([]interface{})
+	if !ok || len(commands) != 1 {
+		t.Fatalf("expected one command in turn.summary, got %#v", summary)
+	}
+}
+
+func TestAgentLoopRepeatedSameOutputInterruptsTurn(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte("loop"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	var requestCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected llm path %s", r.URL.Path)
+		}
+		atomic.AddInt32(&requestCount, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunk := map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{
+					"delta": map[string]interface{}{
+						"tool_calls": []map[string]interface{}{
+							{
+								"index": 0,
+								"id":    "call_list_dir",
+								"type":  "function",
+								"function": map[string]interface{}{
+									"name":      "list_dir",
+									"arguments": `{"path":"` + root + `"}`,
+								},
+							},
+						},
+					},
+					"finish_reason": "tool_calls",
+				},
+			},
+		}
+		raw, _ := json.Marshal(chunk)
+		_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer llmServer.Close()
+
+	db := openTestDB(t)
+	defer db.Close()
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	provider := createProviderForTestWithBaseURL(t, handler, "Local", llmServer.URL+"/v1", true)
+	ws := createWorkspaceForTestWithProvider(t, handler, "Water", root, "request_approval", provider.ID)
+	createdTask := createTaskForTest(t, handler, ws.ID, "Tool loop limit")
+
+	turnRec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", `{"userInput":"反复查看目录"}`)
+	if turnRec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", turnRec.Code, turnRec.Body.String())
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&requestCount) >= 6 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 6 {
+		t.Fatalf("expected 6 llm requests before reading events, got %d", got)
+	}
+
+	events := waitTaskEvents(t, handler, createdTask.ID, "turn.interrupted")
+	if hasEventType(events, "turn.failed") {
+		t.Fatalf("expected repeated tool output to interrupt instead of fail, got %#v", events)
+	}
+	var interruptedPayload map[string]interface{}
+	for _, item := range events {
+		if item.Type == "turn.interrupted" {
+			interruptedPayload = item.Payload()
+			break
+		}
+	}
+	message, ok := interruptedPayload["message"].(string)
+	if !ok || !strings.Contains(message, "没有新的信息") {
+		t.Fatalf("expected Chinese interruption message, got %#v", interruptedPayload)
+	}
+	if interruptedPayload["reason"] != "tool_repeated_output" || interruptedPayload["canContinue"] != true {
+		t.Fatalf("expected continuable repeated-output payload, got %#v", interruptedPayload)
+	}
+	prompt, ok := interruptedPayload["continuationPrompt"].(string)
+	if !ok || !strings.Contains(prompt, "换一个新的检查点") {
+		t.Fatalf("expected continuation prompt, got %#v", interruptedPayload)
+	}
+}
+
+func TestAgentLoopRepeatedPathFailureInterruptsTurn(t *testing.T) {
+	root := t.TempDir()
+
+	var requestCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected llm path %s", r.URL.Path)
+		}
+
+		count := atomic.AddInt32(&requestCount, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch count {
+		case 1, 2:
+			chunk := map[string]interface{}{
+				"choices": []map[string]interface{}{
+					{
+						"delta": map[string]interface{}{
+							"tool_calls": []map[string]interface{}{
+								{
+									"index": 0,
+									"id":    "call_bad_path",
+									"type":  "function",
+									"function": map[string]interface{}{
+										"name":      "run_command",
+										"arguments": `{"command":"ls -la /Users/ligson/workspace/dev/sdk/demo-be"}`,
+									},
+								},
+							},
+						},
+						"finish_reason": "tool_calls",
+					},
+				},
+			}
+			raw, _ := json.Marshal(chunk)
+			_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected llm request count %d", count)
+		}
+	}))
+	defer llmServer.Close()
+
+	db := openTestDB(t)
+	defer db.Close()
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	provider := createProviderForTestWithBaseURL(t, handler, "Local", llmServer.URL+"/v1", true)
+	ws := createWorkspaceForTestWithProvider(t, handler, "Water", root, "request_approval", provider.ID)
+	createdTask := createTaskForTest(t, handler, ws.ID, "Bad path guard")
+
+	turnRec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", `{"userInput":"帮我查看外部目录"}`)
+	if turnRec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", turnRec.Code, turnRec.Body.String())
+	}
+
+	events := waitTaskEvents(t, handler, createdTask.ID, "turn.interrupted")
+	if got := atomic.LoadInt32(&requestCount); got != 2 {
+		t.Fatalf("expected 2 llm requests before interrupt, got %d", got)
+	}
+	if !hasEventType(events, "tool.failed") {
+		t.Fatalf("expected tool.failed event, got %#v", events)
+	}
+	var failedPayload map[string]interface{}
+	for _, item := range events {
+		if item.Type == "tool.failed" {
+			failedPayload = item.Payload()
+			break
+		}
+	}
+	if failedPayload == nil {
+		t.Fatalf("expected tool.failed payload")
+	}
+	if hint, ok := failedPayload["hint"].(string); !ok || !strings.Contains(hint, "工作区根目录") {
+		t.Fatalf("expected path hint in failed payload, got %#v", failedPayload)
+	}
+	var interruptedPayload map[string]interface{}
+	for _, item := range events {
+		if item.Type == "turn.interrupted" {
+			interruptedPayload = item.Payload()
+			break
+		}
+	}
+	if interruptedPayload["reason"] != "tool_repeated_failure" {
+		t.Fatalf("expected repeated failure reason, got %#v", interruptedPayload)
+	}
 }
 
 func TestApprovalResolutionResumesAgentToolLoop(t *testing.T) {
@@ -290,6 +471,21 @@ func TestApprovalResolutionResumesAgentToolLoop(t *testing.T) {
 	}
 	if string(content) != "# 系统报告\n\nok" {
 		t.Fatalf("unexpected report content %q", string(content))
+	}
+	summary := summaryPayloadFromEvents(t, events)
+	files, ok := summary["changedFiles"].([]interface{})
+	if !ok || len(files) != 1 {
+		t.Fatalf("expected one changed file in turn.summary, got %#v", summary)
+	}
+	fileSummary, ok := files[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected changed file object, got %#v", files[0])
+	}
+	if fileSummary["displayPath"] != "reports/system-report.md" {
+		t.Fatalf("unexpected changed file display path %#v", fileSummary)
+	}
+	if fileSummary["additions"] != float64(3) || fileSummary["deletions"] != float64(0) {
+		t.Fatalf("unexpected changed file diff stats %#v", fileSummary)
 	}
 	if got := atomic.LoadInt32(&requestCount); got != 2 {
 		t.Fatalf("expected 2 llm requests, got %d", got)
@@ -505,6 +701,25 @@ func TestCancelTaskWhenNotRunning(t *testing.T) {
 	}
 }
 
+func TestCreateTurnRejectsWhenTaskHasActiveTurn(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws := createWorkspaceForTest(t, handler, "Water", "/tmp/water", "request_approval")
+	taskItem := createTaskForTest(t, handler, ws.ID, "Single active turn")
+	turn := createTurnForTest(t, handler, taskItem.ID, "first")
+
+	if _, err := task.NewStore(db).UpdateTurnStatus(context.Background(), turn.ID, task.TurnStatusRunning); err != nil {
+		t.Fatalf("set running turn: %v", err)
+	}
+
+	rec := performJSON(handler, http.MethodPost, "/api/tasks/"+taskItem.ID+"/turns", `{"userInput":"second"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestCancelRunningTaskMarksTurnInterrupted(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -555,6 +770,60 @@ func TestCancelRunningTaskMarksTurnInterrupted(t *testing.T) {
 	}
 }
 
+func TestCancelStaleRunningTaskMarksTurnInterrupted(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws := createWorkspaceForTest(t, handler, "Water", "/tmp/water", "request_approval")
+	taskItem := createTaskForTest(t, handler, ws.ID, "Stale running")
+	turn := createTurnForTest(t, handler, taskItem.ID, "stale running turn")
+
+	if _, err := task.NewStore(db).UpdateTurnStatus(context.Background(), turn.ID, task.TurnStatusRunning); err != nil {
+		t.Fatalf("set running turn: %v", err)
+	}
+
+	rec := performJSON(handler, http.MethodPost, "/api/tasks/"+taskItem.ID+"/cancel", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected cancel status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	events := waitTaskEvents(t, handler, taskItem.ID, "turn.interrupted")
+	if !hasEventType(events, "turn.interrupted") {
+		t.Fatalf("expected interrupted event, got %#v", events)
+	}
+
+	turnRec := performJSON(handler, http.MethodGet, "/api/tasks/"+taskItem.ID+"/events", "")
+	if turnRec.Code != http.StatusOK {
+		t.Fatalf("expected events status 200, got %d: %s", turnRec.Code, turnRec.Body.String())
+	}
+}
+
+func TestRouterRecoversStaleRunningTurnsOnStartup(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	baseRouter := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws := createWorkspaceForTest(t, baseRouter, "Water", "/tmp/water", "request_approval")
+	createdTask := createTaskForTest(t, baseRouter, ws.ID, "Recover me")
+	createdTurn := createTurnForTest(t, baseRouter, createdTask.ID, "stale turn")
+
+	if _, err := task.NewStore(db).UpdateTurnStatus(context.Background(), createdTurn.ID, task.TurnStatusRunning); err != nil {
+		t.Fatalf("set running turn: %v", err)
+	}
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	eventsRec := performJSON(handler, http.MethodGet, "/api/tasks/"+createdTask.ID+"/events", "")
+	if eventsRec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", eventsRec.Code, eventsRec.Body.String())
+	}
+	var events eventListEnvelope
+	decodeTestEnvelope(t, eventsRec, &events)
+	if !hasEventType(events.Data.Items, "turn.interrupted") {
+		t.Fatalf("expected stale running turn to be interrupted, got %#v", events.Data.Items)
+	}
+}
+
 func createTaskForTest(t *testing.T, handler http.Handler, workspaceID string, title string) taskResponse {
 	t.Helper()
 
@@ -563,6 +832,18 @@ func createTaskForTest(t *testing.T, handler http.Handler, workspaceID string, t
 		t.Fatalf("create task: status %d body %s", rec.Code, rec.Body.String())
 	}
 	var envelope taskEnvelope
+	decodeTestEnvelope(t, rec, &envelope)
+	return envelope.Data
+}
+
+func createTurnForTest(t *testing.T, handler http.Handler, taskID string, userInput string) turnResponse {
+	t.Helper()
+
+	rec := performJSON(handler, http.MethodPost, "/api/tasks/"+taskID+"/turns", `{"userInput":"`+userInput+`"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create turn: status %d body %s", rec.Code, rec.Body.String())
+	}
+	var envelope turnEnvelope
 	decodeTestEnvelope(t, rec, &envelope)
 	return envelope.Data
 }
@@ -615,6 +896,17 @@ func approvalIDFromEvents(t *testing.T, events []eventResponse) string {
 	}
 	t.Fatalf("approval.requested event not found")
 	return ""
+}
+
+func summaryPayloadFromEvents(t *testing.T, events []eventResponse) map[string]interface{} {
+	t.Helper()
+	for _, item := range events {
+		if item.Type == "turn.summary" {
+			return item.Payload()
+		}
+	}
+	t.Fatalf("turn.summary event not found")
+	return nil
 }
 
 type taskResponse struct {

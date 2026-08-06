@@ -161,6 +161,7 @@ WebSocket 不强制使用 HTTP envelope。任务事件流建议采用轻量结�
 - `tool.call.started`
 - `tool.call.output`
 - `tool.call.completed`
+- `turn.summary`
 - `turn.interrupted`
 - `turn.completed`
 - `error`
@@ -170,6 +171,7 @@ WebSocket 不强制使用 HTTP envelope。任务事件流建议采用轻量结�
 - `eventId` 必须唯一，便于前端去重和后续回放。
 - `sequence` 在同一个 Turn 内递增，便于前端排序。
 - 关键事件需要落 SQLite，前端断线重连后可以按任务读取历史事件。
+- `turn.summary` 由 Harness 基于工具事件生成，不依赖模型自由描述，用于展示本轮已编辑文件、增删行统计、验证结果和命令结果。
 
 ## 5. 单用户与多工作区
 

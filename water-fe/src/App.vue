@@ -2,10 +2,16 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import {
+  ArrowRight,
+  ChevronLeft,
+  ChevronDown,
   CheckCircle,
   Code2,
   Copy,
+  Download,
   Eye,
+  FileText,
+  Folder,
   FolderPlus,
   GripVertical,
   PanelLeftClose,
@@ -17,18 +23,23 @@ import {
   RefreshCw,
   Send,
   Square,
+  Terminal,
   Trash2,
 } from '@lucide/vue'
 import MarkdownIt from 'markdown-it'
 import {
   api,
   taskWebSocketURL,
+  workspaceArchiveDownloadURL,
+  workspaceFileDownloadURL,
   type Approval,
   type ExternalPath,
   type Provider,
   type Task,
   type TaskEvent,
   type Workspace,
+  type WorkspaceFileContent,
+  type WorkspaceFileItem,
 } from './api'
 
 type ChatBlock = {
@@ -38,13 +49,19 @@ type ChatBlock = {
   content: string
   sequence: number
   turnId?: string
+  continuation?: {
+    canContinue: boolean
+    prompt: string
+    reason: string
+  }
 }
 
 type ChatTimelineItem = {
   key: string
-  kind: 'message' | 'execution'
+  kind: 'message' | 'execution' | 'summary'
   block?: ChatBlock
   group?: ExecutionGroup
+  summary?: TurnSummary
 }
 
 type PanelSide = 'left' | 'right'
@@ -82,7 +99,52 @@ type ExecutionGroup = {
     tokenBudget: number
     contextWindowTokens: number
     truncated: boolean
+    hasTaskSummary: boolean
+    selectedFilePaths: string[]
   }
+  contextSummary?: {
+    summary: string
+    contentHash: string
+    chars: number
+  }
+}
+
+type ContextSnapshot = {
+  usage?: ExecutionGroup['contextUsage']
+  summary?: ExecutionGroup['contextSummary']
+  turnLabel: string
+}
+
+type SummaryFile = {
+  path: string
+  displayPath: string
+  action: string
+  bytes: number
+  additions: number
+  deletions: number
+}
+
+type SummaryCommand = {
+  command: string
+  status: 'passed' | 'failed' | string
+  summary?: string
+  truncated?: boolean
+}
+
+type TurnSummary = {
+  key: string
+  turnId: string
+  sequence: number
+  changedFiles: SummaryFile[]
+  validations: SummaryCommand[]
+  commands: SummaryCommand[]
+  raw: Record<string, unknown>
+}
+
+type TurnOutcome = {
+  status: 'completed' | 'failed' | 'interrupted'
+  label: string
+  tone: 'success' | 'warning' | 'error'
 }
 
 const providers = ref<Provider[]>([])
@@ -91,10 +153,17 @@ const tasks = ref<Task[]>([])
 const events = ref<TaskEvent[]>([])
 const approvals = ref<Approval[]>([])
 const externalPaths = ref<ExternalPath[]>([])
+const workspaceFiles = ref<WorkspaceFileItem[]>([])
+const workspaceFilePath = ref('')
+const selectedWorkspaceFilePath = ref('')
+const workspaceFileContent = ref<WorkspaceFileContent | null>(null)
+const fileBrowserLoading = ref(false)
+const fileContentLoading = ref(false)
+const filePreviewOpen = ref(false)
 const selectedWorkspaceId = ref('')
 const selectedTaskId = ref('')
 const nowTick = ref(Date.now())
-const rightTab = ref('approvals')
+const rightTab = ref('files')
 const loading = ref(false)
 const wsConnected = ref(false)
 const taskModalOpen = ref(false)
@@ -114,6 +183,7 @@ const executionOpenKeys = ref<string[]>([])
 const settingsOpenKey = ref('appearance')
 const productName = '若水'
 const productTagline = '可驾驭的私有 AI 编程助手'
+const brandMarkSrc = '/favicon.svg'
 const themeStorageKey = 'water-ui-theme'
 const themeOptions: ThemeOption[] = [
   {
@@ -168,6 +238,8 @@ let activePanelResize:
 const assistantRenderedContent = reactive<Record<string, string>>({})
 const assistantTargetContent = reactive<Record<string, string>>({})
 const assistantRawMode = reactive<Record<string, boolean>>({})
+const summaryRawMode = reactive<Record<string, boolean>>({})
+const summaryExpanded = reactive<Record<string, boolean>>({})
 const assistantTypingTimers = new Map<string, number>()
 const assistantTypingDelayMS = 18
 const markdown = new MarkdownIt({
@@ -215,6 +287,38 @@ const externalPathForm = reactive({
 const taskTitle = ref('')
 const userInput = ref('')
 const chatBodyRef = ref<HTMLElement | null>(null)
+const customCursorSupported = ref(false)
+const customCursorVisible = ref(false)
+const customCursorPressed = ref(false)
+const customCursorInteractive = ref(false)
+const customCursorX = ref(0)
+const customCursorY = ref(0)
+const waterPetPoked = ref(false)
+const waterPetMoodIndex = ref(0)
+const waterPetDragging = ref(false)
+const waterPetSuppressClick = ref(false)
+const waterPetWalking = ref(false)
+const waterPetTurning = ref(false)
+const waterPetGaitPhase = ref(0)
+const waterPetFacing = ref(1)
+const waterPetLean = ref(0)
+const waterPetX = ref(0)
+const waterPetY = ref(0)
+let customCursorMediaQuery: MediaQueryList | undefined
+let waterPetTimer: number | undefined
+let waterPetMoveTimer: number | undefined
+let waterPetWalkTimer: number | undefined
+const waterPetStorageKey = 'water-ui-pet-position'
+let waterPetDrag:
+  | {
+      pointerId: number
+      offsetX: number
+      offsetY: number
+      startX: number
+      startY: number
+      moved: boolean
+    }
+  | undefined
 
 const selectedWorkspace = computed(() =>
   workspaces.value.find((item) => item.id === selectedWorkspaceId.value),
@@ -231,6 +335,21 @@ const statusText = computed(() => {
   if (!selectedTask.value) return '选择或创建一个任务'
   return latestTaskStatusText(events.value)
 })
+const selectedTaskIsLive = computed(() =>
+  ['执行中', '思考', '审批', '回复'].some((label) => statusText.value.includes(label)),
+)
+const selectedTaskIsThinking = computed(() =>
+  statusText.value.includes('思考') || statusText.value.includes('执行中'),
+)
+const selectedTaskIsCompleted = computed(() => statusText.value.includes('完成'))
+const composerPlaceholder = computed(() =>
+  selectedTaskIsLive.value
+    ? '可以先输入下一步，当前任务完成后再发送'
+    : `让${productName}修改、解释或规划你的项目`,
+)
+const canSubmitTurn = computed(() =>
+  Boolean(selectedTaskId.value && userInput.value.trim() && !selectedTaskIsLive.value),
+)
 const taskHeaderTone = computed(() => {
   if (statusText.value.includes('失败')) return 'error'
   if (statusText.value.includes('完成')) return 'success'
@@ -244,7 +363,32 @@ const latestExecutionGroup = computed(() =>
 const latestTurnDurationText = computed(() =>
   latestExecutionGroup.value ? executionDurationText(latestExecutionGroup.value) : '',
 )
+const workspaceFilePathLabel = computed(() => workspaceFilePath.value || '根目录')
+const workspaceFileParentPath = computed(() => parentWorkspacePath(workspaceFilePath.value))
+const workspaceFileModalTitle = computed(() => {
+  const path = workspaceFileContent.value?.path || selectedWorkspaceFilePath.value
+  return path || '文件预览'
+})
+const workspaceFileLanguage = computed(() => detectFileLanguage(workspaceFileModalTitle.value))
+const workspaceFileDisplayContent = computed(() => {
+  return workspaceFileContent.value?.content ?? ''
+})
+const workspaceFilePreviewHint = computed(() =>
+  workspaceFileContent.value?.truncated ? '文件过大，当前仅显示前 512 KiB 预览' : '',
+)
+const workspaceFilePreviewLines = computed(() => {
+  const lines = workspaceFileDisplayContent.value.split('\n')
+  return (lines.length > 0 ? lines : ['']).map((line, index) => ({
+    number: index + 1,
+    html: highlightCode(line || ' ', workspaceFileLanguage.value),
+  }))
+})
 const latestContextUsage = computed(() => latestExecutionGroup.value?.contextUsage)
+const latestContextSnapshot = computed<ContextSnapshot>(() => ({
+  usage: latestExecutionGroup.value?.contextUsage,
+  summary: latestExecutionGroup.value?.contextSummary,
+  turnLabel: latestExecutionGroup.value?.subtitle || '最近一轮',
+}))
 const contextBudgetRatio = 0.8
 const contextHeaderBudget = computed(() => {
   const usage = latestContextUsage.value
@@ -310,13 +454,30 @@ const chatBlocks = computed(() => {
       continue
     }
     if (item.type === 'turn.failed' || item.type === 'turn.interrupted') {
+      const continuationPrompt = String(payload.continuationPrompt ?? '').trim()
+      const isContinuableInterrupted =
+        item.type === 'turn.interrupted' &&
+        (payload.canContinue === true || String(payload.message ?? '').includes('工具调用轮次达到上限'))
       blocks.push({
         key: item.eventId,
         role: 'system',
-        title: item.type === 'turn.interrupted' ? '运行已中断' : '运行失败',
+        title:
+          isContinuableInterrupted
+            ? '本轮已暂告一段落'
+            : item.type === 'turn.interrupted'
+              ? '运行已中断'
+              : '运行失败',
         content: String(payload.message ?? (item.type === 'turn.interrupted' ? 'Agent 执行已中断' : 'Agent 执行失败')),
         sequence: item.sequence,
         turnId: item.turnId,
+        continuation:
+          isContinuableInterrupted
+            ? {
+                canContinue: true,
+                prompt: continuationPrompt || '继续上一轮任务，沿用已有结果继续推进，不要重复已经完成的工作。',
+                reason: String(payload.reason ?? ''),
+              }
+            : undefined,
       })
     }
   }
@@ -370,23 +531,95 @@ const executionGroupByTurn = computed(() => {
   return groupMap
 })
 
+const summaryByTurn = computed(() => {
+  const summaries = new Map<string, TurnSummary>()
+  for (const item of events.value) {
+    if (item.type !== 'turn.summary' || !item.turnId) continue
+    const payload = payloadRecord(item)
+    summaries.set(item.turnId, {
+      key: item.eventId,
+      turnId: item.turnId,
+      sequence: item.sequence,
+      changedFiles: parseSummaryFiles(payload.changedFiles),
+      validations: parseSummaryCommands(payload.validations),
+      commands: parseSummaryCommands(payload.commands),
+      raw: payload,
+    })
+  }
+  return summaries
+})
+
+const turnOutcomeByTurn = computed(() => {
+  const outcomes = new Map<string, TurnOutcome>()
+  for (const item of events.value) {
+    if (!item.turnId) continue
+    if (item.type === 'turn.completed') {
+      outcomes.set(item.turnId, {
+        status: 'completed',
+        label: '已完成',
+        tone: 'success',
+      })
+      continue
+    }
+    if (item.type === 'turn.failed') {
+      outcomes.set(item.turnId, {
+        status: 'failed',
+        label: '已失败',
+        tone: 'error',
+      })
+      continue
+    }
+    if (item.type === 'turn.interrupted') {
+      const payload = payloadRecord(item)
+      outcomes.set(item.turnId, {
+        status: 'interrupted',
+        label: payload.canContinue === true ? '已中断，可继续' : '已中断',
+        tone: 'warning',
+      })
+    }
+  }
+  return outcomes
+})
+
 const chatTimeline = computed(() => {
   const items: ChatTimelineItem[] = []
   const renderedExecutionGroups = new Set<string>()
+  const renderedSummaries = new Set<string>()
   for (const block of chatBlocks.value) {
     items.push({
       key: `message-${block.key}`,
       kind: 'message',
       block,
     })
-    if (block.role !== 'user' || !block.turnId) continue
-    const group = executionGroupByTurn.value.get(block.turnId)
-    if (!group || renderedExecutionGroups.has(group.key)) continue
-    renderedExecutionGroups.add(group.key)
+    if (block.turnId && block.role === 'user') {
+      const group = executionGroupByTurn.value.get(block.turnId)
+      if (group && !renderedExecutionGroups.has(group.key)) {
+        renderedExecutionGroups.add(group.key)
+        items.push({
+          key: `execution-${group.key}`,
+          kind: 'execution',
+          group,
+        })
+      }
+    }
+    if (block.turnId && block.role === 'assistant') {
+      const summary = summaryByTurn.value.get(block.turnId)
+      if (summary && !renderedSummaries.has(summary.key)) {
+        renderedSummaries.add(summary.key)
+        items.push({
+          key: `summary-${summary.key}`,
+          kind: 'summary',
+          summary,
+        })
+      }
+    }
+  }
+  for (const summary of [...summaryByTurn.value.values()].sort((a, b) => a.sequence - b.sequence)) {
+    if (renderedSummaries.has(summary.key)) continue
     items.push({
-      key: `execution-${group.key}`,
-      kind: 'execution',
-      group,
+      key: `summary-${summary.key}`,
+      kind: 'summary',
+      summary,
     })
   }
   return items
@@ -415,6 +648,18 @@ const shellStyle = computed(() => ({
   '--left-panel-width': `${leftPanelCollapsed.value ? 48 : leftPanelWidth.value}px`,
   '--right-panel-width': `${rightPanelCollapsed.value ? 48 : rightPanelWidth.value}px`,
 }))
+const customCursorStyle = computed(() => ({
+  transform: `translate3d(${customCursorX.value}px, ${customCursorY.value}px, 0) translate(-2px, -1px)`,
+}))
+const waterPetMessages = ['上善若水', '缓而不怠', '清流已就位', '稳住上下文']
+const waterPetMessage = computed(() => waterPetMessages[waterPetMoodIndex.value % waterPetMessages.length])
+const waterPetStyle = computed(() => ({
+  left: `${waterPetX.value}px`,
+  top: `${waterPetY.value}px`,
+  '--water-pet-face': `${waterPetFacing.value}`,
+  '--water-pet-lean': `${waterPetLean.value}deg`,
+}))
+const waterPetGaitClass = computed(() => (waterPetGaitPhase.value % 2 === 0 ? 'gait-a' : 'gait-b'))
 
 function loadThemeName(): ThemeName {
   if (typeof window === 'undefined') return 'ruoshui'
@@ -430,6 +675,252 @@ function clampPanelWidth(value: number, side: PanelSide) {
   const min = side === 'left' ? 220 : 280
   const max = side === 'left' ? 420 : 520
   return Math.min(Math.max(value, min), max)
+}
+
+function canUseCustomCursor() {
+  return typeof window !== 'undefined' && window.matchMedia('(pointer: fine)').matches
+}
+
+function setCustomCursorState(event: PointerEvent) {
+  if (!customCursorSupported.value || (event.pointerType !== 'mouse' && event.pointerType !== 'pen')) {
+    customCursorVisible.value = false
+    customCursorInteractive.value = false
+    customCursorPressed.value = false
+    return
+  }
+  customCursorVisible.value = true
+  customCursorX.value = event.clientX
+  customCursorY.value = event.clientY
+  const target = event.target as HTMLElement | null
+  customCursorInteractive.value = Boolean(
+    target?.closest(
+      'button, a, input, textarea, select, [role="button"], [contenteditable="true"], .ant-btn, .ant-select, .ant-input, .ant-input-affix-wrapper, .ant-switch, .ant-checkbox, .sidebar-toggle, .resize-handle, .task-item, .provider-card, .workspace-row, .file-row, .approval-row, .water-pet',
+    ),
+  )
+}
+
+function handleCustomCursorDown(event: PointerEvent) {
+  setCustomCursorState(event)
+  if (event.pointerType === 'mouse' || event.pointerType === 'pen') {
+    customCursorPressed.value = true
+  }
+}
+
+function handleCustomCursorMove(event: PointerEvent) {
+  setCustomCursorState(event)
+}
+
+function handleCustomCursorUp() {
+  customCursorPressed.value = false
+}
+
+function hideCustomCursor() {
+  customCursorVisible.value = false
+  customCursorInteractive.value = false
+  customCursorPressed.value = false
+}
+
+function syncCustomCursorSupport() {
+  customCursorSupported.value = canUseCustomCursor()
+  if (typeof document !== 'undefined') {
+    document.body.classList.toggle('water-cursor-mode', customCursorSupported.value)
+  }
+  if (!customCursorSupported.value) {
+    hideCustomCursor()
+  }
+}
+
+function handleCustomCursorOut(event: MouseEvent) {
+  if (event.relatedTarget) return
+  hideCustomCursor()
+}
+
+function pokeWaterPet() {
+  if (waterPetSuppressClick.value) return
+  waterPetMoodIndex.value += 1
+  waterPetPoked.value = true
+  if (waterPetTimer !== undefined) {
+    window.clearTimeout(waterPetTimer)
+  }
+  waterPetTimer = window.setTimeout(() => {
+    waterPetPoked.value = false
+    waterPetTimer = undefined
+  }, 900)
+}
+
+function clampWaterPetPosition(x: number, y: number) {
+  const width = 78
+  const height = 92
+  const margin = 12
+  const maxX = Math.max(margin, window.innerWidth - width - margin)
+  const maxY = Math.max(margin, window.innerHeight - height - margin)
+  return {
+    x: Math.min(Math.max(x, margin), maxX),
+    y: Math.min(Math.max(y, margin), maxY),
+  }
+}
+
+function moveWaterPetTo(x: number, y: number) {
+  const next = clampWaterPetPosition(x, y)
+  waterPetX.value = next.x
+  waterPetY.value = next.y
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(waterPetStorageKey, JSON.stringify(next))
+  }
+}
+
+function stopWaterPetWalk() {
+  waterPetWalking.value = false
+  waterPetTurning.value = false
+  waterPetLean.value = 0
+  if (waterPetWalkTimer !== undefined) {
+    window.clearTimeout(waterPetWalkTimer)
+    waterPetWalkTimer = undefined
+  }
+}
+
+function nextWaterPetWalkTarget() {
+  const width = 78
+  const nearLeft = waterPetX.value < 120
+  const nearRight = waterPetX.value > window.innerWidth - width - 120
+  const direction = nearLeft ? 1 : nearRight ? -1 : Math.random() > 0.5 ? 1 : -1
+  const stepX = direction * (82 + Math.round(Math.random() * 88))
+  const stepY = Math.round((Math.random() - 0.5) * 32)
+  return clampWaterPetPosition(waterPetX.value + stepX, waterPetY.value + stepY)
+}
+
+function setDefaultWaterPetPosition() {
+  const stored = loadWaterPetPosition()
+  if (stored) {
+    moveWaterPetTo(stored.x, stored.y)
+    return
+  }
+  moveWaterPetTo(
+    window.innerWidth - (rightPanelCollapsed.value ? 48 : rightPanelWidth.value) - 116,
+    window.innerHeight - 212,
+  )
+}
+
+function loadWaterPetPosition() {
+  if (typeof window === 'undefined') return undefined
+  const raw = window.localStorage.getItem(waterPetStorageKey)
+  if (!raw) return undefined
+  try {
+    const parsed = JSON.parse(raw) as { x?: number; y?: number }
+    if (typeof parsed.x !== 'number' || typeof parsed.y !== 'number') return undefined
+    return clampWaterPetPosition(parsed.x, parsed.y)
+  } catch {
+    return undefined
+  }
+}
+
+function scheduleWaterPetMove(delay = 900 + Math.round(Math.random() * 700)) {
+  if (waterPetMoveTimer !== undefined) {
+    window.clearTimeout(waterPetMoveTimer)
+  }
+  waterPetMoveTimer = window.setTimeout(() => {
+    waterPetMoveTimer = undefined
+    if (!waterPetDragging.value && !selectedTaskIsLive.value) {
+      const target = nextWaterPetWalkTarget()
+      walkWaterPetTo(target.x, target.y)
+    }
+    scheduleWaterPetMove(3000 + Math.round(Math.random() * 2600))
+  }, delay)
+}
+
+function walkWaterPetTo(x: number, y: number) {
+  if (waterPetDragging.value || selectedTaskIsLive.value) return
+  stopWaterPetWalk()
+  const startX = waterPetX.value
+  const startY = waterPetY.value
+  const target = clampWaterPetPosition(x, y)
+  const dx = target.x - startX
+  const dy = target.y - startY
+  const distance = Math.hypot(dx, dy)
+  if (distance < 24) return
+  waterPetFacing.value = dx >= 0 ? 1 : -1
+  waterPetLean.value = waterPetFacing.value * -4
+  const steps = Math.max(6, Math.min(14, Math.round(distance / 16)))
+  const stepDuration = distance < 100 ? 132 : 112
+  waterPetTurning.value = true
+  waterPetGaitPhase.value = 0
+  let step = 0
+  const advance = () => {
+    if (waterPetDragging.value || selectedTaskIsLive.value) {
+      stopWaterPetWalk()
+      return
+    }
+    step += 1
+    waterPetGaitPhase.value += 1
+    const t = step / steps
+    const eased = t * t * (3 - 2 * t)
+    const wave = Math.sin(t * Math.PI * steps)
+    const bob = Math.abs(wave) * (distance < 100 ? 2.4 : 3.6)
+    const sway = wave * waterPetFacing.value * (distance < 100 ? 1.4 : 2.2)
+    const leanEase = Math.sin(Math.PI * t)
+    waterPetLean.value = waterPetFacing.value * (3 + leanEase * 5)
+    moveWaterPetTo(startX + dx * eased + sway, startY + dy * eased - bob)
+    if (step < steps) {
+      waterPetWalkTimer = window.setTimeout(advance, stepDuration)
+      return
+    }
+    moveWaterPetTo(target.x, target.y)
+    stopWaterPetWalk()
+  }
+  waterPetWalkTimer = window.setTimeout(() => {
+    waterPetTurning.value = false
+    waterPetWalking.value = true
+    advance()
+  }, 140)
+}
+
+function startWaterPetDrag(event: PointerEvent) {
+  stopWaterPetWalk()
+  const target = event.currentTarget as HTMLElement
+  waterPetDrag = {
+    pointerId: event.pointerId,
+    offsetX: event.clientX - waterPetX.value,
+    offsetY: event.clientY - waterPetY.value,
+    startX: event.clientX,
+    startY: event.clientY,
+    moved: false,
+  }
+  waterPetDragging.value = true
+  target.setPointerCapture(event.pointerId)
+  window.addEventListener('pointermove', dragWaterPet)
+  window.addEventListener('pointerup', stopWaterPetDrag)
+  window.addEventListener('pointercancel', stopWaterPetDrag)
+}
+
+function dragWaterPet(event: PointerEvent) {
+  if (!waterPetDrag || event.pointerId !== waterPetDrag.pointerId) return
+  if (Math.hypot(event.clientX - waterPetDrag.startX, event.clientY - waterPetDrag.startY) > 3) {
+    waterPetDrag.moved = true
+  }
+  moveWaterPetTo(event.clientX - waterPetDrag.offsetX, event.clientY - waterPetDrag.offsetY)
+}
+
+function stopWaterPetDrag(event: PointerEvent) {
+  if (!waterPetDrag || event.pointerId !== waterPetDrag.pointerId) return
+  const moved = waterPetDrag.moved
+  window.removeEventListener('pointermove', dragWaterPet)
+  window.removeEventListener('pointerup', stopWaterPetDrag)
+  window.removeEventListener('pointercancel', stopWaterPetDrag)
+  waterPetDragging.value = false
+  waterPetDrag = undefined
+  if (moved) {
+    waterPetSuppressClick.value = true
+    window.setTimeout(() => {
+      waterPetSuppressClick.value = false
+    }, 0)
+  }
+  if (!selectedTaskIsLive.value) {
+    scheduleWaterPetMove()
+  }
+}
+
+function keepWaterPetInBounds() {
+  moveWaterPetTo(waterPetX.value, waterPetY.value)
 }
 
 function startPanelResize(side: PanelSide, event: PointerEvent) {
@@ -472,6 +963,45 @@ function payloadNumber(payload: Record<string, unknown>, key: string) {
   return Number.isFinite(numberValue) ? numberValue : 0
 }
 
+function payloadStringArray(payload: Record<string, unknown>, key: string) {
+  const value = payload[key]
+  if (!Array.isArray(value)) return []
+  return value.map((item) => String(item)).filter(Boolean)
+}
+
+function parseSummaryFiles(value: unknown): SummaryFile[] {
+  if (!Array.isArray(value)) return []
+  return value.map((raw) => {
+    const item = (raw ?? {}) as Record<string, unknown>
+    return {
+      path: String(item.path ?? ''),
+      displayPath: String(item.displayPath ?? item.path ?? ''),
+      action: String(item.action ?? 'modified'),
+      bytes: numberValue(item.bytes),
+      additions: numberValue(item.additions),
+      deletions: numberValue(item.deletions),
+    }
+  }).filter((item) => item.path || item.displayPath)
+}
+
+function parseSummaryCommands(value: unknown): SummaryCommand[] {
+  if (!Array.isArray(value)) return []
+  return value.map((raw) => {
+    const item = (raw ?? {}) as Record<string, unknown>
+    return {
+      command: String(item.command ?? ''),
+      status: String(item.status ?? 'passed'),
+      summary: String(item.summary ?? ''),
+      truncated: item.truncated === true,
+    }
+  }).filter((item) => item.command)
+}
+
+function numberValue(value: unknown) {
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) ? number : 0
+}
+
 function updateExecutionTiming(group: ExecutionGroup, item: TaskEvent) {
   if (item.type === 'turn.started') {
     group.startedAt = item.createdAt
@@ -489,6 +1019,16 @@ function updateExecutionGroup(group: ExecutionGroup, item: TaskEvent) {
       tokenBudget: payloadNumber(payload, 'tokenBudget'),
       contextWindowTokens: payloadNumber(payload, 'contextWindowTokens'),
       truncated: payload.truncated === true,
+      hasTaskSummary: payload.hasTaskSummary === true,
+      selectedFilePaths: payloadStringArray(payload, 'selectedFilePaths'),
+    }
+    return
+  }
+  if (item.type === 'context.summary.updated') {
+    group.contextSummary = {
+      summary: String(payload.summary ?? ''),
+      contentHash: String(payload.contentHash ?? ''),
+      chars: payloadNumber(payload, 'chars'),
     }
     return
   }
@@ -530,6 +1070,9 @@ function executionStepFromEvent(item: TaskEvent): ExecutionStep | undefined {
     case 'task.started':
       return makeExecutionStep(item, '任务创建', String(payload.title ?? '任务已创建'), 'normal')
     case 'context.pack.built':
+      return makeExecutionStep(item, '上下文已组装', summarizeContextPack(payload), 'normal')
+    case 'context.summary.updated':
+      return makeExecutionStep(item, '上下文摘要已更新', summarizeContextSummary(payload), 'success')
     case 'turn.started':
     case 'agent.message.delta':
     case 'agent.message.completed':
@@ -586,6 +1129,25 @@ function summarizeToolCalls(payload: Record<string, unknown>) {
       return `${name}${args ? ` ${args}` : ''}`
     })
     .join('\n')
+}
+
+function summarizeContextPack(payload: Record<string, unknown>) {
+  const estimated = payloadNumber(payload, 'estimatedTokens')
+  const budget = payloadNumber(payload, 'tokenBudget')
+  const files = payloadStringArray(payload, 'selectedFilePaths')
+  const lines = [
+    budget > 0 ? `预算 ${estimated} / ${budget} tokens` : `估算 ${estimated} tokens`,
+    payload.hasTaskSummary === true ? '已带入任务滚动摘要' : '暂无任务滚动摘要',
+    files.length > 0 ? `选中文件摘要 ${files.length} 个` : '未选中文件摘要',
+  ]
+  if (payload.truncated === true) lines.push('已按预算截断低优先级上下文')
+  return lines.join('\n')
+}
+
+function summarizeContextSummary(payload: Record<string, unknown>) {
+  const chars = payloadNumber(payload, 'chars')
+  const summary = compactText(String(payload.summary ?? ''), 360)
+  return [`任务滚动摘要 ${chars} 字`, summary].filter(Boolean).join('\n')
 }
 
 function summarizeToolResult(payload: Record<string, unknown>) {
@@ -658,6 +1220,13 @@ function latestTaskStatusText(items: TaskEvent[]) {
   return 'Agent 正在思考'
 }
 
+function taskLifecycleText(status: string) {
+  if (status === 'created') return '未开始'
+  if (status === 'active') return '已开始'
+  if (status === 'archived') return '已归档'
+  return status
+}
+
 function executionDurationText(group: ExecutionGroup) {
   if (!group.startedAt) return ''
   const started = Date.parse(group.startedAt)
@@ -682,6 +1251,137 @@ function formatTokenCount(value: number) {
   if (value >= 10000) return `${Math.round(value / 1000)}k`
   if (value >= 1000) return `${(value / 1000).toFixed(1)}k`
   return String(value)
+}
+
+function parentWorkspacePath(path: string) {
+  if (!path) return ''
+  const parts = path.split('/').filter(Boolean)
+  parts.pop()
+  return parts.join('/')
+}
+
+function formatFileSize(size: number) {
+  if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`
+  if (size >= 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${size} B`
+}
+
+function detectFileLanguage(path: string) {
+  const name = path.toLowerCase()
+  const ext = name.split('.').pop() ?? ''
+  if (name.endsWith('.vue')) return 'vue'
+  if (['ts', 'tsx'].includes(ext)) return 'typescript'
+  if (['js', 'jsx', 'mjs', 'cjs'].includes(ext)) return 'javascript'
+  if (['java', 'kt', 'kts'].includes(ext)) return 'java'
+  if (['go'].includes(ext)) return 'go'
+  if (['json'].includes(ext)) return 'json'
+  if (['yml', 'yaml'].includes(ext)) return 'yaml'
+  if (['css', 'scss', 'less'].includes(ext)) return 'css'
+  if (['html', 'xml', 'svg'].includes(ext)) return 'markup'
+  if (['md', 'markdown'].includes(ext)) return 'markdown'
+  if (['sql'].includes(ext)) return 'sql'
+  if (['sh', 'bash', 'zsh'].includes(ext)) return 'shell'
+  return ext || 'text'
+}
+
+function escapeHTML(value: string) {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;')
+}
+
+function highlightCode(content: string, language: string) {
+  if (!content) return ''
+  if (language === 'markup' || language === 'vue') return highlightMarkup(content)
+  if (language === 'json') return highlightJSON(content)
+  if (language === 'yaml') return highlightYAML(content)
+  return highlightCommonCode(content, language)
+}
+
+function highlightToken(raw: string, tone: string) {
+  return `<span class="code-token ${tone}">${escapeHTML(raw)}</span>`
+}
+
+function highlightCommonCode(content: string, language: string) {
+  const keywordsByLanguage: Record<string, string[]> = {
+    java: ['class', 'interface', 'enum', 'public', 'private', 'protected', 'static', 'final', 'void', 'new', 'return', 'if', 'else', 'for', 'while', 'switch', 'case', 'try', 'catch', 'throw', 'throws', 'extends', 'implements', 'package', 'import', 'true', 'false', 'null'],
+    typescript: ['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'switch', 'case', 'type', 'interface', 'class', 'extends', 'implements', 'import', 'from', 'export', 'default', 'async', 'await', 'true', 'false', 'null', 'undefined'],
+    javascript: ['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'switch', 'case', 'class', 'extends', 'import', 'from', 'export', 'default', 'async', 'await', 'true', 'false', 'null', 'undefined'],
+    go: ['package', 'import', 'func', 'type', 'struct', 'interface', 'return', 'if', 'else', 'for', 'range', 'switch', 'case', 'defer', 'go', 'chan', 'select', 'true', 'false', 'nil'],
+    css: ['display', 'position', 'grid', 'flex', 'color', 'background', 'border', 'padding', 'margin', 'font', 'width', 'height'],
+    shell: ['if', 'then', 'else', 'fi', 'for', 'do', 'done', 'case', 'esac', 'export', 'local', 'function'],
+    sql: ['select', 'from', 'where', 'insert', 'into', 'update', 'delete', 'create', 'table', 'alter', 'join', 'left', 'right', 'inner', 'values', 'set', 'group', 'order', 'by', 'limit'],
+  }
+  const keywords = new Set([...(keywordsByLanguage[language] ?? []), ...(keywordsByLanguage.javascript ?? [])])
+  const keywordPattern = [...keywords].sort((a, b) => b.length - a.length).join('|')
+  const tokenPattern = new RegExp(
+    `("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|\\\`(?:\\\\.|[^\\\`\\\\])*\\\`|\\/\\/.*|\\/\\*[\\s\\S]*?\\*\\/|#.*$|\\b(?:${keywordPattern})\\b|\\b\\d+(?:\\.\\d+)?\\b)`,
+    'gim',
+  )
+  let lastIndex = 0
+  let output = ''
+  for (const match of content.matchAll(tokenPattern)) {
+    const token = match[0]
+    const index = match.index ?? 0
+    output += escapeHTML(content.slice(lastIndex, index))
+    if (token.startsWith('//') || token.startsWith('/*') || token.startsWith('#')) {
+      output += highlightToken(token, 'comment')
+    } else if (token.startsWith('"') || token.startsWith("'") || token.startsWith('`')) {
+      output += highlightToken(token, 'string')
+    } else if (/^\d/.test(token)) {
+      output += highlightToken(token, 'number')
+    } else {
+      output += highlightToken(token, 'keyword')
+    }
+    lastIndex = index + token.length
+  }
+  output += escapeHTML(content.slice(lastIndex))
+  return output
+}
+
+function highlightJSON(content: string) {
+  const formatted = (() => {
+    try {
+      return JSON.stringify(JSON.parse(content), null, 2)
+    } catch {
+      return content
+    }
+  })()
+  const escaped = escapeHTML(formatted)
+  return escaped.replace(
+    /(&quot;(?:\\.|[^"\\])*&quot;)(\s*:)?|\b(true|false|null)\b|-?\b\d+(?:\.\d+)?\b/g,
+    (token, stringToken: string, colon: string, literal: string) => {
+      if (stringToken) {
+        return colon
+          ? `<span class="code-token property">${stringToken}</span>${colon}`
+          : `<span class="code-token string">${stringToken}</span>`
+      }
+      if (literal) return `<span class="code-token keyword">${literal}</span>`
+      return `<span class="code-token number">${token}</span>`
+    },
+  )
+}
+
+function highlightYAML(content: string) {
+  return escapeHTML(content)
+    .replace(/^(\s*[\w.-]+)(:)/gm, '<span class="code-token property">$1</span>$2')
+    .replace(/(#.*)$/gm, '<span class="code-token comment">$1</span>')
+    .replace(/\b(true|false|null)\b/g, '<span class="code-token keyword">$1</span>')
+}
+
+function highlightMarkup(content: string) {
+  return escapeHTML(content)
+    .replace(/(&lt;!--[\s\S]*?--&gt;)/g, '<span class="code-token comment">$1</span>')
+    .replace(/(&lt;\/?[\w:-]+)([\s\S]*?)(&gt;)/g, (_match, open: string, attrs: string, close: string) => {
+      const highlightedAttrs = attrs.replace(
+        /([\w:-]+)(=)(&quot;.*?&quot;|&#39;.*?&#39;)/g,
+        '<span class="code-token property">$1</span>$2<span class="code-token string">$3</span>',
+      )
+      return `<span class="code-token keyword">${open}</span>${highlightedAttrs}<span class="code-token keyword">${close}</span>`
+    })
 }
 
 function formatDuration(ms: number) {
@@ -744,6 +1444,111 @@ async function copyAssistantMarkdown(block: ChatBlock) {
   } catch {
     message.error('复制失败')
   }
+}
+
+function isSummaryRawMode(summary: TurnSummary) {
+  return summaryRawMode[summary.key] === true
+}
+
+function isSummaryExpanded(summary: TurnSummary) {
+  return summaryExpanded[summary.key] === true
+}
+
+function toggleSummaryExpanded(summary: TurnSummary) {
+  summaryExpanded[summary.key] = !isSummaryExpanded(summary)
+}
+
+function toggleSummaryRawMode(summary: TurnSummary) {
+  summaryRawMode[summary.key] = !summaryRawMode[summary.key]
+}
+
+function summaryCommands(summary: TurnSummary) {
+  return summary.validations.length > 0 ? summary.validations : summary.commands
+}
+
+function summaryCommandTitle(summary: TurnSummary) {
+  return summary.validations.length > 0 ? '验证结果' : '命令结果'
+}
+
+function summaryFileTotals(summary: TurnSummary) {
+  return summary.changedFiles.reduce(
+    (totals, file) => ({
+      additions: totals.additions + file.additions,
+      deletions: totals.deletions + file.deletions,
+    }),
+    { additions: 0, deletions: 0 },
+  )
+}
+
+function commandStatusText(status: string) {
+  return status === 'failed' ? '失败' : '通过'
+}
+
+function commandStatusTone(status: string) {
+  return status === 'failed' ? 'error' : 'success'
+}
+
+function fileActionText(action: string) {
+  return action === 'created' ? '新增' : '修改'
+}
+
+function summaryMarkdown(summary: TurnSummary) {
+  const lines: string[] = []
+  const totals = summaryFileTotals(summary)
+  if (summary.changedFiles.length > 0) {
+    lines.push(`已编辑 ${summary.changedFiles.length} 个文件`)
+    lines.push(`+${totals.additions} -${totals.deletions}`)
+    for (const file of summary.changedFiles) {
+      lines.push(`- ${file.displayPath || file.path} +${file.additions} -${file.deletions}`)
+    }
+  }
+  const commands = summaryCommands(summary)
+  if (commands.length > 0) {
+    if (lines.length > 0) lines.push('')
+    lines.push(`${summaryCommandTitle(summary)}：`)
+    for (const command of commands) {
+      lines.push(`- \`${command.command}\` ${commandStatusText(command.status)}`)
+      if (command.summary) lines.push(`  ${command.summary}`)
+    }
+  }
+  return lines.join('\n')
+}
+
+async function copySummaryMarkdown(summary: TurnSummary) {
+  try {
+    await navigator.clipboard.writeText(summaryMarkdown(summary))
+    message.success('任务产物 Markdown 已复制')
+  } catch {
+    message.error('复制失败')
+  }
+}
+
+async function copyWorkspaceFileContent() {
+  if (!workspaceFileDisplayContent.value) return
+  try {
+    await navigator.clipboard.writeText(workspaceFileDisplayContent.value)
+    message.success('文件内容已复制')
+  } catch {
+    message.error('复制失败')
+  }
+}
+
+function triggerDownload(url: string) {
+  const link = document.createElement('a')
+  link.href = url
+  link.download = ''
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+}
+
+function downloadWorkspaceFile() {
+  if (!selectedWorkspaceId.value || !workspaceFileContent.value?.path) return
+  triggerDownload(workspaceFileDownloadURL(selectedWorkspaceId.value, workspaceFileContent.value.path))
+}
+
+function downloadWorkspaceArchive(item: Workspace) {
+  triggerDownload(workspaceArchiveDownloadURL(item.id))
 }
 
 function syncAssistantTyping(blocks: ChatBlock[]) {
@@ -865,6 +1670,16 @@ function executionStatusColor(status: ExecutionGroup['status']) {
   }
 }
 
+function turnOutcomeLabel(turnId?: string) {
+  if (!turnId) return ''
+  return turnOutcomeByTurn.value.get(turnId)?.label ?? ''
+}
+
+function turnOutcomeTone(turnId?: string) {
+  if (!turnId) return 'default'
+  return turnOutcomeByTurn.value.get(turnId)?.tone ?? 'default'
+}
+
 function openTaskModal(item?: Task) {
   editingTaskId.value = item?.id ?? ''
   taskTitle.value = item?.title ?? ''
@@ -958,6 +1773,10 @@ async function refreshWorkspaceState() {
     tasks.value = []
     approvals.value = []
     externalPaths.value = []
+    workspaceFiles.value = []
+    workspaceFilePath.value = ''
+    selectedWorkspaceFilePath.value = ''
+    workspaceFileContent.value = null
     return
   }
   const previousTaskId = selectedTaskId.value
@@ -975,6 +1794,7 @@ async function refreshWorkspaceState() {
   if (selectedTaskId.value === previousTaskId) {
     await refreshEvents()
   }
+  void refreshWorkspaceFiles(workspaceFilePath.value)
 }
 
 async function refreshApprovals() {
@@ -1110,6 +1930,56 @@ async function deleteExternalPath(item: ExternalPath) {
   }
 }
 
+async function refreshWorkspaceFiles(path = '') {
+  if (!selectedWorkspaceId.value) return
+  fileBrowserLoading.value = true
+  try {
+    const data = await api.listWorkspaceFiles(selectedWorkspaceId.value, path)
+    workspaceFilePath.value = data.path === '.' ? '' : data.path
+    workspaceFiles.value = data.items
+  } catch (err) {
+    workspaceFiles.value = []
+    showError(err)
+  } finally {
+    fileBrowserLoading.value = false
+  }
+}
+
+async function openWorkspaceFile(item: WorkspaceFileItem) {
+  if (item.isDir) {
+    selectedWorkspaceFilePath.value = ''
+    workspaceFileContent.value = null
+    filePreviewOpen.value = false
+    await refreshWorkspaceFiles(item.path)
+    return
+  }
+  if (!selectedWorkspaceId.value) return
+  selectedWorkspaceFilePath.value = item.path
+  workspaceFileContent.value = null
+  filePreviewOpen.value = true
+  fileContentLoading.value = true
+  try {
+    workspaceFileContent.value = await api.readWorkspaceFile(selectedWorkspaceId.value, item.path)
+  } catch (err) {
+    workspaceFileContent.value = null
+    filePreviewOpen.value = false
+    showError(err)
+  } finally {
+    fileContentLoading.value = false
+  }
+}
+
+async function openWorkspaceFileParent() {
+  selectedWorkspaceFilePath.value = ''
+  workspaceFileContent.value = null
+  filePreviewOpen.value = false
+  await refreshWorkspaceFiles(workspaceFileParentPath.value)
+}
+
+function closeWorkspaceFilePreview() {
+  filePreviewOpen.value = false
+}
+
 async function saveTask() {
   if (!selectedWorkspaceId.value || !taskTitle.value.trim()) return
   taskSubmitting.value = true
@@ -1148,16 +2018,31 @@ async function deleteTask(item: Task) {
 }
 
 async function sendTurn() {
-  if (!selectedTaskId.value || !userInput.value.trim()) return
+  if (!canSubmitTurn.value) return
   const input = userInput.value
   userInput.value = ''
+  await submitTurn(input, () => {
+    userInput.value = input
+  })
+}
+
+async function continueTurn(block: ChatBlock) {
+  const input = block.continuation?.prompt.trim()
+  if (!selectedTaskId.value || !input) return
+  await submitTurn(input, () => {
+    userInput.value = input
+  })
+}
+
+async function submitTurn(input: string, restoreInput: () => void) {
+  if (selectedTaskIsLive.value) return
   scrollChatToBottom('smooth')
   try {
     await api.createTurn(selectedTaskId.value, input)
     await refreshEvents()
     scrollChatToBottom('smooth')
   } catch (err) {
-    userInput.value = input
+    restoreInput()
     showError(err)
   }
 }
@@ -1165,6 +2050,7 @@ async function sendTurn() {
 function handleComposerKeydown(event: KeyboardEvent) {
   if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return
   event.preventDefault()
+  if (!canSubmitTurn.value) return
   void sendTurn()
 }
 
@@ -1288,6 +2174,11 @@ function showError(err: unknown) {
 
 watch(selectedWorkspaceId, () => {
   selectedTaskId.value = ''
+  workspaceFilePath.value = ''
+  selectedWorkspaceFilePath.value = ''
+  workspaceFileContent.value = null
+  filePreviewOpen.value = false
+  workspaceFiles.value = []
   void refreshWorkspaceState()
 })
 
@@ -1322,13 +2213,56 @@ watch(selectedThemeName, (name) => {
   window.localStorage.setItem(themeStorageKey, name)
 })
 
-onMounted(refreshAll)
+watch(selectedTaskIsLive, (isLive) => {
+  if (isLive) {
+    stopWaterPetWalk()
+    return
+  }
+  scheduleWaterPetMove(800)
+})
+
+onMounted(() => {
+  refreshAll()
+  setDefaultWaterPetPosition()
+  scheduleWaterPetMove(800)
+  syncCustomCursorSupport()
+  window.addEventListener('pointermove', handleCustomCursorMove, { passive: true })
+  window.addEventListener('pointerdown', handleCustomCursorDown, { passive: true })
+  window.addEventListener('pointerup', handleCustomCursorUp, { passive: true })
+  window.addEventListener('pointercancel', handleCustomCursorUp, { passive: true })
+  window.addEventListener('blur', hideCustomCursor)
+  window.addEventListener('mouseout', handleCustomCursorOut)
+  window.addEventListener('resize', keepWaterPetInBounds, { passive: true })
+  customCursorMediaQuery = window.matchMedia('(pointer: fine)')
+  customCursorMediaQuery.addEventListener('change', syncCustomCursorSupport)
+})
 const nowTickTimer = window.setInterval(() => {
   nowTick.value = Date.now()
 }, 1000)
 onBeforeUnmount(() => {
   stopPanelResize()
   clearAssistantTypingTimers()
+  if (waterPetTimer !== undefined) {
+    window.clearTimeout(waterPetTimer)
+  }
+  if (waterPetMoveTimer !== undefined) {
+    window.clearTimeout(waterPetMoveTimer)
+  }
+  stopWaterPetWalk()
+  window.removeEventListener('pointermove', dragWaterPet)
+  window.removeEventListener('pointerup', stopWaterPetDrag)
+  window.removeEventListener('pointercancel', stopWaterPetDrag)
+  if (typeof document !== 'undefined') {
+    document.body.classList.remove('water-cursor-mode')
+  }
+  window.removeEventListener('pointermove', handleCustomCursorMove)
+  window.removeEventListener('pointerdown', handleCustomCursorDown)
+  window.removeEventListener('pointerup', handleCustomCursorUp)
+  window.removeEventListener('pointercancel', handleCustomCursorUp)
+  window.removeEventListener('blur', hideCustomCursor)
+  window.removeEventListener('mouseout', handleCustomCursorOut)
+  window.removeEventListener('resize', keepWaterPetInBounds)
+  customCursorMediaQuery?.removeEventListener('change', syncCustomCursorSupport)
   window.clearInterval(nowTickTimer)
   closeTaskSocket()
 })
@@ -1342,6 +2276,79 @@ onBeforeUnmount(() => {
       :data-theme="selectedThemeName"
       :style="shellStyle"
     >
+      <div
+        v-show="customCursorSupported && customCursorVisible"
+        class="water-cursor"
+        :class="{ 'is-interactive': customCursorInteractive, 'is-pressed': customCursorPressed }"
+        :style="customCursorStyle"
+        aria-hidden="true"
+      >
+        <svg viewBox="0 0 24 32" class="water-cursor-pointer" aria-hidden="true">
+          <path
+            d="M4 2L17.4 15.2H10.2L13.8 28.8L11.5 29.4L7.7 18.7L4 22.3V2Z"
+            class="water-cursor-body"
+          />
+          <path
+            d="M7.6 8.3L14.7 15.4"
+            class="water-cursor-sheen"
+          />
+        </svg>
+      </div>
+      <button
+        class="water-pet"
+        :class="{
+          'is-live': selectedTaskIsLive,
+          'is-poked': waterPetPoked,
+          'is-dragging': waterPetDragging,
+          'is-walking': waterPetWalking,
+          'is-turning': waterPetTurning,
+          'is-facing-left': waterPetFacing < 0,
+          'is-facing-right': waterPetFacing > 0,
+          [waterPetGaitClass]: true,
+        }"
+        :style="waterPetStyle"
+        type="button"
+        :title="waterPetMessage"
+        aria-label="若水水灵"
+        @pointerdown.prevent="startWaterPetDrag"
+        @click="pokeWaterPet"
+      >
+        <span class="water-pet-bubble">{{ waterPetMessage }}</span>
+        <span class="water-pet-trail one" aria-hidden="true"></span>
+        <span class="water-pet-trail two" aria-hidden="true"></span>
+        <span class="water-pet-ripple" aria-hidden="true"></span>
+        <svg class="water-pet-figure" viewBox="0 0 88 96" aria-hidden="true">
+          <path
+            class="water-pet-shadow"
+            d="M23 78C31 72 55 72 65 78C58 83 31 84 23 78Z"
+          />
+          <path
+            class="water-pet-body"
+            d="M44 8C28 25 17 39 17 57C17 76 30 87 44 87C58 87 71 76 71 57C71 39 60 25 44 8Z"
+          />
+          <path
+            class="water-pet-shine"
+            d="M31 36C35 27 40 21 45 16"
+          />
+          <path class="water-pet-arm left" d="M19 57C11 58 9 64 13 68" />
+          <path class="water-pet-arm right" d="M69 57C77 58 79 64 75 68" />
+          <g class="water-pet-face">
+            <circle class="water-pet-eye left" cx="35" cy="53" r="3.2" />
+            <circle class="water-pet-eye right" cx="53" cy="53" r="3.2" />
+            <circle class="water-pet-eye-spark left" cx="33.9" cy="51.8" r="1" />
+            <circle class="water-pet-eye-spark right" cx="51.9" cy="51.8" r="1" />
+            <path class="water-pet-mouth" d="M36 64C40 69 48 69 52 64" />
+          </g>
+          <path class="water-pet-foot left" d="M31 85C34 89 39 89 42 86" />
+          <path class="water-pet-foot right" d="M46 86C50 89 55 89 58 85" />
+          <path
+            class="water-pet-wave"
+            d="M18 69C25 64 31 64 38 69C45 74 52 74 60 68C64 65 68 64 72 65"
+          />
+          <circle class="water-pet-spark one" cx="22" cy="31" r="2" />
+          <circle class="water-pet-spark two" cx="69" cy="42" r="1.8" />
+        </svg>
+      </button>
       <aside class="left-panel" :class="{ collapsed: leftPanelCollapsed }">
         <button
           class="sidebar-toggle"
@@ -1354,7 +2361,9 @@ onBeforeUnmount(() => {
         </button>
         <template v-if="!leftPanelCollapsed">
           <section class="brand-row">
-            <div class="water-mark"><span>若</span></div>
+            <div class="water-mark">
+              <img :src="brandMarkSrc" alt="" aria-hidden="true" />
+            </div>
             <div>
               <h1>{{ productName }}</h1>
               <p>{{ productTagline }}</p>
@@ -1396,17 +2405,21 @@ onBeforeUnmount(() => {
                 v-for="item in tasks"
                 :key="item.id"
                 class="task-item"
-                :class="{ active: item.id === selectedTaskId }"
+                :class="{
+                  active: item.id === selectedTaskId,
+                  'is-live': item.id === selectedTaskId && selectedTaskIsLive,
+                  'is-complete': item.id === selectedTaskId && selectedTaskIsCompleted,
+                }"
                 @click="selectedTaskId = item.id"
               >
                 <div class="task-item-main">
                   <span>{{ item.title }}</span>
                   <small>
                     <template v-if="item.id === selectedTaskId">
-                      {{ item.status }} · {{ statusText }}
+                      {{ taskLifecycleText(item.status) }} · {{ statusText }}
                     </template>
                     <template v-else>
-                      {{ item.status }}
+                      {{ taskLifecycleText(item.status) }}
                     </template>
                   </small>
                 </div>
@@ -1454,9 +2467,17 @@ onBeforeUnmount(() => {
             <span class="eyebrow">{{ selectedWorkspace?.name ?? productName }}</span>
             <h2>{{ selectedTask?.title ?? '选择任务开始' }}</h2>
             <div class="chat-status-line">
-              <a-tag :color="taskHeaderTone">{{ statusText }}</a-tag>
+              <a-tag class="task-status-tag" :color="taskHeaderTone">
+                {{ statusText }}
+              </a-tag>
+              <span v-if="selectedTaskIsThinking" class="status-thought-wave" aria-hidden="true">
+                <i></i>
+                <i></i>
+                <i></i>
+              </span>
+              <span v-else-if="selectedTaskIsCompleted" class="status-complete-drop" aria-hidden="true"></span>
               <span v-if="latestTurnDurationText" class="duration-chip">{{ latestTurnDurationText }}</span>
-              <span v-if="selectedTask" class="muted">任务 {{ selectedTask.status }}</span>
+              <span v-if="selectedTask" class="muted">任务{{ taskLifecycleText(selectedTask.status) }}</span>
             </div>
           </div>
           <div class="chat-header-actions">
@@ -1512,7 +2533,16 @@ onBeforeUnmount(() => {
               </div>
               <div class="message-content">
                 <div class="message-title-row">
-                  <div class="message-title">{{ item.block.title }}</div>
+                  <div class="message-title">
+                    <span class="message-title-text">{{ item.block.title }}</span>
+                    <a-tag
+                      v-if="item.block.role === 'assistant' && turnOutcomeLabel(item.block.turnId)"
+                      class="message-title-tag"
+                      :color="turnOutcomeTone(item.block.turnId)"
+                    >
+                      {{ turnOutcomeLabel(item.block.turnId) }}
+                    </a-tag>
+                  </div>
                   <a-space v-if="item.block.role === 'assistant'" class="message-actions" :size="4">
                     <a-button
                       size="small"
@@ -1548,6 +2578,15 @@ onBeforeUnmount(() => {
                   <span>{{ visibleChatContent(item.block) }}</span>
                   <span v-if="isAssistantTyping(item.block)" class="answer-cursor" aria-hidden="true" />
                 </p>
+                <div
+                  v-if="item.block.role === 'system' && item.block.continuation?.canContinue"
+                  class="message-continuation-actions"
+                >
+                  <a-button size="small" type="primary" ghost @click="continueTurn(item.block)">
+                    <template #icon><ArrowRight :size="13" /></template>
+                    继续上一轮
+                  </a-button>
+                </div>
               </div>
             </article>
 
@@ -1625,6 +2664,124 @@ onBeforeUnmount(() => {
                 </a-collapse>
               </div>
             </section>
+
+            <section
+              v-else-if="item.kind === 'summary' && item.summary"
+              class="message-block summary-message"
+            >
+              <div class="message-avatar">果</div>
+              <div class="message-content summary-panel">
+                <div class="summary-header">
+                  <div class="summary-heading">
+                    <strong>任务产物</strong>
+                    <small>
+                      {{
+                        [
+                          item.summary.changedFiles.length > 0
+                            ? `已编辑 ${item.summary.changedFiles.length} 个文件`
+                            : '',
+                          summaryCommands(item.summary).length > 0
+                            ? `${summaryCommandTitle(item.summary)} ${summaryCommands(item.summary).length} 项`
+                            : '',
+                        ]
+                          .filter(Boolean)
+                          .join(' · ')
+                      }}
+                    </small>
+                  </div>
+                  <a-button
+                    size="small"
+                    type="text"
+                    class="summary-toggle"
+                    :title="isSummaryExpanded(item.summary) ? '收起任务产物' : '展开任务产物'"
+                    :aria-label="isSummaryExpanded(item.summary) ? '收起任务产物' : '展开任务产物'"
+                    @click="toggleSummaryExpanded(item.summary)"
+                  >
+                    <template #icon>
+                      <ChevronDown
+                        :size="13"
+                        class="summary-toggle-icon"
+                        :class="{ open: isSummaryExpanded(item.summary) }"
+                      />
+                    </template>
+                  </a-button>
+                </div>
+
+                <div v-if="isSummaryExpanded(item.summary)" class="summary-body">
+                  <div class="summary-toolbar">
+                    <a-space :size="4">
+                      <a-button
+                        size="small"
+                        :title="isSummaryRawMode(item.summary) ? '显示内容' : '显示原始事件'"
+                        :aria-label="isSummaryRawMode(item.summary) ? '显示内容' : '显示原始事件'"
+                        @click="toggleSummaryRawMode(item.summary)"
+                      >
+                        <template #icon>
+                          <Eye v-if="isSummaryRawMode(item.summary)" :size="13" />
+                          <Code2 v-else :size="13" />
+                        </template>
+                      </a-button>
+                      <a-button
+                        size="small"
+                        title="复制 Markdown"
+                        aria-label="复制任务产物 Markdown"
+                        @click="copySummaryMarkdown(item.summary)"
+                      >
+                        <template #icon><Copy :size="13" /></template>
+                      </a-button>
+                    </a-space>
+                  </div>
+
+                  <pre v-if="isSummaryRawMode(item.summary)" class="summary-raw">{{ JSON.stringify(item.summary.raw, null, 2) }}</pre>
+                  <div v-else class="summary-body-content">
+                    <section v-if="item.summary.changedFiles.length > 0" class="summary-section">
+                      <div class="summary-section-title">
+                        <FileText :size="15" />
+                        <span>已编辑文件</span>
+                        <small>
+                          +{{ summaryFileTotals(item.summary).additions }}
+                          -{{ summaryFileTotals(item.summary).deletions }}
+                        </small>
+                      </div>
+                      <div class="summary-file-list">
+                        <div v-for="file in item.summary.changedFiles" :key="file.path" class="summary-row">
+                          <div class="summary-row-main">
+                            <strong>{{ file.displayPath || file.path }}</strong>
+                            <small>{{ fileActionText(file.action) }} · {{ file.bytes }} bytes</small>
+                          </div>
+                          <div class="summary-diff-stat">
+                            <span class="plus">+{{ file.additions }}</span>
+                            <span class="minus">-{{ file.deletions }}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </section>
+
+                    <section v-if="summaryCommands(item.summary).length > 0" class="summary-section">
+                      <div class="summary-section-title">
+                        <Terminal :size="15" />
+                        <span>{{ summaryCommandTitle(item.summary) }}</span>
+                      </div>
+                      <div class="summary-command-list">
+                        <div
+                          v-for="command in summaryCommands(item.summary)"
+                          :key="command.command"
+                          class="summary-row command"
+                        >
+                          <div class="summary-row-main">
+                            <code>{{ command.command }}</code>
+                            <pre v-if="command.summary">{{ command.summary }}</pre>
+                          </div>
+                          <a-tag :color="commandStatusTone(command.status)">
+                            {{ commandStatusText(command.status) }}
+                          </a-tag>
+                        </div>
+                      </div>
+                    </section>
+                  </div>
+                </div>
+              </div>
+            </section>
           </template>
         </div>
 
@@ -1634,15 +2791,16 @@ onBeforeUnmount(() => {
               v-model:value="userInput"
               class="composer-input"
               :auto-size="{ minRows: 2, maxRows: 8 }"
-              :placeholder="`让${productName}修改、解释或规划你的项目`"
+              :placeholder="composerPlaceholder"
               @keydown="handleComposerKeydown"
             />
             <a-button
               class="composer-send"
+              :class="{ ready: canSubmitTurn }"
               type="primary"
-              :disabled="!selectedTaskId || !userInput.trim()"
-              title="发送"
-              aria-label="发送"
+              :disabled="!canSubmitTurn"
+              :title="selectedTaskIsLive ? '当前任务执行中，请先等待或打断' : '发送'"
+              :aria-label="selectedTaskIsLive ? '当前任务执行中，请先等待或打断' : '发送'"
               @click="sendTurn"
             >
               <template #icon><Send :size="15" /></template>
@@ -1672,6 +2830,53 @@ onBeforeUnmount(() => {
           <PanelRightClose v-else :size="17" />
         </button>
         <a-tabs v-if="!rightPanelCollapsed" v-model:activeKey="rightTab" size="small">
+          <a-tab-pane key="files" tab="文件">
+            <section class="panel-form">
+              <div class="workspace-files">
+                <div class="section-title">
+                  <label>工作区文件</label>
+                  <a-space>
+                    <a-button
+                      size="small"
+                      :disabled="!workspaceFilePath"
+                      title="返回上级"
+                      aria-label="返回上级"
+                      @click="openWorkspaceFileParent"
+                    >
+                      <template #icon><ChevronLeft :size="14" /></template>
+                    </a-button>
+                    <a-button
+                      size="small"
+                      :loading="fileBrowserLoading"
+                      title="刷新文件"
+                      aria-label="刷新文件"
+                      @click="refreshWorkspaceFiles(workspaceFilePath)"
+                    >
+                      <template #icon><RefreshCw :size="13" /></template>
+                    </a-button>
+                  </a-space>
+                </div>
+                <code class="file-path-chip">{{ workspaceFilePathLabel }}</code>
+                <div class="file-list">
+                  <button
+                    v-for="item in workspaceFiles"
+                    :key="item.path"
+                    class="file-row"
+                    :class="{ active: item.path === selectedWorkspaceFilePath }"
+                    type="button"
+                    @click="openWorkspaceFile(item)"
+                  >
+                    <Folder v-if="item.isDir" :size="15" />
+                    <FileText v-else :size="15" />
+                    <span>{{ item.name }}</span>
+                    <small v-if="!item.isDir">{{ formatFileSize(item.size) }}</small>
+                  </button>
+                  <a-empty v-if="!fileBrowserLoading && workspaceFiles.length === 0" description="暂无文件" />
+                </div>
+              </div>
+            </section>
+          </a-tab-pane>
+
           <a-tab-pane key="approvals" tab="审批">
             <a-list :data-source="approvals" class="dense-list">
               <template #renderItem="{ item }">
@@ -1699,6 +2904,48 @@ onBeforeUnmount(() => {
 
           <a-tab-pane key="context" tab="上下文">
             <section class="panel-form">
+              <div class="context-pack-card">
+                <div class="section-title">
+                  <label>最近上下文包</label>
+                  <a-tag>{{ latestContextSnapshot.turnLabel }}</a-tag>
+                </div>
+                <div v-if="latestContextSnapshot.usage" class="context-pack-body">
+                  <div class="context-meter-card is-live" :style="contextHeaderStyle">
+                    <span class="context-meter" />
+                    <strong>{{ contextHeaderText }}</strong>
+                  </div>
+                  <div class="context-pack-grid">
+                    <div>
+                      <small>任务摘要</small>
+                      <span>{{ latestContextSnapshot.usage.hasTaskSummary ? '已带入' : '暂无' }}</span>
+                    </div>
+                    <div>
+                      <small>文件摘要</small>
+                      <span>{{ latestContextSnapshot.usage.selectedFilePaths.length }}</span>
+                    </div>
+                    <div>
+                      <small>裁剪</small>
+                      <span>{{ latestContextSnapshot.usage.truncated ? '已截断' : '未截断' }}</span>
+                    </div>
+                  </div>
+                  <div v-if="latestContextSnapshot.usage.selectedFilePaths.length > 0" class="context-path-list">
+                    <code v-for="path in latestContextSnapshot.usage.selectedFilePaths" :key="path">
+                      {{ path }}
+                    </code>
+                  </div>
+                  <a-collapse
+                    v-if="latestContextSnapshot.summary?.summary"
+                    class="context-summary-collapse"
+                    ghost
+                  >
+                    <a-collapse-panel key="summary" header="任务滚动摘要">
+                      <pre class="context-summary-preview">{{ latestContextSnapshot.summary.summary }}</pre>
+                    </a-collapse-panel>
+                  </a-collapse>
+                </div>
+                <a-empty v-else description="暂无上下文记录" />
+              </div>
+
               <div class="section-title">
                 <label>外部路径授权</label>
                 <a-tag>{{ externalPaths.length }}</a-tag>
@@ -1845,36 +3092,46 @@ onBeforeUnmount(() => {
                   </div>
                 </template>
                 <section class="settings-panel-body">
-                  <a-list v-if="workspaces.length > 0" :data-source="workspaces" class="settings-list">
-                    <template #renderItem="{ item }">
-                      <a-list-item
-                        class="settings-row"
-                        :class="{ active: item.id === selectedWorkspaceId }"
-                        @click="selectedWorkspaceId = item.id"
-                      >
-                        <a-list-item-meta :title="item.name">
-                          <template #description>
-                            <div class="settings-desc">
-                              <code>{{ item.rootPath }}</code>
-                              <span>
-                                {{ item.permissionMode === 'full_access' ? '完全访问' : '请求审批' }}
-                              </span>
-                            </div>
-                          </template>
-                        </a-list-item-meta>
-                        <a-space>
-                          <a-button size="small" @click.stop="openWorkspaceModal(item)">
-                            <template #icon><Pencil :size="14" /></template>
+                  <div v-if="workspaces.length > 0" class="settings-list workspace-settings-list">
+                    <div
+                      v-for="item in workspaces"
+                      :key="item.id"
+                      class="workspace-settings-row"
+                      :class="{ active: item.id === selectedWorkspaceId }"
+                      role="button"
+                      tabindex="0"
+                      @click="selectedWorkspaceId = item.id"
+                      @keydown.enter.prevent="selectedWorkspaceId = item.id"
+                      @keydown.space.prevent="selectedWorkspaceId = item.id"
+                    >
+                      <div class="workspace-settings-main">
+                        <div class="workspace-settings-title">
+                          <strong>{{ item.name }}</strong>
+                          <a-tag v-if="item.id === selectedWorkspaceId" color="green">当前</a-tag>
+                        </div>
+                        <code>{{ item.rootPath }}</code>
+                        <span>{{ item.permissionMode === 'full_access' ? '完全访问' : '请求审批' }}</span>
+                      </div>
+                      <a-space class="workspace-settings-actions" :size="6">
+                        <a-button
+                          size="small"
+                          title="下载工作区"
+                          aria-label="下载工作区"
+                          @click.stop="downloadWorkspaceArchive(item)"
+                        >
+                          <template #icon><Download :size="13" /></template>
+                        </a-button>
+                        <a-button size="small" title="编辑工作区" aria-label="编辑工作区" @click.stop="openWorkspaceModal(item)">
+                          <template #icon><Pencil :size="14" /></template>
+                        </a-button>
+                        <a-popconfirm title="确认删除这个工作区？" ok-text="删除" cancel-text="取消" @confirm="deleteWorkspace(item)">
+                          <a-button size="small" danger title="删除工作区" aria-label="删除工作区" @click.stop>
+                            <template #icon><Trash2 :size="14" /></template>
                           </a-button>
-                          <a-popconfirm title="确认删除这个工作区？" ok-text="删除" cancel-text="取消" @confirm="deleteWorkspace(item)">
-                            <a-button size="small" danger @click.stop>
-                              <template #icon><Trash2 :size="14" /></template>
-                            </a-button>
-                          </a-popconfirm>
-                        </a-space>
-                      </a-list-item>
-                    </template>
-                  </a-list>
+                        </a-popconfirm>
+                      </a-space>
+                    </div>
+                  </div>
                   <a-empty v-else description="暂无工作区" />
                 </section>
               </a-collapse-panel>
@@ -1882,6 +3139,61 @@ onBeforeUnmount(() => {
           </a-tab-pane>
         </a-tabs>
       </aside>
+
+      <a-modal
+        v-model:open="filePreviewOpen"
+        :width="920"
+        :footer="null"
+        class="file-preview-modal"
+        @cancel="closeWorkspaceFilePreview"
+      >
+        <template #title>
+          <div class="file-modal-title">
+            <FileText :size="15" />
+            <span>{{ workspaceFileModalTitle }}</span>
+          </div>
+        </template>
+        <div class="file-modal-toolbar">
+          <a-space :size="6" wrap>
+            <a-tag>{{ workspaceFileLanguage }}</a-tag>
+            <span v-if="workspaceFileContent" class="muted">{{ formatFileSize(workspaceFileContent.size) }}</span>
+            <a-tag v-if="workspaceFileContent?.truncated" color="gold">已截断</a-tag>
+          </a-space>
+          <a-button
+            size="small"
+            :disabled="!workspaceFileContent"
+            title="复制文件内容"
+            aria-label="复制文件内容"
+            @click="copyWorkspaceFileContent"
+          >
+            <template #icon><Copy :size="13" /></template>
+          </a-button>
+          <a-button
+            size="small"
+            type="primary"
+            ghost
+            :disabled="!workspaceFileContent"
+            title="下载文件"
+            aria-label="下载文件"
+            @click="downloadWorkspaceFile"
+          >
+            <template #icon><Download :size="13" /></template>
+          </a-button>
+        </div>
+        <div v-if="fileContentLoading" class="file-modal-empty">读取中...</div>
+        <div v-else-if="workspaceFileContent" class="file-modal-code" role="region" aria-label="文件内容">
+          <div
+            v-for="line in workspaceFilePreviewLines"
+            :key="line.number"
+            class="file-code-line"
+          >
+            <span class="file-code-line-number">{{ line.number }}</span>
+            <code v-html="line.html" />
+          </div>
+        </div>
+        <div v-if="workspaceFilePreviewHint" class="file-modal-hint">{{ workspaceFilePreviewHint }}</div>
+        <div v-else-if="!workspaceFileContent && !fileContentLoading" class="file-modal-empty">未选择文件</div>
+      </a-modal>
 
       <a-modal
         v-model:open="taskModalOpen"

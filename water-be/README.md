@@ -88,6 +88,8 @@ curl -X POST http://localhost:8080/api/workspaces \
 - `GET /api/workspaces/{id}`
 - `PUT /api/workspaces/{id}`
 - `DELETE /api/workspaces/{id}`
+- `GET /api/workspaces/{id}/files?path=relative/path`
+- `GET /api/workspaces/{id}/files/content?path=relative/file`
 - `GET /api/workspaces/{id}/external-paths`
 - `POST /api/workspaces/{id}/external-paths`
 - `DELETE /api/workspaces/{id}/external-paths/{pathId}`
@@ -96,6 +98,8 @@ curl -X POST http://localhost:8080/api/workspaces \
 
 - `pathType`: `file` 或 `directory`
 - `accessMode`: `read` 或 `write`
+
+工作区文件接口只允许读取当前工作区根路径下的相对路径；后端会拒绝绝对路径、`..` 逃逸路径和软链接逃逸路径。文件内容预览最多返回 512 KiB，超过时会标记 `truncated: true`。
 
 ## Task API
 
@@ -173,12 +177,14 @@ curl -X POST http://localhost:8080/api/tasks/{taskId}/turns \
 - `tool.call.started`
 - `tool.completed`
 - `tool.failed`
+- `turn.summary`
 - `turn.completed`
 - `turn.failed`
 - `turn.interrupted`
 
 模型返回 `tool_calls` 时，后端会通过 Harness 执行工具或生成审批请求；Agent Prompt 会携带后端内部构建的 Context Pack 基础信息。
 `context.pack.built` 会返回本轮估算上下文用量、预算、模型上下文窗口和是否截断，供前端展示“上下文约 X / Y tokens”。
+`turn.summary` 会在 Turn 完成前汇总本轮工具产物，包括 `write_file` 产生的文件变更、增删行统计，以及 `run_command` 产生的命令/验证结果。前端聊天窗口用它展示类似 Codex 的任务产物卡。
 
 ## Tool 与 Approval API
 

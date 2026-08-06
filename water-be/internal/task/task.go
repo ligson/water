@@ -25,6 +25,8 @@ const (
 )
 
 var ErrNotFound = errors.New("task not found")
+var ErrTurnNotActive = errors.New("turn is not active")
+var ErrTaskHasActiveTurn = errors.New("task has active turn")
 
 type Task struct {
 	ID          string     `json:"id"`
@@ -44,6 +46,11 @@ type Turn struct {
 	UserInput   string     `json:"userInput"`
 	CreatedAt   time.Time  `json:"createdAt"`
 	CompletedAt *time.Time `json:"completedAt,omitempty"`
+}
+
+type TurnWithWorkspace struct {
+	Turn
+	WorkspaceID string `json:"workspaceId"`
 }
 
 type Store struct {
@@ -187,6 +194,13 @@ func (s *Store) CreateTurn(ctx context.Context, input CreateTurnInput) (Turn, er
 	if err != nil {
 		return Turn{}, err
 	}
+	hasActive, err := taskHasActiveTurn(ctx, tx, input.TaskID)
+	if err != nil {
+		return Turn{}, err
+	}
+	if hasActive {
+		return Turn{}, ErrTaskHasActiveTurn
+	}
 
 	now := time.Now()
 	turn := Turn{
@@ -224,6 +238,27 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 	return s.GetTurn(ctx, turn.ID)
 }
 
+func taskHasActiveTurn(ctx context.Context, tx *sql.Tx, taskID string) (bool, error) {
+	row := tx.QueryRowContext(ctx, `
+SELECT 1
+FROM turns
+WHERE task_id = ?
+  AND status IN (?, ?, ?)
+LIMIT 1`,
+		taskID,
+		TurnStatusCreated,
+		TurnStatusRunning,
+		TurnStatusWaitingApproval,
+	)
+	var value int
+	if err := row.Scan(&value); errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("query active turn: %w", err)
+	}
+	return true, nil
+}
+
 func (s *Store) GetTurn(ctx context.Context, id string) (Turn, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, task_id, sequence, status, user_input, created_at, COALESCE(completed_at, '')
@@ -235,6 +270,68 @@ WHERE id = ?`, id)
 		return Turn{}, ErrNotFound
 	}
 	return turn, err
+}
+
+func (s *Store) ListTurnsByStatus(ctx context.Context, status string) ([]TurnWithWorkspace, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT turns.id, turns.task_id, turns.sequence, turns.status, turns.user_input, turns.created_at, COALESCE(turns.completed_at, ''), tasks.workspace_id
+FROM turns
+JOIN tasks ON tasks.id = turns.task_id
+WHERE turns.status = ?
+ORDER BY turns.created_at ASC`, status)
+	if err != nil {
+		return nil, fmt.Errorf("query turns by status: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]TurnWithWorkspace, 0)
+	for rows.Next() {
+		var item TurnWithWorkspace
+		turn, err := scanTurnWithWorkspace(rows, &item.WorkspaceID)
+		if err != nil {
+			return nil, err
+		}
+		item.Turn = turn
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate turns by status: %w", err)
+	}
+	return items, nil
+}
+
+func (s *Store) ListActiveTurnsByTask(ctx context.Context, taskID string) ([]TurnWithWorkspace, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT turns.id, turns.task_id, turns.sequence, turns.status, turns.user_input, turns.created_at, COALESCE(turns.completed_at, ''), tasks.workspace_id
+FROM turns
+JOIN tasks ON tasks.id = turns.task_id
+WHERE turns.task_id = ?
+  AND turns.status IN (?, ?, ?)
+ORDER BY turns.created_at ASC`,
+		taskID,
+		TurnStatusCreated,
+		TurnStatusRunning,
+		TurnStatusWaitingApproval,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query active turns by task: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]TurnWithWorkspace, 0)
+	for rows.Next() {
+		var item TurnWithWorkspace
+		turn, err := scanTurnWithWorkspace(rows, &item.WorkspaceID)
+		if err != nil {
+			return nil, err
+		}
+		item.Turn = turn
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active turns by task: %w", err)
+	}
+	return items, nil
 }
 
 func (s *Store) UpdateTurnStatus(ctx context.Context, id string, status string) (Turn, error) {
@@ -265,6 +362,43 @@ WHERE id = ?`,
 	return s.GetTurn(ctx, id)
 }
 
+func (s *Store) UpdateActiveTurnStatus(ctx context.Context, id string, status string) (Turn, error) {
+	now := time.Now()
+	completedAt := ""
+	if isTerminalTurnStatus(status) {
+		completedAt = dbutil.FormatTime(now)
+	}
+
+	result, err := s.db.ExecContext(ctx, `
+UPDATE turns
+SET status = ?, completed_at = NULLIF(?, '')
+WHERE id = ?
+  AND status IN (?, ?, ?)`,
+		status,
+		completedAt,
+		id,
+		TurnStatusCreated,
+		TurnStatusRunning,
+		TurnStatusWaitingApproval,
+	)
+	if err != nil {
+		return Turn{}, fmt.Errorf("update active turn status: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return Turn{}, fmt.Errorf("read affected rows: %w", err)
+	}
+	if affected == 0 {
+		if _, getErr := s.GetTurn(ctx, id); errors.Is(getErr, ErrNotFound) {
+			return Turn{}, ErrNotFound
+		} else if getErr != nil {
+			return Turn{}, getErr
+		}
+		return Turn{}, ErrTurnNotActive
+	}
+	return s.GetTurn(ctx, id)
+}
+
 func isTerminalTurnStatus(status string) bool {
 	return status == TurnStatusCompleted || status == TurnStatusFailed || status == TurnStatusInterrupted
 }
@@ -291,10 +425,18 @@ func scanTask(row scanner) (Task, error) {
 }
 
 func scanTurn(row scanner) (Turn, error) {
+	return scanTurnWithWorkspace(row, nil)
+}
+
+func scanTurnWithWorkspace(row scanner, workspaceID *string) (Turn, error) {
 	var turn Turn
 	var createdAt string
 	var completedAt string
-	if err := row.Scan(&turn.ID, &turn.TaskID, &turn.Sequence, &turn.Status, &turn.UserInput, &createdAt, &completedAt); err != nil {
+	dest := []interface{}{&turn.ID, &turn.TaskID, &turn.Sequence, &turn.Status, &turn.UserInput, &createdAt, &completedAt}
+	if workspaceID != nil {
+		dest = append(dest, workspaceID)
+	}
+	if err := row.Scan(dest...); err != nil {
 		return Turn{}, err
 	}
 	turn.CreatedAt = dbutil.ParseTime(createdAt)

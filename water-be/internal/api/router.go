@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -10,9 +11,11 @@ import (
 	"time"
 
 	"github.com/ligson/water/water-be/internal/agent"
+	"github.com/ligson/water/water-be/internal/event"
 	"github.com/ligson/water/water-be/internal/config"
 	"github.com/ligson/water/water-be/internal/realtime"
 	"github.com/ligson/water/water-be/internal/requestid"
+	"github.com/ligson/water/water-be/internal/task"
 )
 
 type Router struct {
@@ -39,6 +42,7 @@ func NewRouter(db *sql.DB, cfg config.Config, logger *slog.Logger) http.Handler 
 		cancel: make(map[string]taskRun),
 	}
 	r.agent = agent.NewRunner(db, r.appendTaskEvent)
+	r.recoverInterruptedRunningTurns(context.Background())
 
 	return requestid.Middleware(corsMiddleware(r))
 }
@@ -94,4 +98,29 @@ func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
 		"status":  "ok",
 		"time":    time.Now().Format(time.RFC3339),
 	})
+}
+
+func (r *Router) recoverInterruptedRunningTurns(ctx context.Context) {
+	items, err := task.NewStore(r.db).ListTurnsByStatus(ctx, task.TurnStatusRunning)
+	if err != nil {
+		r.logger.Error("recover running turns", "error", err)
+		return
+	}
+	for _, item := range items {
+		if _, err := task.NewStore(r.db).UpdateTurnStatus(ctx, item.ID, task.TurnStatusInterrupted); err != nil {
+			r.logger.Error("mark stale running turn interrupted", "turnId", item.ID, "error", err)
+			continue
+		}
+		payload := fmt.Sprintf(`{"reason":"backend_restarted","message":"若水后端已重启，上一轮运行已自动暂停。可继续上一轮结果重新推进。","canContinue":true,"continuationPrompt":"继续上一轮任务，先确认已经完成的结果，再接着推进剩余工作，不要重复已完成内容。"}`)
+		if _, err := r.appendTaskEvent(ctx, event.AppendInput{
+			RequestID:   "backend-restart-recovery",
+			WorkspaceID: item.WorkspaceID,
+			TaskID:      item.TaskID,
+			TurnID:      item.ID,
+			Type:        "turn.interrupted",
+			PayloadJSON: payload,
+		}); err != nil {
+			r.logger.Error("append stale turn recovery event", "turnId", item.ID, "error", err)
+		}
+	}
 }

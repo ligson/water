@@ -186,6 +186,9 @@ func (r *Router) updateTask(w http.ResponseWriter, req *http.Request, taskID str
 
 func (r *Router) deleteTask(w http.ResponseWriter, req *http.Request, taskID string) {
 	r.cancelTaskRun(taskID)
+	if _, err := r.interruptActiveTurns(req.Context(), taskID, "task_deleted", "任务已删除，当前执行已停止。"); err != nil {
+		r.logger.ErrorContext(req.Context(), "interrupt task turns before delete", "error", err)
+	}
 
 	err := task.NewStore(r.db).Delete(req.Context(), taskID)
 	if errors.Is(err, task.ErrNotFound) {
@@ -221,6 +224,10 @@ func (r *Router) createTurn(w http.ResponseWriter, req *http.Request, taskID str
 		TaskID:    taskID,
 		UserInput: input.UserInput,
 	})
+	if errors.Is(err, task.ErrTaskHasActiveTurn) {
+		WriteError(req.Context(), w, http.StatusConflict, "当前任务仍在执行，请等待完成、审批或打断后再继续")
+		return
+	}
 	if err != nil {
 		r.logger.ErrorContext(req.Context(), "create turn", "error", err)
 		WriteError(req.Context(), w, http.StatusInternalServerError, "create turn failed")
@@ -315,13 +322,68 @@ func (r *Router) cancelTask(w http.ResponseWriter, req *http.Request, taskID str
 		return
 	}
 
+	interrupted, err := r.interruptActiveTurns(req.Context(), taskID, "user_cancelled", "你已打断任务，当前执行已停止。")
+	if err != nil {
+		r.logger.ErrorContext(req.Context(), "interrupt active turns", "error", err)
+		WriteError(req.Context(), w, http.StatusInternalServerError, "cancel task failed")
+		return
+	}
 	ok := r.cancelTaskRun(taskID)
 
-	if ok {
+	if ok || interrupted {
 		WriteOK(req.Context(), w, "task cancelled", map[string]interface{}{})
 		return
 	}
 	WriteOK(req.Context(), w, "task is not running", map[string]interface{}{})
+}
+
+func (r *Router) interruptActiveTurns(ctx context.Context, taskID string, reason string, message string) (bool, error) {
+	items, err := task.NewStore(r.db).ListActiveTurnsByTask(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	if len(items) == 0 {
+		return false, nil
+	}
+	interruptedAny := false
+	for _, item := range items {
+		turn, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, item.ID, task.TurnStatusInterrupted)
+		if errors.Is(err, task.ErrTurnNotActive) {
+			continue
+		}
+		if errors.Is(err, task.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return interruptedAny, err
+		}
+		interruptedAny = true
+		payload := map[string]interface{}{
+			"reason":             reason,
+			"message":            message,
+			"canContinue":        true,
+			"continuationPrompt": "继续上一轮任务，先确认已经完成的结果，再接着推进剩余工作，不要重复已完成内容。",
+		}
+		if reason == "task_deleted" {
+			payload["canContinue"] = false
+			payload["continuationPrompt"] = ""
+		}
+		raw, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			return interruptedAny, marshalErr
+		}
+		if _, err := r.appendTaskEvent(ctx, event.AppendInput{
+			RequestID:   requestid.FromContext(ctx),
+			WorkspaceID: item.WorkspaceID,
+			TaskID:      item.TaskID,
+			TurnID:      item.ID,
+			Type:        "turn.interrupted",
+			PayloadJSON: string(raw),
+		}); err != nil {
+			r.logger.ErrorContext(ctx, "append interrupted event", "turnId", turn.ID, "error", err)
+		}
+	}
+	return interruptedAny, nil
 }
 
 func (r *Router) cancelTaskRun(taskID string) bool {

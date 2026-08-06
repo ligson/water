@@ -68,6 +68,50 @@ func TestCommandNotFoundHint(t *testing.T) {
 	}
 }
 
+func TestBackgroundOperatorDetection(t *testing.T) {
+	rejected := []string{
+		"mvn spring-boot:run &",
+		"npm run dev 2>&1 &",
+		"npm run dev & echo started",
+	}
+	for _, command := range rejected {
+		if !hasBackgroundOperator(command) {
+			t.Fatalf("expected %q to be rejected as background command", command)
+		}
+	}
+
+	allowed := []string{
+		"npm run build 2>&1 | tail -20",
+		"cd demo-be && mvn compile",
+		"echo a && echo b",
+	}
+	for _, command := range allowed {
+		if hasBackgroundOperator(command) {
+			t.Fatalf("expected %q not to be treated as background command", command)
+		}
+	}
+}
+
+func TestValidateScaffoldCommandRejectsAbsoluteViteTarget(t *testing.T) {
+	command := "rm -rf /workspace/demo-fe-new && npm create vite@latest /workspace/demo-fe -- --template vue-ts"
+	if err := validateScaffoldCommand(command, "/workspace"); err == nil {
+		t.Fatalf("expected absolute create-vite target to be rejected")
+	}
+}
+
+func TestValidateScaffoldCommandAllowsRelativeViteTarget(t *testing.T) {
+	allowed := []string{
+		"npm create vite@latest demo-fe -- --template vue-ts",
+		"cd /workspace && npm create vite@latest demo-fe -- --template vue-ts",
+		"npx create-vite demo-fe --template vue-ts",
+	}
+	for _, command := range allowed {
+		if err := validateScaffoldCommand(command, "/workspace"); err != nil {
+			t.Fatalf("expected %q to be allowed, got %v", command, err)
+		}
+	}
+}
+
 func TestShellCommandForOS(t *testing.T) {
 	name, args := shellCommand("windows", "wmic OS get FreePhysicalMemory,TotalVisibleMemorySize /Value")
 	if name != "cmd" || len(args) != 2 || args[0] != "/C" {
@@ -77,5 +121,17 @@ func TestShellCommandForOS(t *testing.T) {
 	name, args = shellCommand("linux", "free -h")
 	if name != "sh" || len(args) != 2 || args[0] != "-c" {
 		t.Fatalf("expected unix sh shell, got %q %#v", name, args)
+	}
+}
+
+func TestLineDiffStats(t *testing.T) {
+	additions, deletions := lineDiffStats("a\nb\nc\n", "a\nb2\nc\nd\n", false)
+	if additions != 2 || deletions != 1 {
+		t.Fatalf("expected +2 -1, got +%d -%d", additions, deletions)
+	}
+
+	additions, deletions = lineDiffStats("", "one\n\nthree", true)
+	if additions != 3 || deletions != 0 {
+		t.Fatalf("expected created file +3 -0, got +%d -%d", additions, deletions)
 	}
 }
