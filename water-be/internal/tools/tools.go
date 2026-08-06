@@ -38,6 +38,7 @@ type Request struct {
 	Name       string          `json:"name"`
 	Arguments  json.RawMessage `json:"arguments"`
 	ApprovalID string          `json:"approvalId"`
+	ToolCallID string          `json:"toolCallId,omitempty"`
 }
 
 type Context struct {
@@ -438,7 +439,14 @@ func (e *Executor) ensureApproved(ctx context.Context, toolCtx Context, req Requ
 		if appr.Status != approval.StatusApproved || appr.WorkspaceID != toolCtx.Workspace.ID || appr.TaskID != toolCtx.Task.ID || appr.ActionType != actionType {
 			return errors.New("approval does not allow this action")
 		}
+		if !approvalRequestMatches(appr.RequestJSON, req) {
+			return errors.New("approval request does not match this tool call")
+		}
 		return nil
+	}
+	requestJSON, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("encode approval request: %w", err)
 	}
 	appr, err := e.approvalStore.Create(ctx, approval.CreateInput{
 		WorkspaceID:    toolCtx.Workspace.ID,
@@ -448,11 +456,42 @@ func (e *Executor) ensureApproved(ctx context.Context, toolCtx Context, req Requ
 		Target:         target,
 		RiskSummary:    risk,
 		ExpectedImpact: impact,
+		RequestJSON:    string(requestJSON),
 	})
 	if err != nil {
 		return err
 	}
 	return approvalRequiredError{approval: appr}
+}
+
+func approvalRequestMatches(snapshot string, req Request) bool {
+	snapshot = strings.TrimSpace(snapshot)
+	if snapshot == "" || snapshot == "{}" {
+		return true
+	}
+	var saved Request
+	if err := json.Unmarshal([]byte(snapshot), &saved); err != nil {
+		return false
+	}
+	if strings.TrimSpace(saved.Name) != strings.TrimSpace(req.Name) {
+		return false
+	}
+	return normalizeJSON(saved.Arguments) == normalizeJSON(req.Arguments)
+}
+
+func normalizeJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "{}"
+	}
+	var value interface{}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	normalized, err := json.Marshal(value)
+	if err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	return string(normalized)
 }
 
 type approvalRequiredError struct {

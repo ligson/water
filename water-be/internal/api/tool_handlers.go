@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"github.com/ligson/water/water-be/internal/sandbox"
 	"github.com/ligson/water/water-be/internal/task"
 	"github.com/ligson/water/water-be/internal/tools"
+	"github.com/ligson/water/water-be/internal/uid"
 	"github.com/ligson/water/water-be/internal/workspace"
 )
 
@@ -130,8 +132,59 @@ func (r *Router) handleApprovalByID(w http.ResponseWriter, req *http.Request, re
 			PayloadJSON: mustJSON(map[string]interface{}{"approval": resolved}),
 		})
 	}
+	if resolved.Status == approval.StatusApproved {
+		r.startApprovalContinuation(req, resolved)
+	}
+	if resolved.Status == approval.StatusRejected {
+		r.interruptRejectedApprovalTurn(req, resolved)
+	}
 
 	WriteOK(req.Context(), w, "approval resolved", resolved)
+}
+
+func (r *Router) startApprovalContinuation(req *http.Request, resolved approval.Approval) {
+	if r.agent == nil || resolved.TaskID == "" || resolved.TurnID == "" {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runID := uid.New("run")
+	r.mu.Lock()
+	if previous, ok := r.cancel[resolved.TaskID]; ok {
+		previous.cancel()
+	}
+	r.cancel[resolved.TaskID] = taskRun{id: runID, cancel: cancel}
+	r.mu.Unlock()
+
+	requestID := requestid.FromContext(req.Context())
+	go func() {
+		defer func() {
+			r.mu.Lock()
+			if current, ok := r.cancel[resolved.TaskID]; ok && current.id == runID {
+				delete(r.cancel, resolved.TaskID)
+			}
+			r.mu.Unlock()
+		}()
+		r.agent.ResumeApprovedTool(ctx, resolved, requestID)
+	}()
+}
+
+func (r *Router) interruptRejectedApprovalTurn(req *http.Request, resolved approval.Approval) {
+	if resolved.TaskID == "" || resolved.TurnID == "" {
+		return
+	}
+	_, _ = task.NewStore(r.db).UpdateTurnStatus(req.Context(), resolved.TurnID, task.TurnStatusInterrupted)
+	_, _ = r.appendTaskEvent(req.Context(), event.AppendInput{
+		RequestID:   requestid.FromContext(req.Context()),
+		WorkspaceID: resolved.WorkspaceID,
+		TaskID:      resolved.TaskID,
+		TurnID:      resolved.TurnID,
+		Type:        "turn.interrupted",
+		PayloadJSON: mustJSON(map[string]interface{}{
+			"message":    "用户拒绝了审批请求，当前轮次已中断。",
+			"approvalId": resolved.ID,
+		}),
+	})
 }
 
 func (r *Router) appendToolEvent(req *http.Request, currentTask task.Task, eventType string, payload map[string]interface{}) {

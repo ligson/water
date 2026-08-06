@@ -244,6 +244,36 @@ const latestExecutionGroup = computed(() =>
 const latestTurnDurationText = computed(() =>
   latestExecutionGroup.value ? executionDurationText(latestExecutionGroup.value) : '',
 )
+const latestContextUsage = computed(() => latestExecutionGroup.value?.contextUsage)
+const contextBudgetRatio = 0.8
+const contextHeaderBudget = computed(() => {
+  const usage = latestContextUsage.value
+  if (usage?.tokenBudget) return usage.tokenBudget
+  const contextWindow = activeProvider.value?.contextWindowTokens || 8192
+  return Math.floor(contextWindow * contextBudgetRatio)
+})
+const contextHeaderText = computed(() => {
+  const usage = latestContextUsage.value
+  const budget = contextHeaderBudget.value
+  if (usage) {
+    return `上下文 ${formatTokenCount(usage.estimatedTokens)} / ${formatTokenCount(budget)}`
+  }
+  return `上下文 -- / ${formatTokenCount(budget)}`
+})
+const contextHeaderTitle = computed(() =>
+  latestExecutionGroup.value && latestContextUsage.value
+    ? contextUsageText(latestExecutionGroup.value)
+    : '当前 Provider 的上下文预算',
+)
+const contextHeaderPercent = computed(() => {
+  const usage = latestContextUsage.value
+  const budget = contextHeaderBudget.value
+  if (!usage || budget <= 0) return 0
+  return Math.min(100, Math.round((usage.estimatedTokens / budget) * 100))
+})
+const contextHeaderStyle = computed(() => ({
+  '--context-used': `${contextHeaderPercent.value}%`,
+}))
 
 const chatBlocks = computed(() => {
   const blocks: ChatBlock[] = []
@@ -468,7 +498,12 @@ function updateExecutionGroup(group: ExecutionGroup, item: TaskEvent) {
     group.status = 'running'
     return
   }
-  if (item.type === 'agent.tool_calls.detected' || item.type === 'tool.completed') {
+  if (
+    item.type === 'agent.tool_calls.detected' ||
+    item.type === 'approval.continuation.started' ||
+    item.type === 'tool.call.started' ||
+    item.type === 'tool.completed'
+  ) {
     group.status = 'running'
     return
   }
@@ -502,6 +537,10 @@ function executionStepFromEvent(item: TaskEvent): ExecutionStep | undefined {
       return undefined
     case 'agent.tool_calls.detected':
       return makeExecutionStep(item, '准备调用工具', summarizeToolCalls(payload), 'running')
+    case 'approval.continuation.started':
+      return makeExecutionStep(item, '审批通过，继续执行', summarizeApprovalContinuation(payload), 'running')
+    case 'tool.call.started':
+      return makeExecutionStep(item, '工具开始', summarizeToolStart(payload), 'running')
     case 'tool.completed':
       return makeExecutionStep(item, '工具完成', summarizeToolResult(payload), 'success')
     case 'tool.failed':
@@ -562,6 +601,18 @@ function summarizeToolResult(payload: Record<string, unknown>) {
   return lines.join('\n')
 }
 
+function summarizeToolStart(payload: Record<string, unknown>) {
+  const name = String(payload.name ?? 'tool')
+  const toolCallId = String(payload.toolCallId ?? '')
+  return compactText([name, toolCallId].filter(Boolean).join('\n'))
+}
+
+function summarizeApprovalContinuation(payload: Record<string, unknown>) {
+  const toolName = String(payload.toolName ?? 'tool')
+  const approvalId = String(payload.approvalId ?? '')
+  return compactText([toolName, approvalId].filter(Boolean).join('\n'))
+}
+
 function summarizeApproval(payload: Record<string, unknown>) {
   const approval = (payload.approval ?? payload) as Record<string, unknown>
   const action = String(approval.actionType ?? 'approval')
@@ -588,9 +639,20 @@ function latestTaskStatusText(items: TaskEvent[]) {
   if (latestTurnEvents.some((item) => item.type === 'turn.failed')) return '最近一轮失败'
   if (latestTurnEvents.some((item) => item.type === 'turn.interrupted')) return '最近一轮已中断'
   if (latestTurnEvents.some((item) => item.type === 'turn.completed')) return '已完成最近一轮'
-  if (latestTurnEvents.some((item) => item.type === 'approval.requested')) return '等待审批'
+  const hasPendingApproval =
+    latestTurnEvents.some((item) => item.type === 'approval.requested') &&
+    !latestTurnEvents.some((item) => item.type === 'approval.resolved')
+  if (hasPendingApproval) return '等待审批'
   if (latestTurnEvents.some((item) => item.type === 'agent.message.delta')) return 'Agent 正在回复'
-  if (latestTurnEvents.some((item) => item.type === 'agent.tool_calls.detected' || item.type === 'tool.completed')) {
+  if (
+    latestTurnEvents.some(
+      (item) =>
+        item.type === 'agent.tool_calls.detected' ||
+        item.type === 'approval.continuation.started' ||
+        item.type === 'tool.call.started' ||
+        item.type === 'tool.completed',
+    )
+  ) {
     return '工具执行中'
   }
   return 'Agent 正在思考'
@@ -614,6 +676,12 @@ function contextUsageText(group: ExecutionGroup) {
   if (!budget) return `上下文约 ${usage.estimatedTokens} tokens`
   const suffix = usage.truncated ? '，已截断' : ''
   return `上下文约 ${usage.estimatedTokens} / ${budget} tokens${suffix}`
+}
+
+function formatTokenCount(value: number) {
+  if (value >= 10000) return `${Math.round(value / 1000)}k`
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}k`
+  return String(value)
 }
 
 function formatDuration(ms: number) {
@@ -1392,6 +1460,15 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="chat-header-actions">
+            <span
+              class="context-state"
+              :class="{ active: latestContextUsage, warning: contextHeaderPercent >= 80 }"
+              :style="contextHeaderStyle"
+              :title="contextHeaderTitle"
+            >
+              <span class="context-meter" />
+              <span>{{ contextHeaderText }}</span>
+            </span>
             <span class="connection-state" :class="{ connected: wsConnected }">
               <span class="connection-dot" />
               <span>{{ wsConnected ? '实时' : '离线' }}</span>

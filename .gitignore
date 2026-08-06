@@ -2,6 +2,18 @@
 /water-be/data/
 /scripts/run/
 /scripts/logs/
+/.playwright-cli/
+/output/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Build outputs
 /water-be/bin/

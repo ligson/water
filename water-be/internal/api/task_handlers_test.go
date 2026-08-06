@@ -196,6 +196,171 @@ func TestAgentLoopExecutesReadOnlyToolCall(t *testing.T) {
 	}
 }
 
+func TestApprovalResolutionResumesAgentToolLoop(t *testing.T) {
+	root := t.TempDir()
+	reportPath := filepath.Join(root, "reports", "system-report.md")
+
+	var requestCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected llm path %s", r.URL.Path)
+		}
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode llm body: %v", err)
+		}
+
+		count := atomic.AddInt32(&requestCount, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch count {
+		case 1:
+			chunk := map[string]interface{}{
+				"choices": []map[string]interface{}{
+					{
+						"delta": map[string]interface{}{
+							"tool_calls": []map[string]interface{}{
+								{
+									"index": 0,
+									"id":    "call_write_report",
+									"type":  "function",
+									"function": map[string]interface{}{
+										"name":      "write_file",
+										"arguments": `{"path":"` + reportPath + `","content":"# 系统报告\n\nok"}`,
+									},
+								},
+							},
+						},
+						"finish_reason": "tool_calls",
+					},
+				},
+			}
+			raw, _ := json.Marshal(chunk)
+			_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			messagesRaw, _ := json.Marshal(body["messages"])
+			if !strings.Contains(string(messagesRaw), "\"role\":\"tool\"") {
+				t.Fatalf("expected approved tool result in resumed request, got %s", string(messagesRaw))
+			}
+			if !strings.Contains(string(messagesRaw), "call_write_report") {
+				t.Fatalf("expected original tool call id in resumed request, got %s", string(messagesRaw))
+			}
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"报告已保存\"},\"finish_reason\":\"stop\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected llm request count %d", count)
+		}
+	}))
+	defer llmServer.Close()
+
+	db := openTestDB(t)
+	defer db.Close()
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	provider := createProviderForTestWithBaseURL(t, handler, "Local", llmServer.URL+"/v1", true)
+	ws := createWorkspaceForTestWithProvider(t, handler, "Water", root, "request_approval", provider.ID)
+	createdTask := createTaskForTest(t, handler, ws.ID, "系统分析报告")
+
+	turnRec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", `{"userInput":"帮我生成系统分析报告并保存"}`)
+	if turnRec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", turnRec.Code, turnRec.Body.String())
+	}
+
+	events := waitTaskEvents(t, handler, createdTask.ID, "approval.requested")
+	approvalID := approvalIDFromEvents(t, events)
+	if _, err := os.Stat(reportPath); !os.IsNotExist(err) {
+		t.Fatalf("report should not be written before approval")
+	}
+
+	resolveRec := performJSON(handler, http.MethodPost, "/api/approvals/"+approvalID+"/resolve", `{"status":"approved","message":"同意"}`)
+	if resolveRec.Code != http.StatusOK {
+		t.Fatalf("expected approve status 200, got %d: %s", resolveRec.Code, resolveRec.Body.String())
+	}
+
+	events = waitTaskEvents(t, handler, createdTask.ID, "turn.completed")
+	if !hasEventType(events, "approval.continuation.started") {
+		t.Fatalf("expected approval.continuation.started event, got %#v", events)
+	}
+	if !hasEventType(events, "tool.completed") {
+		t.Fatalf("expected tool.completed event, got %#v", events)
+	}
+	content, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatalf("read approved report: %v", err)
+	}
+	if string(content) != "# 系统报告\n\nok" {
+		t.Fatalf("unexpected report content %q", string(content))
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 2 {
+		t.Fatalf("expected 2 llm requests, got %d", got)
+	}
+}
+
+func TestApprovalRejectionInterruptsWaitingTurn(t *testing.T) {
+	root := t.TempDir()
+	reportPath := filepath.Join(root, "reports", "rejected-report.md")
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected llm path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunk := map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{
+					"delta": map[string]interface{}{
+						"tool_calls": []map[string]interface{}{
+							{
+								"index": 0,
+								"id":    "call_write_rejected",
+								"type":  "function",
+								"function": map[string]interface{}{
+									"name":      "write_file",
+									"arguments": `{"path":"` + reportPath + `","content":"no"}`,
+								},
+							},
+						},
+					},
+					"finish_reason": "tool_calls",
+				},
+			},
+		}
+		raw, _ := json.Marshal(chunk)
+		_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer llmServer.Close()
+
+	db := openTestDB(t)
+	defer db.Close()
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	provider := createProviderForTestWithBaseURL(t, handler, "Local", llmServer.URL+"/v1", true)
+	ws := createWorkspaceForTestWithProvider(t, handler, "Water", root, "request_approval", provider.ID)
+	createdTask := createTaskForTest(t, handler, ws.ID, "拒绝报告")
+
+	turnRec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", `{"userInput":"帮我生成报告并保存"}`)
+	if turnRec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", turnRec.Code, turnRec.Body.String())
+	}
+
+	events := waitTaskEvents(t, handler, createdTask.ID, "approval.requested")
+	approvalID := approvalIDFromEvents(t, events)
+
+	resolveRec := performJSON(handler, http.MethodPost, "/api/approvals/"+approvalID+"/resolve", `{"status":"rejected","message":"不要写"}`)
+	if resolveRec.Code != http.StatusOK {
+		t.Fatalf("expected reject status 200, got %d: %s", resolveRec.Code, resolveRec.Body.String())
+	}
+
+	events = waitTaskEvents(t, handler, createdTask.ID, "turn.interrupted")
+	if hasEventType(events, "tool.completed") {
+		t.Fatalf("expected rejected approval not to execute tool, got %#v", events)
+	}
+	if _, err := os.Stat(reportPath); !os.IsNotExist(err) {
+		t.Fatalf("report should not be written after rejection")
+	}
+}
+
 func TestTaskListAndEventsEmptyArrays(t *testing.T) {
 	db := openTestDB(t)
 	defer db.Close()
@@ -429,6 +594,27 @@ func hasEventType(events []eventResponse, eventType string) bool {
 		}
 	}
 	return false
+}
+
+func approvalIDFromEvents(t *testing.T, events []eventResponse) string {
+	t.Helper()
+	for _, item := range events {
+		if item.Type != "approval.requested" {
+			continue
+		}
+		payload := item.Payload()
+		approvalValue, ok := payload["approval"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("approval.requested payload missing approval: %#v", payload)
+		}
+		id, ok := approvalValue["id"].(string)
+		if !ok || id == "" {
+			t.Fatalf("approval payload missing id: %#v", approvalValue)
+		}
+		return id
+	}
+	t.Fatalf("approval.requested event not found")
+	return ""
 }
 
 type taskResponse struct {

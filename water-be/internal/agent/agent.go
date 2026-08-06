@@ -112,7 +112,14 @@ func (r *Runner) runTurn(ctx context.Context, input RunTurnInput) error {
 		return err
 	}
 
-	for round := 0; round < 6; round++ {
+	return r.continueWithMessages(ctx, client, messages, input, ws, currentTask, 6)
+}
+
+func (r *Runner) continueWithMessages(ctx context.Context, client llm.Client, messages []llm.Message, input RunTurnInput, ws workspace.Workspace, currentTask task.Task, maxRounds int) error {
+	if maxRounds <= 0 {
+		maxRounds = 1
+	}
+	for round := 0; round < maxRounds; round++ {
 		assistantMsg, toolCalls, finishReason, err := r.collectAssistantRound(ctx, client, messages, input, ws, currentTask)
 		if err != nil {
 			return err
@@ -142,6 +149,110 @@ func (r *Runner) runTurn(ctx context.Context, input RunTurnInput) error {
 	}
 
 	return errors.New("tool loop exceeded maximum rounds")
+}
+
+func (r *Runner) ResumeApprovedTool(ctx context.Context, appr approval.Approval, requestID string) {
+	if appr.Status != approval.StatusApproved || appr.TaskID == "" || appr.TurnID == "" {
+		return
+	}
+	if requestID == "" {
+		requestID = appr.ID
+	}
+	if r.requestTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.requestTimeout)
+		defer cancel()
+	}
+
+	input, err := r.resumeApprovedTool(ctx, appr, requestID)
+	if err != nil {
+		if input.TurnID == "" {
+			return
+		}
+		if errors.Is(err, context.Canceled) {
+			_ = r.interruptTurn(context.Background(), input, err)
+			return
+		}
+		_ = r.failTurn(context.Background(), input, err)
+	}
+}
+
+func (r *Runner) resumeApprovedTool(ctx context.Context, appr approval.Approval, requestID string) (RunTurnInput, error) {
+	req, err := toolRequestFromApproval(appr, requestID)
+	if err != nil {
+		return RunTurnInput{}, err
+	}
+
+	turn, err := task.NewStore(r.db).GetTurn(ctx, appr.TurnID)
+	if err != nil {
+		return RunTurnInput{}, fmt.Errorf("load turn: %w", err)
+	}
+
+	input := RunTurnInput{
+		RequestID:    requestID,
+		TaskID:       appr.TaskID,
+		TurnID:       appr.TurnID,
+		TurnSequence: turn.Sequence,
+		WorkspaceID:  appr.WorkspaceID,
+		UserInput:    turn.UserInput,
+	}
+	if _, err := task.NewStore(r.db).UpdateTurnStatus(ctx, input.TurnID, task.TurnStatusRunning); err != nil {
+		return input, err
+	}
+
+	ws, err := workspace.NewStore(r.db).Get(ctx, appr.WorkspaceID)
+	if err != nil {
+		return input, fmt.Errorf("load workspace: %w", err)
+	}
+	p, err := selectProvider(ctx, provider.NewStore(r.db), ws)
+	if err != nil {
+		return input, err
+	}
+	client, err := r.clientFactory(p)
+	if err != nil {
+		return input, fmt.Errorf("create llm client: %w", err)
+	}
+	currentTask, err := task.NewStore(r.db).Get(ctx, appr.TaskID)
+	if err != nil {
+		return input, fmt.Errorf("load task: %w", err)
+	}
+	messages, err := r.buildMessages(ctx, input, ws, p, currentTask)
+	if err != nil {
+		return input, err
+	}
+	assistantMsg, err := r.assistantMessageForApproval(ctx, appr, req)
+	if err != nil {
+		return input, err
+	}
+	messages = append(messages, assistantMsg)
+
+	if err := r.appendJSONEvent(ctx, input, "approval.continuation.started", map[string]interface{}{
+		"approvalId": appr.ID,
+		"toolName":   req.Name,
+	}); err != nil {
+		return input, err
+	}
+
+	toolCall := llm.ToolCall{
+		ID:   req.ToolCallID,
+		Type: "function",
+		Function: llm.ToolCallFunction{
+			Name:      req.Name,
+			Arguments: string(req.Arguments),
+		},
+	}
+	toolMessages, pendingApproval, err := r.executeToolCalls(ctx, input, ws, currentTask, []llm.ToolCall{toolCall}, req.ApprovalID)
+	if err != nil {
+		return input, err
+	}
+	if pendingApproval {
+		if _, err := task.NewStore(r.db).UpdateTurnStatus(ctx, input.TurnID, task.TurnStatusWaitingApproval); err != nil {
+			return input, err
+		}
+		return input, nil
+	}
+	messages = append(messages, toolMessages...)
+	return input, r.continueWithMessages(ctx, client, messages, input, ws, currentTask, 5)
 }
 
 func (r *Runner) buildMessages(ctx context.Context, input RunTurnInput, ws workspace.Workspace, p provider.Provider, currentTask task.Task) ([]llm.Message, error) {
@@ -272,20 +383,122 @@ func toolCallKey(call llm.ToolCall) string {
 	return fmt.Sprintf("index:%d:%s", call.Index, call.Function.Name)
 }
 
-func (r *Runner) executeToolCalls(ctx context.Context, input RunTurnInput, ws workspace.Workspace, currentTask task.Task, calls []llm.ToolCall) ([]llm.Message, bool, error) {
+func (r *Runner) assistantMessageForApproval(ctx context.Context, appr approval.Approval, req tools.Request) (llm.Message, error) {
+	events, err := event.NewStore(r.db).ListByTask(ctx, appr.TaskID)
+	if err != nil {
+		return llm.Message{}, err
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		item := events[i]
+		if item.TurnID != appr.TurnID || item.Type != "agent.message.completed" {
+			continue
+		}
+		var payload struct {
+			Content   string         `json:"content"`
+			ToolCalls []llm.ToolCall `json:"toolCalls"`
+		}
+		if err := json.Unmarshal([]byte(item.PayloadJSON), &payload); err != nil {
+			return llm.Message{}, fmt.Errorf("decode assistant event: %w", err)
+		}
+		if call, ok := matchingToolCall(payload.ToolCalls, req); ok {
+			return llm.Message{
+				Role:      llm.RoleAssistant,
+				Content:   payload.Content,
+				ToolCalls: []llm.ToolCall{call},
+			}, nil
+		}
+	}
+	if req.ToolCallID == "" {
+		req.ToolCallID = appr.ID
+	}
+	return llm.Message{
+		Role: llm.RoleAssistant,
+		ToolCalls: []llm.ToolCall{
+			{
+				ID:   req.ToolCallID,
+				Type: "function",
+				Function: llm.ToolCallFunction{
+					Name:      req.Name,
+					Arguments: string(req.Arguments),
+				},
+			},
+		},
+	}, nil
+}
+
+func matchingToolCall(calls []llm.ToolCall, req tools.Request) (llm.ToolCall, bool) {
+	for _, call := range calls {
+		if req.ToolCallID != "" && call.ID == req.ToolCallID {
+			return call, true
+		}
+		if call.Function.Name == req.Name && normalizeJSONRaw(call.Function.Arguments) == normalizeJSONRaw(string(req.Arguments)) {
+			return call, true
+		}
+	}
+	return llm.ToolCall{}, false
+}
+
+func toolRequestFromApproval(appr approval.Approval, requestID string) (tools.Request, error) {
+	var req tools.Request
+	if strings.TrimSpace(appr.RequestJSON) == "" || strings.TrimSpace(appr.RequestJSON) == "{}" {
+		return tools.Request{}, errors.New("approval has no tool request snapshot")
+	}
+	if err := json.Unmarshal([]byte(appr.RequestJSON), &req); err != nil {
+		return tools.Request{}, fmt.Errorf("decode approval tool request: %w", err)
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		return tools.Request{}, errors.New("approval tool request has no name")
+	}
+	req.RequestID = requestID
+	req.ApprovalID = appr.ID
+	if req.ToolCallID == "" {
+		req.ToolCallID = appr.ID
+	}
+	return req, nil
+}
+
+func normalizeJSONRaw(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "{}"
+	}
+	var value interface{}
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return raw
+	}
+	normalized, err := json.Marshal(value)
+	if err != nil {
+		return raw
+	}
+	return string(normalized)
+}
+
+func (r *Runner) executeToolCalls(ctx context.Context, input RunTurnInput, ws workspace.Workspace, currentTask task.Task, calls []llm.ToolCall, approvalID ...string) ([]llm.Message, bool, error) {
 	if r.toolExecutor == nil {
 		return nil, false, nil
 	}
 	toolMessages := make([]llm.Message, 0, len(calls))
 	for _, call := range calls {
+		if err := r.appendJSONEvent(ctx, input, "tool.call.started", map[string]interface{}{
+			"name":       call.Function.Name,
+			"toolCallId": call.ID,
+		}); err != nil {
+			return nil, false, err
+		}
+		reqApprovalID := ""
+		if len(approvalID) > 0 {
+			reqApprovalID = approvalID[0]
+		}
 		result, err := r.toolExecutor.Execute(ctx, tools.Context{
 			Workspace: ws,
 			Task:      currentTask,
 			TurnID:    input.TurnID,
 		}, tools.Request{
-			RequestID: input.RequestID,
-			Name:      call.Function.Name,
-			Arguments: json.RawMessage(call.Function.Arguments),
+			RequestID:  input.RequestID,
+			Name:       call.Function.Name,
+			Arguments:  json.RawMessage(call.Function.Arguments),
+			ApprovalID: reqApprovalID,
+			ToolCallID: call.ID,
 		})
 		if errors.Is(err, tools.ErrApprovalRequired) {
 			if err := r.appendJSONEvent(ctx, input, "approval.requested", map[string]interface{}{"approval": result.Approval}); err != nil {

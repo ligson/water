@@ -4,6 +4,13 @@
 
 ## 2026-08-06
 
+- 更新 `AGENTS.md` 与 `.gitignore`，明确提交前禁止携带本地敏感信息，移除个人绝对路径引用，并忽略环境文件、密钥文件、Playwright 会话和临时输出。
+- 审批记录新增后端内部工具请求快照，Agent 工具审批通过后会自动恢复原工具调用、回填工具结果并继续模型推理；拒绝审批会将当前 Turn 标记为 `interrupted`。
+- 任务事件新增 `approval.continuation.started` 与 `tool.call.started`，前端执行过程同步展示审批恢复和工具开始执行状态。
+- 新增 migration `00003_approval_request_snapshot.sql`，为 approvals 表增加 `request_json` 字段支撑审批后恢复执行。
+- 前端聊天头部右侧新增当前任务上下文用量状态条，实时展示最近一轮 Context Pack 估算用量和预算，并用进度线提示占比。
+- 新增 MIT `LICENSE`，并为根 README 增加项目徽章和若水工作台截图资产，完善 GitHub 开源展示。
+- 新增根目录 `README.md`，以开源项目主页形式说明若水定位、核心能力、架构、快速开始、配置、安全模型、路线图和贡献方式。
 - 前端聊天头部控制区改为连接状态点与紧凑图标按钮，弱化“实时 / 打断 / 刷新”控件的视觉噪音。
 - Provider 新增 `contextWindowTokens` 上下文窗口配置，默认 8192；Agent 按当前 Provider 生成 Context Pack 预算并写入 `context.pack.built` 事件，前端在 Provider 列表、弹框和执行过程里展示上下文长度与估算用量。
 - Agent 对“生成/整理/保存报告或文档”类请求增加默认 Markdown 保存路径提示，未指定路径时建议使用工作区内 `reports/<任务标题>-turn-<轮次>.md`，减少模型反复追问路径。

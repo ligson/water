@@ -36,6 +36,7 @@ type Approval struct {
 	RequestedAt    time.Time  `json:"requestedAt"`
 	ResolvedAt     *time.Time `json:"resolvedAt,omitempty"`
 	DecisionMsg    string     `json:"decisionMessage"`
+	RequestJSON    string     `json:"-"`
 }
 
 type Store struct {
@@ -50,6 +51,7 @@ type CreateInput struct {
 	Target         string
 	RiskSummary    string
 	ExpectedImpact string
+	RequestJSON    string
 }
 
 func NewStore(db *sql.DB) *Store {
@@ -58,7 +60,7 @@ func NewStore(db *sql.DB) *Store {
 
 func (s *Store) ListByWorkspace(ctx context.Context, workspaceID string, status string) ([]Approval, error) {
 	query := `
-SELECT id, workspace_id, COALESCE(task_id, ''), COALESCE(turn_id, ''), action_type, target, risk_summary, expected_impact, status, requested_at, COALESCE(resolved_at, ''), decision_message
+SELECT id, workspace_id, COALESCE(task_id, ''), COALESCE(turn_id, ''), action_type, target, risk_summary, expected_impact, status, requested_at, COALESCE(resolved_at, ''), decision_message, request_json
 FROM approvals
 WHERE workspace_id = ?`
 	args := []interface{}{workspaceID}
@@ -90,7 +92,7 @@ WHERE workspace_id = ?`
 
 func (s *Store) Get(ctx context.Context, id string) (Approval, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, workspace_id, COALESCE(task_id, ''), COALESCE(turn_id, ''), action_type, target, risk_summary, expected_impact, status, requested_at, COALESCE(resolved_at, ''), decision_message
+SELECT id, workspace_id, COALESCE(task_id, ''), COALESCE(turn_id, ''), action_type, target, risk_summary, expected_impact, status, requested_at, COALESCE(resolved_at, ''), decision_message, request_json
 FROM approvals
 WHERE id = ?`, id)
 	item, err := scanApproval(row)
@@ -113,11 +115,12 @@ func (s *Store) Create(ctx context.Context, input CreateInput) (Approval, error)
 		ExpectedImpact: input.ExpectedImpact,
 		Status:         StatusPending,
 		RequestedAt:    now,
+		RequestJSON:    dbutil.WithDefault(input.RequestJSON, "{}"),
 	}
 
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO approvals (id, workspace_id, task_id, turn_id, action_type, target, risk_summary, expected_impact, status, requested_at)
-VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?, ?)`,
+INSERT INTO approvals (id, workspace_id, task_id, turn_id, action_type, target, risk_summary, expected_impact, status, requested_at, request_json)
+VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?)`,
 		item.ID,
 		item.WorkspaceID,
 		item.TaskID,
@@ -128,6 +131,7 @@ VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?, ?)`,
 		item.ExpectedImpact,
 		item.Status,
 		dbutil.FormatTime(item.RequestedAt),
+		item.RequestJSON,
 	)
 	if err != nil {
 		return Approval{}, fmt.Errorf("insert approval: %w", err)
@@ -171,7 +175,7 @@ func scanApproval(row scanner) (Approval, error) {
 	var item Approval
 	var requestedAt string
 	var resolvedAt string
-	if err := row.Scan(&item.ID, &item.WorkspaceID, &item.TaskID, &item.TurnID, &item.ActionType, &item.Target, &item.RiskSummary, &item.ExpectedImpact, &item.Status, &requestedAt, &resolvedAt, &item.DecisionMsg); err != nil {
+	if err := row.Scan(&item.ID, &item.WorkspaceID, &item.TaskID, &item.TurnID, &item.ActionType, &item.Target, &item.RiskSummary, &item.ExpectedImpact, &item.Status, &requestedAt, &resolvedAt, &item.DecisionMsg, &item.RequestJSON); err != nil {
 		return Approval{}, err
 	}
 	item.RequestedAt = dbutil.ParseTime(requestedAt)

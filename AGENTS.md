@@ -1,6 +1,6 @@
 # AGENTS.md
 
-@/Users/ligson/.codex/RTK.md
+本仓库不提交个人机器上的私有 Agent 配置路径；本地开发者可在自己的 Codex/Agent 环境中按需加载额外规则。
 
 ## 项目概述
 
@@ -188,7 +188,10 @@ water-be/
 7. **必须维护 CHANGELOG**
    每次对仓库做任何文件改动，都必须更新根目录 `CHANGELOG.md`，记录日期、改动内容和影响范围。
 
-8. **本地模型优先**
+8. **提交前禁止携带本地敏感信息**
+   提交或推送前必须检查 `git status`、暂存区 diff 和新增文件，禁止提交 API Key、Token、Cookie、私钥、`.env*`、本地数据库、日志、PID、Playwright 会话、构建产物、绝对私有路径或其他只属于本机环境的信息。发现敏感内容时应先移除、脱敏或加入 `.gitignore`，再提交。
+
+9. **本地模型优先**
    所有 LLM 调用都走可配置的 OpenAI-compatible 接口，方便对接 Ollama / vLLM / LM Studio / 内网模型网关。
 
 ## 当前阶段建议

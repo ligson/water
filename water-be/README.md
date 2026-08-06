@@ -166,8 +166,16 @@ curl -X POST http://localhost:8080/api/tasks/{taskId}/turns \
 - `context.pack.built`
 - `agent.message.delta`
 - `agent.message.completed`
+- `agent.tool_calls.detected`
+- `approval.requested`
+- `approval.resolved`
+- `approval.continuation.started`
+- `tool.call.started`
+- `tool.completed`
+- `tool.failed`
 - `turn.completed`
 - `turn.failed`
+- `turn.interrupted`
 
 模型返回 `tool_calls` 时，后端会通过 Harness 执行工具或生成审批请求；Agent Prompt 会携带后端内部构建的 Context Pack 基础信息。
 `context.pack.built` 会返回本轮估算上下文用量、预算、模型上下文窗口和是否截断，供前端展示“上下文约 X / Y tokens”。
@@ -205,3 +213,5 @@ curl -X POST http://localhost:8080/api/approvals/{approvalId}/resolve \
 ```bash
 curl http://localhost:8080/api/workspaces/{workspaceId}/approvals?status=pending
 ```
+
+Agent Loop 中产生的审批会保存后端内部工具请求快照。用户批准后，后端会自动恢复原工具调用，将工具结果回填给模型继续推理；用户拒绝后，当前 Turn 会写入 `turn.interrupted`，前端显示为已中断。

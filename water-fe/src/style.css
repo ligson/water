@@ -697,6 +697,53 @@ label,
   gap: 8px;
 }
 
+.context-state {
+  --context-used: 0%;
+  min-height: 30px;
+  min-width: 136px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.context-state.active {
+  color: var(--brand-deep);
+  border-color: var(--brand-ring);
+  background: color-mix(in srgb, var(--brand-soft) 68%, var(--surface));
+}
+
+.context-state.warning {
+  color: var(--status-warning);
+}
+
+.context-meter {
+  position: relative;
+  width: 34px;
+  height: 6px;
+  flex: none;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--line) 72%, transparent);
+}
+
+.context-meter::after {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: var(--context-used);
+  border-radius: inherit;
+  background: currentColor;
+  transition: width 180ms ease;
+}
+
 .connection-state {
   min-height: 30px;
   display: inline-flex;
@@ -1558,7 +1605,20 @@ label,
   }
 
   .chat-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
     padding-inline: 14px;
+  }
+
+  .chat-header-actions {
+    width: 100%;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .context-state {
+    flex: 1;
+    min-width: 168px;
   }
 
   .composer {
