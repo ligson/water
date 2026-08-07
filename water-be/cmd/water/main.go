@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ligson/water/water-be/internal/api"
+	"github.com/ligson/water/water-be/internal/auth"
 	"github.com/ligson/water/water-be/internal/config"
 	"github.com/ligson/water/water-be/internal/store"
 )
@@ -32,6 +33,18 @@ func main() {
 	if err := store.Migrate(db); err != nil {
 		logger.Error("migrate database", "error", err)
 		os.Exit(1)
+	}
+
+	bootstrapPIN, err := auth.NewStore(db).Ensure(context.Background(), cfg.AccessPIN)
+	if err != nil {
+		logger.Error("initialize auth", "error", err)
+		os.Exit(1)
+	}
+	cfg.AuthEnabled = true
+	if bootstrapPIN != "" {
+		logger.Warn("若水 access PIN generated", "pin", bootstrapPIN)
+	} else if cfg.AccessPIN != "" {
+		logger.Info("若水 access PIN loaded from WATER_ACCESS_PIN")
 	}
 
 	server := &http.Server{

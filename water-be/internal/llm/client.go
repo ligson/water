@@ -30,6 +30,10 @@ type Client interface {
 	ChatStream(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error)
 }
 
+type ModelOption struct {
+	ID string `json:"id"`
+}
+
 type Message struct {
 	Role       string     `json:"role"`
 	Content    string     `json:"content,omitempty"`
@@ -115,7 +119,7 @@ func (c *OpenAIClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse,
 		return ChatResponse{}, err
 	}
 
-	httpReq, err := c.newRequest(ctx, payload)
+	httpReq, err := c.newRequest(ctx, http.MethodPost, "/chat/completions", payload)
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -152,7 +156,7 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan 
 		return nil, err
 	}
 
-	httpReq, err := c.newRequest(ctx, payload)
+	httpReq, err := c.newRequest(ctx, http.MethodPost, "/chat/completions", payload)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +187,47 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan 
 	}()
 
 	return events, nil
+}
+
+func (c *OpenAIClient) ListModels(ctx context.Context) ([]ModelOption, error) {
+	httpReq, err := c.newRequest(ctx, http.MethodGet, "/models", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("list models request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := checkOpenAIResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var decoded openAIModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decode model list response: %w", err)
+	}
+
+	items := decoded.Data
+	if len(items) == 0 {
+		items = decoded.Models
+	}
+	models := make([]ModelOption, 0, len(items))
+	seen := make(map[string]struct{})
+	for _, item := range items {
+		id := strings.TrimSpace(firstNonEmpty(item.ID, item.Name, item.Model))
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		models = append(models, ModelOption{ID: id})
+	}
+	return models, nil
 }
 
 func (c *OpenAIClient) buildPayload(req ChatRequest, stream bool) ([]byte, error) {
@@ -219,12 +264,18 @@ func (c *OpenAIClient) buildPayload(req ChatRequest, stream bool) ([]byte, error
 	return payload, nil
 }
 
-func (c *OpenAIClient) newRequest(ctx context.Context, payload []byte) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.provider.BaseURL+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("build chat request: %w", err)
+func (c *OpenAIClient) newRequest(ctx context.Context, method string, endpoint string, payload []byte) (*http.Request, error) {
+	var body io.Reader
+	if len(payload) > 0 {
+		body = bytes.NewReader(payload)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req, err := http.NewRequestWithContext(ctx, method, c.provider.BaseURL+endpoint, body)
+	if err != nil {
+		return nil, fmt.Errorf("build provider request: %w", err)
+	}
+	if len(payload) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("Accept", "application/json")
 	if c.provider.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.provider.APIKey)
@@ -244,6 +295,27 @@ func (c *OpenAIClient) newRequest(ctx context.Context, payload []byte) (*http.Re
 	}
 
 	return req, nil
+}
+
+type openAIModelsResponse struct {
+	Data   []openAIModelItem `json:"data"`
+	Models []openAIModelItem `json:"models"`
+}
+
+type openAIModelItem struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Model   string `json:"model"`
+	OwnedBy string `json:"owned_by"`
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func checkOpenAIResponse(resp *http.Response) error {

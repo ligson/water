@@ -128,6 +128,12 @@ cd water
 - 后端：`http://127.0.0.1:8080`
 - 健康检查：`http://127.0.0.1:8080/api/health`
 
+首次启动后端时，若水会初始化访问 PIN。未设置 `WATER_ACCESS_PIN` 时，后端会生成一个一次性初始 PIN 并写入 `scripts/logs/water-be.log`；后续可以在设置页修改。建议本机固定使用环境变量启动：
+
+```bash
+WATER_ACCESS_PIN=123456 ./scripts/start-all.sh
+```
+
 查看服务状态：
 
 ```bash
@@ -176,6 +182,7 @@ VITE_API_BASE=http://127.0.0.1:8080 npm run dev
 | `WATER_HTTP_ADDR` | `:8080` | 后端监听地址 |
 | `WATER_DATA_DIR` | `data` | 数据目录 |
 | `WATER_DATABASE_PATH` | `data/water.db` | SQLite 数据库路径 |
+| `WATER_ACCESS_PIN` | 首次启动自动生成 | 单用户访问 PIN；设置后会重置本地 PIN 并使旧会话失效 |
 
 前端常用环境变量：
 
@@ -233,6 +240,7 @@ npm run build
 
 若水默认把“能不能做”交给 Harness 判断，而不是直接相信模型输出。
 
+- 后端默认启用单用户访问 PIN，解锁后前端使用短期 session token 访问 HTTP API 与 WebSocket。
 - 工作区内只读操作可以自动执行。
 - 写文件、删除文件、命令执行、Python 执行、网络访问和跨工作区访问默认需要权限策略判断。
 - 完全访问模式只放宽当前工作区内的高信任动作，不隐式开放工作区外路径。

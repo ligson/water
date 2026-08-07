@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -23,6 +25,12 @@ type providerRequest struct {
 	MaxRetries          int     `json:"maxRetries"`
 	StreamIdleTimeoutMS int     `json:"streamIdleTimeoutMs"`
 	HeadersJSON         string  `json:"headersJson"`
+}
+
+type providerModelsRequest struct {
+	ProviderID *string `json:"providerId"`
+	BaseURL    *string `json:"baseUrl"`
+	APIKey     *string `json:"apiKey"`
 }
 
 func (r *Router) handleProviders(w http.ResponseWriter, req *http.Request) {
@@ -71,6 +79,37 @@ func (r *Router) handleProviderByID(w http.ResponseWriter, req *http.Request, re
 	default:
 		WriteError(req.Context(), w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (r *Router) handleProviderModels(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		WriteError(req.Context(), w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	input, ok := decodeProviderModelsRequest(w, req)
+	if !ok {
+		return
+	}
+
+	p, err := r.resolveProviderModelSource(req.Context(), input)
+	if err != nil {
+		if errors.Is(err, provider.ErrNotFound) {
+			WriteError(req.Context(), w, http.StatusNotFound, "provider not found")
+			return
+		}
+		r.logger.ErrorContext(req.Context(), "resolve provider for model list", "error", err)
+		WriteError(req.Context(), w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	items, err := llm.ListProviderModels(req.Context(), p)
+	if err != nil {
+		r.logger.ErrorContext(req.Context(), "list provider models", "error", err)
+		WriteError(req.Context(), w, http.StatusBadGateway, providerModelListErrorMessage(err))
+		return
+	}
+	WriteOK(req.Context(), w, "ok", map[string]interface{}{"items": items})
 }
 
 func (r *Router) listProviders(w http.ResponseWriter, req *http.Request) {
@@ -251,6 +290,72 @@ func decodeProviderRequest(w http.ResponseWriter, req *http.Request) (providerRe
 	return input, true
 }
 
+func decodeProviderModelsRequest(w http.ResponseWriter, req *http.Request) (providerModelsRequest, bool) {
+	defer req.Body.Close()
+
+	var input providerModelsRequest
+	if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+		WriteError(req.Context(), w, http.StatusBadRequest, "invalid json body")
+		return providerModelsRequest{}, false
+	}
+	if input.ProviderID != nil {
+		value := strings.TrimSpace(*input.ProviderID)
+		if value == "" {
+			input.ProviderID = nil
+		} else {
+			input.ProviderID = &value
+		}
+	}
+	if input.BaseURL != nil {
+		value := strings.TrimSpace(*input.BaseURL)
+		if value == "" {
+			input.BaseURL = nil
+		} else {
+			input.BaseURL = &value
+		}
+	}
+	if input.APIKey != nil {
+		value := strings.TrimSpace(*input.APIKey)
+		if value == "" {
+			input.APIKey = nil
+		} else {
+			input.APIKey = &value
+		}
+	}
+	return input, true
+}
+
+func (r *Router) resolveProviderModelSource(ctx context.Context, input providerModelsRequest) (provider.Provider, error) {
+	source := provider.Provider{
+		Type:        provider.TypeOpenAICompatible,
+		Enabled:     true,
+		HeadersJSON: "{}",
+	}
+
+	if input.ProviderID != nil {
+		p, err := provider.NewStore(r.db).Get(ctx, *input.ProviderID)
+		if err != nil {
+			return provider.Provider{}, err
+		}
+		source = p
+	}
+
+	if input.BaseURL != nil {
+		source.BaseURL = *input.BaseURL
+	}
+	if input.APIKey != nil {
+		source.APIKey = *input.APIKey
+	}
+	if source.BaseURL == "" {
+		return provider.Provider{}, fmt.Errorf("baseUrl is required")
+	}
+	source.Enabled = true
+	if source.HeadersJSON == "" {
+		source.HeadersJSON = "{}"
+	}
+	return source, nil
+}
+
 func splitProviderPath(rest string) (id string, action string, ok bool) {
 	rest = strings.Trim(rest, "/")
 	if rest == "" {
@@ -278,4 +383,19 @@ func enabledOrDefault(value *bool) bool {
 		return true
 	}
 	return *value
+}
+
+func providerModelListErrorMessage(err error) string {
+	if err == nil {
+		return "获取模型列表失败"
+	}
+	message := err.Error()
+	lower := strings.ToLower(message)
+	if strings.Contains(lower, "http 404") || strings.TrimSpace(lower) == "not found" {
+		return "模型服务未提供 /models 列表接口，可以继续手动填写模型名"
+	}
+	if strings.Contains(lower, "http 401") || strings.Contains(lower, "http 403") || strings.Contains(lower, "invalid token") {
+		return "模型服务认证失败，请检查 API Key 后重试"
+	}
+	return message
 }

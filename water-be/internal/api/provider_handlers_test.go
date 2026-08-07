@@ -141,6 +141,64 @@ func TestProviderSetDefault(t *testing.T) {
 	}
 }
 
+func TestProviderModelsUsesStoredProvider(t *testing.T) {
+	var gotAuth string
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected provider path %s", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"object": "list",
+			"data": [
+				{"id": "qwen2.5-coder:7b"},
+				{"id": "llama3.1:8b"}
+			]
+		}`))
+	}))
+	defer modelServer.Close()
+
+	db := openTestDB(t)
+	defer db.Close()
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	createBody := `{
+		"name": "Local",
+		"type": "openai-compatible",
+		"baseUrl": "` + modelServer.URL + `/v1",
+		"model": "qwen2.5-coder:7b",
+		"apiKey": "secret",
+		"isDefault": true
+	}`
+	createRec := performJSON(handler, http.MethodPost, "/api/providers", createBody)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create provider: status %d body %s", createRec.Code, createRec.Body.String())
+	}
+	var created providerEnvelope
+	decodeTestEnvelope(t, createRec, &created)
+
+	modelsRec := performJSON(handler, http.MethodPost, "/api/provider-models", `{"providerId":"`+created.Data.ID+`"}`)
+	if modelsRec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", modelsRec.Code, modelsRec.Body.String())
+	}
+	if strings.Contains(modelsRec.Body.String(), "secret") {
+		t.Fatalf("model list response leaked api key: %s", modelsRec.Body.String())
+	}
+	if gotAuth != "Bearer secret" {
+		t.Fatalf("expected stored authorization header, got %q", gotAuth)
+	}
+
+	var models providerModelListEnvelope
+	decodeTestEnvelope(t, modelsRec, &models)
+	if len(models.Data.Items) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(models.Data.Items))
+	}
+	if models.Data.Items[0].ID != "qwen2.5-coder:7b" {
+		t.Fatalf("unexpected first model: %+v", models.Data.Items[0])
+	}
+}
+
 func createProviderForTest(t *testing.T, handler http.Handler, name string, isDefault bool) providerResponse {
 	t.Helper()
 
@@ -215,5 +273,14 @@ type providerListEnvelope struct {
 	Success bool `json:"success"`
 	Data    struct {
 		Items []providerResponse `json:"items"`
+	} `json:"data"`
+}
+
+type providerModelListEnvelope struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Items []struct {
+			ID string `json:"id"`
+		} `json:"items"`
 	} `json:"data"`
 }

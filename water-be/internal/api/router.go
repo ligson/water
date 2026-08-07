@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -11,8 +12,9 @@ import (
 	"time"
 
 	"github.com/ligson/water/water-be/internal/agent"
-	"github.com/ligson/water/water-be/internal/event"
+	"github.com/ligson/water/water-be/internal/auth"
 	"github.com/ligson/water/water-be/internal/config"
+	"github.com/ligson/water/water-be/internal/event"
 	"github.com/ligson/water/water-be/internal/realtime"
 	"github.com/ligson/water/water-be/internal/requestid"
 	"github.com/ligson/water/water-be/internal/task"
@@ -24,6 +26,7 @@ type Router struct {
 	logger *slog.Logger
 	hub    *realtime.Hub
 	agent  *agent.Runner
+	auth   *auth.Store
 	mu     sync.Mutex
 	cancel map[string]taskRun
 }
@@ -39,6 +42,7 @@ func NewRouter(db *sql.DB, cfg config.Config, logger *slog.Logger) http.Handler 
 		cfg:    cfg,
 		logger: logger,
 		hub:    realtime.NewHub(),
+		auth:   auth.NewStore(db),
 		cancel: make(map[string]taskRun),
 	}
 	r.agent = agent.NewRunner(db, r.appendTaskEvent)
@@ -48,16 +52,44 @@ func NewRouter(db *sql.DB, cfg config.Config, logger *slog.Logger) http.Handler 
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if r.cfg.AuthEnabled && !r.isPublicRoute(req.URL.Path) {
+		if ok := r.requireAuth(w, req); !ok {
+			return
+		}
+	}
+
 	switch req.URL.Path {
 	case "/api/health":
 		r.handleHealth(w, req)
 	case "/api/providers":
 		r.handleProviders(w, req)
+	case "/api/provider-models":
+		r.handleProviderModels(w, req)
 	case "/api/workspaces":
 		r.handleWorkspaces(w, req)
 	default:
+		if strings.HasPrefix(req.URL.Path, "/api/auth/") {
+			r.handleAuth(w, req, strings.TrimPrefix(req.URL.Path, "/api/auth/"))
+			return
+		}
 		if strings.HasPrefix(req.URL.Path, "/ws/tasks/") {
 			r.handleTaskWebSocket(w, req, strings.TrimPrefix(req.URL.Path, "/ws/tasks/"))
+			return
+		}
+		if strings.HasPrefix(req.URL.Path, "/ws/terminal-sessions/") {
+			r.handleTerminalWebSocket(w, req, strings.TrimPrefix(req.URL.Path, "/ws/terminal-sessions/"))
+			return
+		}
+		if req.URL.Path == "/api/terminal-sessions" {
+			r.handleTerminalSessions(w, req)
+			return
+		}
+		if strings.HasPrefix(req.URL.Path, "/api/terminal-sessions/") {
+			r.handleTerminalSessionByID(w, req, strings.TrimPrefix(req.URL.Path, "/api/terminal-sessions/"))
+			return
+		}
+		if strings.HasPrefix(req.URL.Path, "/api/terminal-profiles/") {
+			r.handleTerminalProfileByID(w, req, strings.TrimPrefix(req.URL.Path, "/api/terminal-profiles/"))
 			return
 		}
 		if strings.HasPrefix(req.URL.Path, "/api/tasks/") {
@@ -78,6 +110,39 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		WriteError(req.Context(), w, http.StatusNotFound, "not found")
 	}
+}
+
+func (r *Router) isPublicRoute(path string) bool {
+	if path == "/api/health" || path == "/api/auth/status" || path == "/api/auth/unlock" {
+		return true
+	}
+	return false
+}
+
+func (r *Router) requireAuth(w http.ResponseWriter, req *http.Request) bool {
+	token := authTokenFromRequest(req)
+	if token == "" {
+		WriteError(req.Context(), w, http.StatusUnauthorized, "auth required")
+		return false
+	}
+	valid, err := r.authStore().ValidateToken(req.Context(), token)
+	if err != nil {
+		if errors.Is(err, auth.ErrNotConfigured) {
+			return true
+		}
+		r.logger.ErrorContext(req.Context(), "validate auth token", "error", err)
+		WriteError(req.Context(), w, http.StatusInternalServerError, "validate auth failed")
+		return false
+	}
+	if !valid {
+		WriteError(req.Context(), w, http.StatusUnauthorized, "auth required")
+		return false
+	}
+	return true
+}
+
+func (r *Router) authStore() *auth.Store {
+	return r.auth
 }
 
 func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {

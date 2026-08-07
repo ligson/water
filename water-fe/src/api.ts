@@ -18,6 +18,10 @@ export interface Provider {
   contextWindowTokens: number
 }
 
+export interface ProviderModelOption {
+  id: string
+}
+
 export interface Workspace {
   id: string
   name: string
@@ -83,24 +87,109 @@ export interface WorkspaceFileContent {
   truncated: boolean
 }
 
+export interface TerminalSession {
+  id: string
+  workspaceId: string
+  profileId: string
+  status: string
+  cwd: string
+  cols: number
+  rows: number
+  createdAt: string
+  updatedAt: string
+  lastActiveAt?: string
+  closedAt?: string
+}
+
+export interface AuthStatus {
+  configured: boolean
+  authenticated: boolean
+  locked: boolean
+  sessionExpiresAt: string
+  lastUnlockedAt: string
+}
+
+export interface AuthSession {
+  accessToken: string
+  expiresAt: string
+}
+
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
+const ACCESS_TOKEN_KEY = 'water-access-token'
+
+export function getAccessToken(): string {
+  if (typeof window === 'undefined') return ''
+  return window.localStorage.getItem(ACCESS_TOKEN_KEY) ?? ''
+}
+
+export function setAccessToken(token: string) {
+  if (typeof window === 'undefined') return
+  if (token) {
+    window.localStorage.setItem(ACCESS_TOKEN_KEY, token)
+  } else {
+    window.localStorage.removeItem(ACCESS_TOKEN_KEY)
+  }
+}
+
+export function clearAccessToken() {
+  setAccessToken('')
+}
+
+function buildHeaders(init?: RequestInit): HeadersInit {
+  const headers = new Headers(init?.headers ?? {})
+  if (!headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+  const token = getAccessToken()
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`)
+  }
+  return headers
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(API_BASE + path, {
     ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
+    headers: buildHeaders(init),
   })
   const body = (await res.json()) as Envelope<T>
   if (!res.ok || !body.success) {
-    throw new Error(body.message || `HTTP ${res.status}`)
+    const error = new Error(body.message || `HTTP ${res.status}`) as Error & { status?: number }
+    error.status = res.status
+    throw error
   }
   return body.data
 }
 
+async function download(path: string): Promise<Blob> {
+  const res = await fetch(API_BASE + path, {
+    headers: buildHeaders(),
+  })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => undefined)) as Envelope<unknown> | undefined
+    const error = new Error(body?.message || `HTTP ${res.status}`) as Error & { status?: number }
+    error.status = res.status
+    throw error
+  }
+  return await res.blob()
+}
+
 export const api = {
+  authStatus: () => request<AuthStatus>('/api/auth/status'),
+  unlockAuth: (pin: string) =>
+    request<AuthSession>('/api/auth/unlock', {
+      method: 'POST',
+      body: JSON.stringify({ pin }),
+    }),
+  lockAuth: () =>
+    request<Record<string, never>>('/api/auth/lock', {
+      method: 'POST',
+    }),
+  changeAuthPin: (currentPin: string, newPin: string) =>
+    request<AuthSession>('/api/auth/change-pin', {
+      method: 'POST',
+      body: JSON.stringify({ currentPin, newPin }),
+    }),
   listProviders: () => request<{ items: Provider[] }>('/api/providers'),
   createProvider: (body: Record<string, unknown>) =>
     request<Provider>('/api/providers', { method: 'POST', body: JSON.stringify(body) }),
@@ -110,9 +199,18 @@ export const api = {
     request<Record<string, never>>(`/api/providers/${providerId}`, {
       method: 'DELETE',
     }),
+  setDefaultProvider: (providerId: string) =>
+    request<Provider>(`/api/providers/${providerId}/default`, {
+      method: 'POST',
+    }),
   testProvider: (id: string) =>
     request<{ ok: boolean; message: string; latency: string }>(`/api/providers/${id}/test`, {
       method: 'POST',
+    }),
+  listProviderModels: (body: Record<string, unknown>) =>
+    request<{ items: ProviderModelOption[] }>('/api/provider-models', {
+      method: 'POST',
+      body: JSON.stringify(body),
     }),
 
   listWorkspaces: () => request<{ items: Workspace[] }>('/api/workspaces'),
@@ -146,6 +244,18 @@ export const api = {
     request<WorkspaceFileContent>(
       `/api/workspaces/${workspaceId}/files/content?path=${encodeURIComponent(path)}`,
     ),
+  createTerminalSession: (body: Record<string, unknown>) =>
+    request<TerminalSession>('/api/terminal-sessions', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  closeTerminalSession: (sessionId: string) =>
+    request<Record<string, never>>(`/api/terminal-sessions/${sessionId}`, {
+      method: 'DELETE',
+    }),
+  downloadWorkspaceFile: (workspaceId: string, path: string) =>
+    download(`/api/workspaces/${workspaceId}/files/download?path=${encodeURIComponent(path)}`),
+  downloadWorkspaceArchive: (workspaceId: string) => download(`/api/workspaces/${workspaceId}/archive`),
 
   listTasks: (workspaceId: string) =>
     request<{ items: Task[] }>(`/api/workspaces/${workspaceId}/tasks`),
@@ -185,11 +295,20 @@ export const api = {
 }
 
 export function workspaceFileDownloadURL(workspaceId: string, path: string): string {
-  return `${API_BASE}/api/workspaces/${workspaceId}/files/download?path=${encodeURIComponent(path)}`
+  const url = new URL(API_BASE || window.location.origin, window.location.origin)
+  url.pathname = `/api/workspaces/${workspaceId}/files/download`
+  url.searchParams.set('path', path)
+  const token = getAccessToken()
+  if (token) url.searchParams.set('accessToken', token)
+  return url.toString()
 }
 
 export function workspaceArchiveDownloadURL(workspaceId: string): string {
-  return `${API_BASE}/api/workspaces/${workspaceId}/archive`
+  const url = new URL(API_BASE || window.location.origin, window.location.origin)
+  url.pathname = `/api/workspaces/${workspaceId}/archive`
+  const token = getAccessToken()
+  if (token) url.searchParams.set('accessToken', token)
+  return url.toString()
 }
 
 export function taskWebSocketURL(taskId: string, afterSequence = 0): string {
@@ -198,8 +317,25 @@ export function taskWebSocketURL(taskId: string, afterSequence = 0): string {
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
   url.pathname = `/ws/tasks/${taskId}`
   url.search = ''
+  const token = getAccessToken()
+  if (token) {
+    url.searchParams.set('accessToken', token)
+  }
   if (afterSequence > 0) {
     url.searchParams.set('afterSequence', String(afterSequence))
+  }
+  return url.toString()
+}
+
+export function terminalWebSocketURL(sessionId: string): string {
+  const base = API_BASE || window.location.origin
+  const url = new URL(base, window.location.origin)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  url.pathname = `/ws/terminal-sessions/${sessionId}`
+  url.search = ''
+  const token = getAccessToken()
+  if (token) {
+    url.searchParams.set('accessToken', token)
   }
   return url.toString()
 }

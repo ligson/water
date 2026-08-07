@@ -14,6 +14,9 @@ import {
   Folder,
   FolderPlus,
   GripVertical,
+  KeyRound,
+  LockKeyhole,
+  LogOut,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
@@ -22,19 +25,24 @@ import {
   Plus,
   RefreshCw,
   Send,
+  Settings2,
   Square,
   Terminal,
   Trash2,
 } from '@lucide/vue'
 import MarkdownIt from 'markdown-it'
+import WaterAuthScene from './components/auth/WaterAuthScene.vue'
+import ServerTerminalPanel from './components/terminal/ServerTerminalPanel.vue'
 import {
   api,
+  clearAccessToken,
+  setAccessToken,
   taskWebSocketURL,
-  workspaceArchiveDownloadURL,
-  workspaceFileDownloadURL,
+  type AuthStatus,
   type Approval,
   type ExternalPath,
   type Provider,
+  type ProviderModelOption,
   type Task,
   type TaskEvent,
   type Workspace,
@@ -165,6 +173,12 @@ const selectedTaskId = ref('')
 const nowTick = ref(Date.now())
 const rightTab = ref('files')
 const loading = ref(false)
+const authReady = ref(false)
+const authUnlocked = ref(false)
+const authSubmitting = ref(false)
+const authPIN = ref('')
+const authError = ref('')
+const authStatus = ref<AuthStatus | null>(null)
 const wsConnected = ref(false)
 const taskModalOpen = ref(false)
 const taskSubmitting = ref(false)
@@ -172,19 +186,24 @@ const editingTaskId = ref('')
 const providerModalOpen = ref(false)
 const providerSubmitting = ref(false)
 const editingProviderId = ref('')
+const providerModelOptions = ref<ProviderModelOption[]>([])
+const providerModelsLoading = ref(false)
+const providerModelsError = ref('')
 const workspaceModalOpen = ref(false)
 const workspaceSubmitting = ref(false)
 const editingWorkspaceId = ref('')
 const leftPanelWidth = ref(272)
-const rightPanelWidth = ref(340)
+const rightPanelWidth = ref(420)
 const leftPanelCollapsed = ref(false)
 const rightPanelCollapsed = ref(true)
 const executionOpenKeys = ref<string[]>([])
 const settingsOpenKey = ref('appearance')
+const waterPetEnabled = ref(loadWaterPetEnabled())
 const productName = '若水'
 const productTagline = '可驾驭的私有 AI 编程助手'
 const brandMarkSrc = '/favicon.svg'
 const themeStorageKey = 'water-ui-theme'
+const waterPetEnabledStorageKey = 'water-ui-water-pet-enabled'
 const themeOptions: ThemeOption[] = [
   {
     name: 'ruoshui',
@@ -228,6 +247,7 @@ let taskSocketReconnectTimer: number | undefined
 let taskSocketReconnectAttempts = 0
 const taskSocketReconnectBaseMS = 800
 const taskSocketReconnectMaxMS = 8000
+const terminalPanelMinWidth = 560
 let activePanelResize:
   | {
       side: PanelSide
@@ -284,6 +304,11 @@ const externalPathForm = reactive({
   accessMode: 'read',
 })
 
+const authPinForm = reactive({
+  currentPin: '',
+  newPin: '',
+})
+
 const taskTitle = ref('')
 const userInput = ref('')
 const chatBodyRef = ref<HTMLElement | null>(null)
@@ -305,6 +330,9 @@ const waterPetLean = ref(0)
 const waterPetX = ref(0)
 const waterPetY = ref(0)
 let customCursorMediaQuery: MediaQueryList | undefined
+let customCursorFrame: number | undefined
+let customCursorPendingX = 0
+let customCursorPendingY = 0
 let waterPetTimer: number | undefined
 let waterPetMoveTimer: number | undefined
 let waterPetWalkTimer: number | undefined
@@ -330,6 +358,16 @@ const activeProvider = computed(() => {
   return providers.value.find((item) => item.id === workspaceProviderId) ?? defaultProvider.value
 })
 const activeProviderId = computed(() => activeProvider.value?.id ?? '')
+const activeProviderScopeLabel = computed(() => {
+  if (!activeProvider.value) return '未配置'
+  if (selectedWorkspace.value?.defaultProviderId === activeProvider.value.id) {
+    return '当前工作区默认'
+  }
+  if (defaultProvider.value?.id === activeProvider.value.id) {
+    return '全局默认'
+  }
+  return '回退生效'
+})
 const statusText = computed(() => {
   if (!selectedWorkspace.value) return '未选择工作区'
   if (!selectedTask.value) return '选择或创建一个任务'
@@ -400,14 +438,14 @@ const contextHeaderText = computed(() => {
   const usage = latestContextUsage.value
   const budget = contextHeaderBudget.value
   if (usage) {
-    return `上下文 ${formatTokenCount(usage.estimatedTokens)} / ${formatTokenCount(budget)}`
+    return `上下文估算 ${formatTokenCount(usage.estimatedTokens)} / ${formatTokenCount(budget)}`
   }
-  return `上下文 -- / ${formatTokenCount(budget)}`
+  return `上下文估算 -- / ${formatTokenCount(budget)}`
 })
 const contextHeaderTitle = computed(() =>
   latestExecutionGroup.value && latestContextUsage.value
-    ? contextUsageText(latestExecutionGroup.value)
-    : '当前 Provider 的上下文预算',
+    ? `本轮 ${contextUsageText(latestExecutionGroup.value)}`
+    : '当前 Provider 的本轮上下文预算',
 )
 const contextHeaderPercent = computed(() => {
   const usage = latestContextUsage.value
@@ -644,9 +682,14 @@ const antdTheme = computed(() => ({
     fontFamily: 'Inter, system-ui, sans-serif',
   },
 }))
+const effectiveRightPanelWidth = computed(() =>
+  rightTab.value === 'terminal' && !rightPanelCollapsed.value
+    ? Math.max(rightPanelWidth.value, terminalPanelMinWidth)
+    : rightPanelWidth.value,
+)
 const shellStyle = computed(() => ({
   '--left-panel-width': `${leftPanelCollapsed.value ? 48 : leftPanelWidth.value}px`,
-  '--right-panel-width': `${rightPanelCollapsed.value ? 48 : rightPanelWidth.value}px`,
+  '--right-panel-width': `${rightPanelCollapsed.value ? 48 : effectiveRightPanelWidth.value}px`,
 }))
 const customCursorStyle = computed(() => ({
   transform: `translate3d(${customCursorX.value}px, ${customCursorY.value}px, 0) translate(-2px, -1px)`,
@@ -658,13 +701,25 @@ const waterPetStyle = computed(() => ({
   top: `${waterPetY.value}px`,
   '--water-pet-face': `${waterPetFacing.value}`,
   '--water-pet-lean': `${waterPetLean.value}deg`,
+  '--water-pet-tilt': `${waterPetFacing.value * 7}deg`,
 }))
 const waterPetGaitClass = computed(() => (waterPetGaitPhase.value % 2 === 0 ? 'gait-a' : 'gait-b'))
+const authStatusText = computed(() =>
+  authStatus.value?.authenticated ? '已解锁' : authStatus.value?.configured === false ? '未启用访问锁' : '已上锁',
+)
+const canChangePIN = computed(() => Boolean(authPinForm.currentPin.trim() && authPinForm.newPin.trim()))
 
 function loadThemeName(): ThemeName {
   if (typeof window === 'undefined') return 'ruoshui'
   const stored = window.localStorage.getItem(themeStorageKey)
   return themeOptions.some((item) => item.name === stored) ? (stored as ThemeName) : 'ruoshui'
+}
+
+function loadWaterPetEnabled() {
+  if (typeof window === 'undefined') return true
+  const stored = window.localStorage.getItem(waterPetEnabledStorageKey)
+  if (stored === null) return true
+  return stored !== 'false'
 }
 
 function selectTheme(name: ThemeName) {
@@ -673,12 +728,25 @@ function selectTheme(name: ThemeName) {
 
 function clampPanelWidth(value: number, side: PanelSide) {
   const min = side === 'left' ? 220 : 280
-  const max = side === 'left' ? 420 : 520
+  const max = side === 'left' ? 420 : 760
   return Math.min(Math.max(value, min), max)
 }
 
 function canUseCustomCursor() {
   return typeof window !== 'undefined' && window.matchMedia('(pointer: fine)').matches
+}
+
+function flushCustomCursorFrame() {
+  customCursorFrame = undefined
+  customCursorX.value = customCursorPendingX
+  customCursorY.value = customCursorPendingY
+}
+
+function scheduleCustomCursorUpdate(x: number, y: number) {
+  customCursorPendingX = x
+  customCursorPendingY = y
+  if (customCursorFrame !== undefined) return
+  customCursorFrame = window.requestAnimationFrame(flushCustomCursorFrame)
 }
 
 function setCustomCursorState(event: PointerEvent) {
@@ -689,8 +757,7 @@ function setCustomCursorState(event: PointerEvent) {
     return
   }
   customCursorVisible.value = true
-  customCursorX.value = event.clientX
-  customCursorY.value = event.clientY
+  scheduleCustomCursorUpdate(event.clientX, event.clientY)
   const target = event.target as HTMLElement | null
   customCursorInteractive.value = Boolean(
     target?.closest(
@@ -718,10 +785,14 @@ function hideCustomCursor() {
   customCursorVisible.value = false
   customCursorInteractive.value = false
   customCursorPressed.value = false
+  if (customCursorFrame !== undefined) {
+    window.cancelAnimationFrame(customCursorFrame)
+    customCursorFrame = undefined
+  }
 }
 
 function syncCustomCursorSupport() {
-  customCursorSupported.value = canUseCustomCursor()
+  customCursorSupported.value = canUseCustomCursor() && authUnlocked.value
   if (typeof document !== 'undefined') {
     document.body.classList.toggle('water-cursor-mode', customCursorSupported.value)
   }
@@ -733,6 +804,21 @@ function syncCustomCursorSupport() {
 function handleCustomCursorOut(event: MouseEvent) {
   if (event.relatedTarget) return
   hideCustomCursor()
+}
+
+function stopWaterPetTimers() {
+  if (waterPetTimer !== undefined) {
+    window.clearTimeout(waterPetTimer)
+    waterPetTimer = undefined
+  }
+  if (waterPetMoveTimer !== undefined) {
+    window.clearTimeout(waterPetMoveTimer)
+    waterPetMoveTimer = undefined
+  }
+  if (waterPetWalkTimer !== undefined) {
+    window.clearTimeout(waterPetWalkTimer)
+    waterPetWalkTimer = undefined
+  }
 }
 
 function pokeWaterPet() {
@@ -796,7 +882,7 @@ function setDefaultWaterPetPosition() {
     return
   }
   moveWaterPetTo(
-    window.innerWidth - (rightPanelCollapsed.value ? 48 : rightPanelWidth.value) - 116,
+    window.innerWidth - (rightPanelCollapsed.value ? 48 : effectiveRightPanelWidth.value) - 116,
     window.innerHeight - 212,
   )
 }
@@ -815,6 +901,7 @@ function loadWaterPetPosition() {
 }
 
 function scheduleWaterPetMove(delay = 900 + Math.round(Math.random() * 700)) {
+  if (!waterPetEnabled.value) return
   if (waterPetMoveTimer !== undefined) {
     window.clearTimeout(waterPetMoveTimer)
   }
@@ -829,7 +916,7 @@ function scheduleWaterPetMove(delay = 900 + Math.round(Math.random() * 700)) {
 }
 
 function walkWaterPetTo(x: number, y: number) {
-  if (waterPetDragging.value || selectedTaskIsLive.value) return
+  if (!waterPetEnabled.value || waterPetDragging.value || selectedTaskIsLive.value) return
   stopWaterPetWalk()
   const startX = waterPetX.value
   const startY = waterPetY.value
@@ -1533,22 +1620,35 @@ async function copyWorkspaceFileContent() {
   }
 }
 
-function triggerDownload(url: string) {
+function triggerDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = ''
+  link.download = filename
   document.body.appendChild(link)
   link.click()
   link.remove()
+  URL.revokeObjectURL(url)
 }
 
-function downloadWorkspaceFile() {
+async function downloadWorkspaceFile() {
   if (!selectedWorkspaceId.value || !workspaceFileContent.value?.path) return
-  triggerDownload(workspaceFileDownloadURL(selectedWorkspaceId.value, workspaceFileContent.value.path))
+  try {
+    const path = workspaceFileContent.value.path
+    const blob = await api.downloadWorkspaceFile(selectedWorkspaceId.value, path)
+    triggerDownload(blob, path.split('/').pop() || 'workspace-file')
+  } catch (err) {
+    showError(err)
+  }
 }
 
-function downloadWorkspaceArchive(item: Workspace) {
-  triggerDownload(workspaceArchiveDownloadURL(item.id))
+async function downloadWorkspaceArchive(item: Workspace) {
+  try {
+    const blob = await api.downloadWorkspaceArchive(item.id)
+    triggerDownload(blob, `${item.name || 'workspace'}.zip`)
+  } catch (err) {
+    showError(err)
+  }
 }
 
 function syncAssistantTyping(blocks: ChatBlock[]) {
@@ -1696,7 +1796,14 @@ function resetProviderForm() {
   providerForm.contextWindowTokens = 8192
 }
 
+function resetProviderModelOptions() {
+  providerModelOptions.value = []
+  providerModelsError.value = ''
+  providerModelsLoading.value = false
+}
+
 function openProviderModal(item?: Provider) {
+  resetProviderModelOptions()
   if (item) {
     editingProviderId.value = item.id
     providerForm.name = item.name
@@ -1746,7 +1853,114 @@ function syncSelectedWorkspace() {
   }
 }
 
+function authLockedStatus(): AuthStatus {
+  return {
+    configured: true,
+    authenticated: false,
+    locked: true,
+    sessionExpiresAt: '',
+    lastUnlockedAt: '',
+  }
+}
+
+function clearWorkspaceState() {
+  closeTaskSocket()
+  providers.value = []
+  workspaces.value = []
+  tasks.value = []
+  events.value = []
+  approvals.value = []
+  externalPaths.value = []
+  workspaceFiles.value = []
+  workspaceFilePath.value = ''
+  selectedWorkspaceFilePath.value = ''
+  workspaceFileContent.value = null
+  selectedWorkspaceId.value = ''
+  selectedTaskId.value = ''
+}
+
+function handleAuthExpired() {
+  clearAccessToken()
+  authUnlocked.value = false
+  authReady.value = true
+  authStatus.value = authLockedStatus()
+  clearWorkspaceState()
+}
+
+async function refreshAuthStatus() {
+  try {
+    const status = await api.authStatus()
+    authStatus.value = status
+    authUnlocked.value = status.authenticated || status.configured === false || !status.locked
+    if (!authUnlocked.value) {
+      clearAccessToken()
+      clearWorkspaceState()
+    }
+  } catch (err) {
+    clearAccessToken()
+    authStatus.value = authLockedStatus()
+    authUnlocked.value = false
+    authError.value = err instanceof Error ? err.message : '检查访问状态失败'
+  } finally {
+    authReady.value = true
+  }
+}
+
+async function unlockAccess() {
+  const pin = authPIN.value.trim()
+  if (!pin) return
+  authSubmitting.value = true
+  authError.value = ''
+  try {
+    const session = await api.unlockAuth(pin)
+    setAccessToken(session.accessToken)
+    authPIN.value = ''
+    await refreshAuthStatus()
+    if (authUnlocked.value) {
+      message.success('若水已解锁')
+      await refreshAll()
+    }
+  } catch (err) {
+    if (errorStatus(err) === 401) {
+      authError.value = 'PIN 不正确'
+      return
+    }
+    authError.value = err instanceof Error ? err.message : '解锁失败'
+  } finally {
+    authSubmitting.value = false
+  }
+}
+
+async function lockAccess() {
+  try {
+    await api.lockAuth()
+  } catch {
+    // Local locking should still happen even if the server-side session already expired.
+  }
+  handleAuthExpired()
+  message.success('若水已上锁')
+}
+
+async function changeAuthPIN() {
+  if (!canChangePIN.value) return
+  try {
+    const session = await api.changeAuthPin(authPinForm.currentPin.trim(), authPinForm.newPin.trim())
+    setAccessToken(session.accessToken)
+    authPinForm.currentPin = ''
+    authPinForm.newPin = ''
+    await refreshAuthStatus()
+    message.success('访问 PIN 已更新')
+  } catch (err) {
+    if (errorStatus(err) === 401) {
+      message.error('当前 PIN 不正确')
+      return
+    }
+    showError(err)
+  }
+}
+
 async function refreshAll() {
+  if (!authUnlocked.value) return
   loading.value = true
   try {
     const [providerData, workspaceData] = await Promise.all([
@@ -1817,6 +2031,70 @@ async function refreshEvents() {
   connectTaskSocket()
 }
 
+function selectProviderModel(item: ProviderModelOption) {
+  providerForm.model = item.id
+}
+
+function providerRowStatusLabel(item: Provider) {
+  if (selectedWorkspace.value?.defaultProviderId === item.id) {
+    return '当前工作区使用'
+  }
+  if (defaultProvider.value?.id === item.id) {
+    return '全局默认'
+  }
+  if (item.enabled) {
+    return '启用'
+  }
+  return '停用'
+}
+
+async function loadProviderModels() {
+  if (!providerForm.baseUrl.trim() && !editingProviderId.value) {
+    providerModelsError.value = '请先填写 Base URL'
+    return
+  }
+
+  providerModelsLoading.value = true
+  providerModelsError.value = ''
+  try {
+    const body: Record<string, unknown> = {}
+    if (editingProviderId.value) {
+      body.providerId = editingProviderId.value
+    }
+    if (providerForm.baseUrl.trim()) {
+      body.baseUrl = providerForm.baseUrl.trim()
+    }
+    if (providerForm.apiKey.trim()) {
+      body.apiKey = providerForm.apiKey.trim()
+    }
+
+    const data = await api.listProviderModels(body)
+    const seen = new Set<string>()
+    providerModelOptions.value = data.items
+      .filter((item) => item.id.trim())
+      .filter((item) => {
+        if (seen.has(item.id)) return false
+        seen.add(item.id)
+        return true
+      })
+    if (!providerForm.model.trim() && providerModelOptions.value.length > 0) {
+      providerForm.model = providerModelOptions.value[0].id
+    }
+    if (providerModelOptions.value.length === 0) {
+      providerModelsError.value = '接口未返回模型列表，可以继续手动填写'
+      return
+    }
+    message.success(`已获取 ${providerModelOptions.value.length} 个模型`)
+  } catch (err) {
+    providerModelsError.value = err instanceof Error ? err.message : '获取模型失败'
+    if (errorStatus(err) === 401) {
+      showError(err)
+    }
+  } finally {
+    providerModelsLoading.value = false
+  }
+}
+
 async function saveProvider() {
   if (!providerForm.name.trim() || !providerForm.baseUrl.trim() || !providerForm.model.trim()) return
   providerSubmitting.value = true
@@ -1853,6 +2131,36 @@ async function testProvider(provider: Provider) {
   try {
     const result = await api.testProvider(provider.id)
     message.success(result.message)
+  } catch (err) {
+    showError(err)
+  }
+}
+
+async function setGlobalDefaultProvider(item: Provider) {
+  try {
+    await api.setDefaultProvider(item.id)
+    message.success(`已设为全局默认：${item.name}`)
+    await refreshAll()
+  } catch (err) {
+    showError(err)
+  }
+}
+
+async function setWorkspaceDefaultProvider(item: Provider) {
+  if (!selectedWorkspace.value) {
+    message.warning('请先选择工作区')
+    return
+  }
+  try {
+    await api.updateWorkspace(selectedWorkspace.value.id, {
+      name: selectedWorkspace.value.name,
+      rootPath: selectedWorkspace.value.rootPath,
+      defaultProviderId: item.id,
+      permissionMode: selectedWorkspace.value.permissionMode,
+      trusted: selectedWorkspace.value.trusted,
+    })
+    message.success(`当前工作区已切换到：${item.name}`)
+    await refreshAll()
   } catch (err) {
     showError(err)
   }
@@ -2168,7 +2476,17 @@ function normalizeEvent(item: TaskEvent): TaskEvent {
   }
 }
 
+function errorStatus(err: unknown) {
+  if (!err || typeof err !== 'object') return 0
+  return Number((err as { status?: number }).status ?? 0)
+}
+
 function showError(err: unknown) {
+  if (errorStatus(err) === 401) {
+    handleAuthExpired()
+    message.warning('访问会话已失效，请重新输入 PIN')
+    return
+  }
   message.error(err instanceof Error ? err.message : '操作失败')
 }
 
@@ -2213,18 +2531,53 @@ watch(selectedThemeName, (name) => {
   window.localStorage.setItem(themeStorageKey, name)
 })
 
+watch(authUnlocked, () => {
+  syncCustomCursorSupport()
+})
+
+watch(waterPetEnabled, (enabled) => {
+  window.localStorage.setItem(waterPetEnabledStorageKey, String(enabled))
+  if (!enabled) {
+    stopWaterPetWalk()
+    stopWaterPetTimers()
+    return
+  }
+  if (!selectedTaskIsLive.value) {
+    scheduleWaterPetMove(800)
+  }
+})
+
 watch(selectedTaskIsLive, (isLive) => {
   if (isLive) {
     stopWaterPetWalk()
+    if (waterPetMoveTimer !== undefined) {
+      window.clearTimeout(waterPetMoveTimer)
+      waterPetMoveTimer = undefined
+    }
     return
   }
-  scheduleWaterPetMove(800)
+  if (waterPetEnabled.value) {
+    scheduleWaterPetMove(800)
+  }
+})
+
+watch(effectiveRightPanelWidth, () => {
+  if (waterPetEnabled.value) {
+    keepWaterPetInBounds()
+  }
 })
 
 onMounted(() => {
-  refreshAll()
+  void (async () => {
+    await refreshAuthStatus()
+    if (authUnlocked.value) {
+      await refreshAll()
+    }
+  })()
   setDefaultWaterPetPosition()
-  scheduleWaterPetMove(800)
+  if (waterPetEnabled.value) {
+    scheduleWaterPetMove(800)
+  }
   syncCustomCursorSupport()
   window.addEventListener('pointermove', handleCustomCursorMove, { passive: true })
   window.addEventListener('pointerdown', handleCustomCursorDown, { passive: true })
@@ -2242,12 +2595,14 @@ const nowTickTimer = window.setInterval(() => {
 onBeforeUnmount(() => {
   stopPanelResize()
   clearAssistantTypingTimers()
+  if (customCursorFrame !== undefined) {
+    window.cancelAnimationFrame(customCursorFrame)
+    customCursorFrame = undefined
+  }
   if (waterPetTimer !== undefined) {
     window.clearTimeout(waterPetTimer)
   }
-  if (waterPetMoveTimer !== undefined) {
-    window.clearTimeout(waterPetMoveTimer)
-  }
+  stopWaterPetTimers()
   stopWaterPetWalk()
   window.removeEventListener('pointermove', dragWaterPet)
   window.removeEventListener('pointerup', stopWaterPetDrag)
@@ -2270,7 +2625,68 @@ onBeforeUnmount(() => {
 
 <template>
   <a-config-provider :theme="antdTheme">
+    <main v-if="!authReady" class="auth-shell" :data-theme="selectedThemeName">
+      <WaterAuthScene :theme="selectedThemeName" />
+      <section class="auth-card">
+        <div class="auth-brand">
+          <img :src="brandMarkSrc" alt="" aria-hidden="true" />
+          <div>
+            <h1>{{ productName }}</h1>
+            <p>{{ productTagline }}</p>
+          </div>
+        </div>
+        <a-skeleton active :paragraph="{ rows: 2 }" />
+      </section>
+    </main>
+
+    <main v-else-if="!authUnlocked" class="auth-shell" :data-theme="selectedThemeName">
+      <WaterAuthScene :theme="selectedThemeName" />
+      <section class="auth-card">
+        <div class="auth-brand">
+          <img :src="brandMarkSrc" alt="" aria-hidden="true" />
+          <div>
+            <h1>{{ productName }}</h1>
+            <p>{{ productTagline }}</p>
+          </div>
+        </div>
+        <div class="auth-lock-title">
+          <LockKeyhole :size="18" />
+          <strong>访问已上锁</strong>
+        </div>
+        <a-alert
+          v-if="authStatus?.configured === false"
+          class="auth-lock-alert"
+          type="info"
+          show-icon
+          message="访问锁未启用"
+          description="当前运行未初始化访问门禁，工作台会直接开放。"
+        />
+        <form class="auth-form" @submit.prevent="unlockAccess">
+          <a-input-password
+            v-model:value="authPIN"
+            id="auth-pin"
+            name="auth-pin"
+            size="large"
+            placeholder="输入访问 PIN"
+            autocomplete="one-time-code"
+          />
+          <p v-if="authError" class="auth-error">{{ authError }}</p>
+          <a-button
+            html-type="submit"
+            type="primary"
+            size="large"
+            block
+            :loading="authSubmitting"
+          >
+            <template #icon><KeyRound :size="16" /></template>
+            解锁
+          </a-button>
+        </form>
+      </section>
+    </main>
+
     <main
+      v-else
       class="codex-shell"
       :class="{ 'left-collapsed': leftPanelCollapsed, 'right-collapsed': rightPanelCollapsed }"
       :data-theme="selectedThemeName"
@@ -2295,6 +2711,7 @@ onBeforeUnmount(() => {
         </svg>
       </div>
       <button
+        v-show="waterPetEnabled"
         class="water-pet"
         :class="{
           'is-live': selectedTaskIsLive,
@@ -2318,16 +2735,44 @@ onBeforeUnmount(() => {
         <span class="water-pet-trail two" aria-hidden="true"></span>
         <span class="water-pet-ripple" aria-hidden="true"></span>
         <svg class="water-pet-figure" viewBox="0 0 88 96" aria-hidden="true">
+          <defs>
+            <radialGradient id="water-pet-body-front-gradient" cx="30%" cy="22%" r="78%">
+              <stop offset="0%" style="stop-color: #ffffff; stop-opacity: 0.9" />
+              <stop offset="24%" style="stop-color: var(--brand-soft); stop-opacity: 0.42" />
+              <stop offset="52%" style="stop-color: var(--brand); stop-opacity: 0.98" />
+              <stop offset="100%" style="stop-color: var(--brand-deep); stop-opacity: 0.95" />
+            </radialGradient>
+            <radialGradient id="water-pet-body-back-gradient" cx="50%" cy="42%" r="68%">
+              <stop offset="0%" style="stop-color: var(--brand-deep); stop-opacity: 0.34" />
+              <stop offset="75%" style="stop-color: var(--brand-deep); stop-opacity: 0.18" />
+              <stop offset="100%" style="stop-color: var(--brand-deep); stop-opacity: 0" />
+            </radialGradient>
+            <linearGradient id="water-pet-body-rim-gradient" x1="20%" x2="85%" y1="18%" y2="88%">
+              <stop offset="0%" style="stop-color: #ffffff; stop-opacity: 0.62" />
+              <stop offset="36%" style="stop-color: #ffffff; stop-opacity: 0" />
+              <stop offset="100%" style="stop-color: var(--brand-deep); stop-opacity: 0.42" />
+            </linearGradient>
+          </defs>
+          <ellipse class="water-pet-volume" cx="44" cy="48" rx="25" ry="34" />
+          <path
+            class="water-pet-body-back"
+            d="M44 8C28 25 17 39 17 57C17 76 30 87 44 87C58 87 71 76 71 57C71 39 60 25 44 8Z"
+          />
           <path
             class="water-pet-shadow"
             d="M23 78C31 72 55 72 65 78C58 83 31 84 23 78Z"
           />
           <path
             class="water-pet-body"
+            fill="url(#water-pet-body-front-gradient)"
             d="M44 8C28 25 17 39 17 57C17 76 30 87 44 87C58 87 71 76 71 57C71 39 60 25 44 8Z"
           />
           <path
-            class="water-pet-shine"
+            class="water-pet-body-rim"
+            d="M27 26C34 18 40 13 46 10C39 23 33 32 28 38"
+          />
+          <path
+            class="water-pet-body-shine"
             d="M31 36C35 27 40 21 45 16"
           />
           <path class="water-pet-arm left" d="M19 57C11 58 9 64 13 68" />
@@ -2503,6 +2948,16 @@ onBeforeUnmount(() => {
               @click="cancelTask"
             >
               <template #icon><Square :size="13" /></template>
+            </a-button>
+            <a-button
+              class="header-icon-button"
+              size="small"
+              :disabled="authStatus?.configured === false"
+              title="锁定访问"
+              aria-label="锁定访问"
+              @click="lockAccess"
+            >
+              <template #icon><LogOut :size="13" /></template>
             </a-button>
             <a-button
               class="header-icon-button"
@@ -2829,8 +3284,20 @@ onBeforeUnmount(() => {
           <PanelRightOpen v-if="rightPanelCollapsed" :size="17" />
           <PanelRightClose v-else :size="17" />
         </button>
-        <a-tabs v-if="!rightPanelCollapsed" v-model:activeKey="rightTab" size="small">
-          <a-tab-pane key="files" tab="文件">
+        <a-tabs
+          v-if="!rightPanelCollapsed"
+          v-model:activeKey="rightTab"
+          class="right-panel-tabs"
+          size="small"
+          tab-position="left"
+        >
+          <a-tab-pane key="files">
+            <template #tab>
+              <span class="right-tab-label">
+                <FileText :size="14" />
+                文件
+              </span>
+            </template>
             <section class="panel-form">
               <div class="workspace-files">
                 <div class="section-title">
@@ -2877,7 +3344,14 @@ onBeforeUnmount(() => {
             </section>
           </a-tab-pane>
 
-          <a-tab-pane key="approvals" tab="审批">
+          <a-tab-pane key="approvals">
+            <template #tab>
+              <span class="right-tab-label">
+                <CheckCircle :size="14" />
+                审批
+                <small v-if="approvals.length > 0">{{ approvals.length }}</small>
+              </span>
+            </template>
             <a-list :data-source="approvals" class="dense-list">
               <template #renderItem="{ item }">
                 <a-list-item>
@@ -2902,7 +3376,13 @@ onBeforeUnmount(() => {
             <a-empty v-if="approvals.length === 0" description="暂无待审批" />
           </a-tab-pane>
 
-          <a-tab-pane key="context" tab="上下文">
+          <a-tab-pane key="context">
+            <template #tab>
+              <span class="right-tab-label">
+                <Code2 :size="14" />
+                上下文
+              </span>
+            </template>
             <section class="panel-form">
               <div class="context-pack-card">
                 <div class="section-title">
@@ -2973,8 +3453,79 @@ onBeforeUnmount(() => {
             </section>
           </a-tab-pane>
 
-          <a-tab-pane key="settings" tab="设置">
+          <a-tab-pane key="terminal">
+            <template #tab>
+              <span class="right-tab-label">
+                <Terminal :size="14" />
+                终端
+              </span>
+            </template>
+            <ServerTerminalPanel
+              :workspace-id="selectedWorkspaceId"
+              :workspace-name="selectedWorkspace?.name"
+              :active="rightTab === 'terminal' && !rightPanelCollapsed"
+            />
+          </a-tab-pane>
+
+          <a-tab-pane key="settings">
+            <template #tab>
+              <span class="right-tab-label">
+                <Settings2 :size="14" />
+                设置
+              </span>
+            </template>
             <a-collapse v-model:activeKey="settingsOpenKey" class="settings-collapse" accordion ghost>
+              <a-collapse-panel key="access">
+                <template #header>
+                  <div class="settings-panel-header">
+                    <span>访问安全</span>
+                    <a-space>
+                      <a-tag :color="authUnlocked ? 'green' : 'red'">{{ authStatusText }}</a-tag>
+                      <a-button size="small" @click.stop="lockAccess">
+                        <template #icon><LockKeyhole :size="14" /></template>
+                        锁定
+                      </a-button>
+                    </a-space>
+                  </div>
+                </template>
+                <section class="settings-panel-body">
+                  <a-alert
+                    v-if="authStatus?.configured === false"
+                    type="info"
+                    show-icon
+                    message="访问锁未启用"
+                    description="后端当前未初始化 PIN 门禁，工作台直接开放。"
+                  />
+                  <div class="settings-note">
+                    <strong>当前会话</strong>
+                    <span>
+                      {{
+                        authStatus?.sessionExpiresAt
+                          ? `有效期至 ${authStatus.sessionExpiresAt}`
+                          : '当前尚未解锁'
+                      }}
+                    </span>
+                  </div>
+                  <div v-if="authStatus?.configured !== false" class="settings-note">
+                    <strong>PIN 修改</strong>
+                    <span>输入当前 PIN 和新 PIN，修改后会自动刷新会话。</span>
+                  </div>
+                  <a-space v-if="authStatus?.configured !== false" class="modal-form" direction="vertical" :size="12">
+                    <a-input-password
+                      v-model:value="authPinForm.currentPin"
+                      placeholder="当前 PIN"
+                    />
+                    <a-input-password
+                      v-model:value="authPinForm.newPin"
+                      placeholder="新 PIN"
+                    />
+                    <a-button type="primary" :disabled="!canChangePIN" @click="changeAuthPIN">
+                      保存 PIN
+                    </a-button>
+                  </a-space>
+                </section>
+              </a-collapse-panel>
+
               <a-collapse-panel key="appearance">
                 <template #header>
                   <div class="settings-panel-header">
@@ -2983,6 +3534,23 @@ onBeforeUnmount(() => {
                   </div>
                 </template>
                 <section class="settings-panel-body">
+                  <div class="settings-toggle-row">
+                    <div class="settings-toggle-copy">
+                      <strong>显示若水水灵</strong>
+                      <small>关闭后不显示宠物，也不再自动移动。</small>
+                    </div>
+                    <button
+                      class="settings-toggle-switch"
+                      :class="{ active: waterPetEnabled }"
+                      type="button"
+                      role="switch"
+                      :aria-checked="waterPetEnabled"
+                      @click="waterPetEnabled = !waterPetEnabled"
+                    >
+                      <span>{{ waterPetEnabled ? '已开启' : '已关闭' }}</span>
+                      <i aria-hidden="true"></i>
+                    </button>
+                  </div>
                   <div class="theme-grid">
                     <button
                       v-for="item in themeOptions"
@@ -3021,6 +3589,14 @@ onBeforeUnmount(() => {
                   </div>
                 </template>
                 <section class="settings-panel-body">
+                  <div v-if="activeProvider" class="provider-summary">
+                    <div class="provider-summary-main">
+                      <small>当前工作区使用</small>
+                      <strong>{{ activeProvider.name }}</strong>
+                      <span>{{ activeProviderScopeLabel }}</span>
+                    </div>
+                    <a-tag class="provider-summary-tag">{{ activeProviderScopeLabel }}</a-tag>
+                  </div>
                   <a-list v-if="providers.length > 0" :data-source="providers" class="settings-list">
                     <template #renderItem="{ item }">
                       <div
@@ -3035,9 +3611,9 @@ onBeforeUnmount(() => {
                             <span>{{ item.name }}</span>
                             <a-tag v-if="item.id === activeProviderId" class="provider-status active">
                               <template #icon><CheckCircle :size="12" /></template>
-                              激活
+                              {{ providerRowStatusLabel(item) }}
                             </a-tag>
-                            <a-tag v-else-if="item.isDefault" class="provider-status">默认</a-tag>
+                            <a-tag v-else-if="item.isDefault" class="provider-status">全局默认</a-tag>
                             <a-tag v-else-if="item.enabled" class="provider-status">启用</a-tag>
                             <a-tag v-else class="provider-status disabled">停用</a-tag>
                           </div>
@@ -3062,6 +3638,24 @@ onBeforeUnmount(() => {
                         </div>
                         <div class="provider-actions">
                           <a-button size="small" class="provider-test-button" @click="testProvider(item)">测试</a-button>
+                          <a-button
+                            v-if="item.id !== activeProviderId"
+                            size="small"
+                            title="切换当前工作区默认 Provider"
+                            @click="setWorkspaceDefaultProvider(item)"
+                          >
+                            <template #icon><ArrowRight :size="14" /></template>
+                            当前工作区
+                          </a-button>
+                          <a-button
+                            v-if="item.id !== defaultProvider?.id"
+                            size="small"
+                            title="设为全局默认 Provider"
+                            @click="setGlobalDefaultProvider(item)"
+                          >
+                            <template #icon><CheckCircle :size="14" /></template>
+                            全局默认
+                          </a-button>
                           <a-button size="small" title="编辑 Provider" aria-label="编辑 Provider" @click="openProviderModal(item)">
                             <template #icon><Pencil :size="14" /></template>
                           </a-button>
@@ -3144,6 +3738,7 @@ onBeforeUnmount(() => {
         v-model:open="filePreviewOpen"
         :width="920"
         :footer="null"
+        :mask-closable="false"
         class="file-preview-modal"
         @cancel="closeWorkspaceFilePreview"
       >
@@ -3201,6 +3796,7 @@ onBeforeUnmount(() => {
         :ok-text="editingTaskId ? '保存' : '创建'"
         cancel-text="取消"
         :confirm-loading="taskSubmitting"
+        :mask-closable="false"
         @ok="saveTask"
       >
         <a-input
@@ -3216,6 +3812,7 @@ onBeforeUnmount(() => {
         :ok-text="editingWorkspaceId ? '保存' : '创建'"
         cancel-text="取消"
         :confirm-loading="workspaceSubmitting"
+        :mask-closable="false"
         @ok="saveWorkspace"
       >
         <a-space class="modal-form" direction="vertical" :size="12">
@@ -3238,12 +3835,32 @@ onBeforeUnmount(() => {
         :ok-text="editingProviderId ? '保存' : '创建'"
         cancel-text="取消"
         :confirm-loading="providerSubmitting"
+        :mask-closable="false"
         @ok="saveProvider"
       >
         <a-space class="modal-form" direction="vertical" :size="12">
           <a-input v-model:value="providerForm.name" placeholder="Provider 名称" />
           <a-input v-model:value="providerForm.baseUrl" placeholder="Base URL" />
-          <a-input v-model:value="providerForm.model" placeholder="Model" />
+          <div class="provider-model-field">
+            <a-input v-model:value="providerForm.model" placeholder="Model" />
+            <a-button :loading="providerModelsLoading" @click="loadProviderModels">
+              <template #icon><RefreshCw :size="13" /></template>
+              获取模型
+            </a-button>
+          </div>
+          <div v-if="providerModelOptions.length > 0" class="provider-model-options">
+            <button
+              v-for="item in providerModelOptions"
+              :key="item.id"
+              class="provider-model-option"
+              :class="{ active: providerForm.model === item.id }"
+              type="button"
+              @click="selectProviderModel(item)"
+            >
+              {{ item.id }}
+            </button>
+          </div>
+          <p v-if="providerModelsError" class="provider-model-error">{{ providerModelsError }}</p>
           <a-input-number
             v-model:value="providerForm.contextWindowTokens"
             class="full"

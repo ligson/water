@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ligson/water/water-be/internal/event"
+	"github.com/ligson/water/water-be/internal/llm"
 	"github.com/ligson/water/water-be/internal/workspace"
 )
 
@@ -49,6 +50,19 @@ func TestDocumentOutputRequestGetsDefaultPath(t *testing.T) {
 	expected := filepath.Join("/workspace/water", "reports", "电脑分析报告-turn-2.md")
 	if path != expected {
 		t.Fatalf("expected default document path %q, got %q", expected, path)
+	}
+}
+
+func TestToolCallKeyUsesStableIndex(t *testing.T) {
+	first := toolCallKey(llm.ToolCall{Index: 2})
+	second := toolCallKey(llm.ToolCall{Index: 2, Function: llm.ToolCallFunction{Name: "read_file", Arguments: `{"path":"/tmp"}`}})
+	third := toolCallKey(llm.ToolCall{Index: 7, Function: llm.ToolCallFunction{Name: "list_dir"}})
+
+	if first != second {
+		t.Fatalf("expected same key for same index fragments, got %q and %q", first, second)
+	}
+	if first == third {
+		t.Fatalf("expected different keys for different indices")
 	}
 }
 

@@ -1,6 +1,7 @@
 import { createApp } from 'vue'
 import {
   Button,
+  Alert,
   Collapse,
   ConfigProvider,
   Divider,
@@ -12,6 +13,7 @@ import {
   Popconfirm,
   Select,
   Segmented,
+  Skeleton,
   Space,
   Tabs,
   Tag,
@@ -25,6 +27,7 @@ import App from './App.vue'
 const app = createApp(App)
 
 app.use(Button)
+app.use(Alert)
 app.use(Collapse)
 app.use(ConfigProvider)
 app.use(Divider)
@@ -36,6 +39,7 @@ app.use(Modal)
 app.use(Popconfirm)
 app.use(Select)
 app.use(Segmented)
+app.use(Skeleton)
 app.use(Space)
 app.use(Tabs)
 app.use(Tag)

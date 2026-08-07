@@ -502,6 +502,7 @@ func (r *Runner) collectAssistantRound(ctx context.Context, client llm.Client, m
 	toolCallsByKey := make(map[string]llm.ToolCall)
 	toolCallOrder := make([]string, 0)
 	finishReason := ""
+	sawToolCalls := false
 
 	for item := range stream {
 		if item.Err != nil {
@@ -520,6 +521,7 @@ func (r *Runner) collectAssistantRound(ctx context.Context, client llm.Client, m
 				return llm.Message{}, nil, "", err
 			}
 		case "tool_calls":
+			sawToolCalls = true
 			for _, call := range item.ToolCalls {
 				key := toolCallKey(call)
 				if existing, ok := toolCallsByKey[key]; ok {
@@ -545,9 +547,6 @@ func (r *Runner) collectAssistantRound(ctx context.Context, client llm.Client, m
 				toolCallsByKey[key] = call
 				toolCallOrder = append(toolCallOrder, key)
 			}
-			if err := r.appendJSONEvent(ctx, input, "agent.tool_calls.detected", map[string]interface{}{"toolCalls": item.ToolCalls}); err != nil {
-				return llm.Message{}, nil, "", err
-			}
 		case "completed":
 			finishReason = item.FinishReason
 		}
@@ -559,6 +558,13 @@ func (r *Runner) collectAssistantRound(ctx context.Context, client llm.Client, m
 	toolCalls := make([]llm.ToolCall, 0, len(toolCallOrder))
 	for _, key := range toolCallOrder {
 		toolCalls = append(toolCalls, toolCallsByKey[key])
+	}
+	if sawToolCalls {
+		if err := r.appendJSONEvent(ctx, input, "agent.tool_calls.detected", map[string]interface{}{
+			"toolCalls": toolCalls,
+		}); err != nil {
+			return llm.Message{}, nil, "", err
+		}
 	}
 	if err := r.appendJSONEvent(ctx, input, "agent.message.completed", map[string]interface{}{
 		"content":      full.String(),
@@ -580,7 +586,7 @@ func toolCallKey(call llm.ToolCall) string {
 	if call.ID != "" {
 		return "id:" + call.ID
 	}
-	return fmt.Sprintf("index:%d:%s", call.Index, call.Function.Name)
+	return fmt.Sprintf("index:%d", call.Index)
 }
 
 func (r *Runner) assistantMessageForApproval(ctx context.Context, appr approval.Approval, req tools.Request) (llm.Message, error) {

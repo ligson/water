@@ -44,3 +44,14 @@ func TestProvider(ctx context.Context, p provider.Provider) TestResult {
 		Latency:  latency.String(),
 	}
 }
+
+func ListProviderModels(ctx context.Context, p provider.Provider) ([]ModelOption, error) {
+	available := p
+	available.Enabled = true
+
+	client, err := NewOpenAIClient(available)
+	if err != nil {
+		return nil, err
+	}
+	return client.ListModels(ctx)
+}

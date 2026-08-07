@@ -105,6 +105,39 @@ func TestOpenAIClientChatStream(t *testing.T) {
 	}
 }
 
+func TestOpenAIClientListModels(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("expected authorization header, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"object": "list",
+			"data": [
+				{"id": "qwen2.5-coder:7b"},
+				{"name": "llama3.1:8b"},
+				{"model": "deepseek-r1:14b"}
+			]
+		}`))
+	}))
+	defer server.Close()
+
+	client := newTestOpenAIClient(t, server.URL+"/v1")
+	models, err := client.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("list models: %v", err)
+	}
+	if len(models) != 3 {
+		t.Fatalf("expected 3 models, got %d", len(models))
+	}
+	if models[0].ID != "qwen2.5-coder:7b" || models[1].ID != "llama3.1:8b" || models[2].ID != "deepseek-r1:14b" {
+		t.Fatalf("unexpected models: %+v", models)
+	}
+}
+
 func TestOpenAIClientErrorResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad model", http.StatusBadGateway)

@@ -19,6 +19,19 @@ go run ./cmd/water
 - `WATER_HTTP_ADDR`
 - `WATER_DATA_DIR`
 - `WATER_DATABASE_PATH`
+- `WATER_ACCESS_PIN`
+
+## 访问 PIN
+
+后端默认启用单用户访问 PIN。首次启动时，如果没有设置 `WATER_ACCESS_PIN`，服务会自动生成一个初始 PIN 并在启动日志中输出一次；用户解锁后，前端会保存短期 session token，用于后续 HTTP API 和 WebSocket 连接。
+
+固定 PIN 启动：
+
+```bash
+WATER_ACCESS_PIN=123456 go run ./cmd/water
+```
+
+通过 `WATER_ACCESS_PIN` 重新启动会重置本地 PIN，并清理旧 session。前端设置页也可以在已解锁状态下修改 PIN。
 
 ## 健康检查
 
@@ -67,6 +80,7 @@ curl -X POST http://localhost:8080/api/providers \
 - `DELETE /api/providers/{id}`
 - `POST /api/providers/{id}/default`
 - `POST /api/providers/{id}/test`
+- `POST /api/provider-models`：根据已保存 Provider 或当前表单里的 `baseUrl` / `apiKey` 调用 OpenAI-compatible `/models`，返回可选模型列表。
 
 ## Workspace API
 

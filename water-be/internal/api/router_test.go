@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io"
@@ -8,8 +9,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/ligson/water/water-be/internal/auth"
 	"github.com/ligson/water/water-be/internal/config"
 	"github.com/ligson/water/water-be/internal/store"
 )
@@ -93,6 +96,87 @@ func TestCORSForLocalDevFrontend(t *testing.T) {
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "http://127.0.0.1:5173" {
 		t.Fatalf("expected local frontend origin, got %q", got)
+	}
+}
+
+func TestAuthGateUnlockAndLock(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	bootstrapPIN := "123456"
+	if _, err := auth.NewStore(db).Ensure(context.Background(), bootstrapPIN); err != nil {
+		t.Fatalf("ensure auth: %v", err)
+	}
+
+	cfg := config.Config{AuthEnabled: true}
+	handler := NewRouter(db, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	unauthRec := performJSON(handler, http.MethodGet, "/api/providers", "")
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 before unlock, got %d", unauthRec.Code)
+	}
+
+	unlockRec := performJSON(handler, http.MethodPost, "/api/auth/unlock", `{"pin":"123456"}`)
+	if unlockRec.Code != http.StatusOK {
+		t.Fatalf("expected unlock 200, got %d: %s", unlockRec.Code, unlockRec.Body.String())
+	}
+	var unlockBody struct {
+		Data struct {
+			AccessToken string `json:"accessToken"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(unlockRec.Body.Bytes(), &unlockBody); err != nil {
+		t.Fatalf("decode unlock response: %v", err)
+	}
+	if unlockBody.Data.AccessToken == "" {
+		t.Fatalf("expected access token")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/providers", nil)
+	req.Header.Set("Authorization", "Bearer "+unlockBody.Data.AccessToken)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected protected request 200 after unlock, got %d", rec.Code)
+	}
+
+	lockReq := httptest.NewRequest(http.MethodPost, "/api/auth/lock", nil)
+	lockReq.Header.Set("Authorization", "Bearer "+unlockBody.Data.AccessToken)
+	lockRec := httptest.NewRecorder()
+	handler.ServeHTTP(lockRec, lockReq)
+	if lockRec.Code != http.StatusOK {
+		t.Fatalf("expected lock 200, got %d: %s", lockRec.Code, lockRec.Body.String())
+	}
+
+	afterLockRec := performJSON(handler, http.MethodGet, "/api/providers", "")
+	if afterLockRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after lock, got %d", afterLockRec.Code)
+	}
+
+	changeWithoutTokenRec := performJSON(handler, http.MethodPost, "/api/auth/change-pin", `{"currentPin":"123456","newPin":"654321"}`)
+	if changeWithoutTokenRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected change pin without token 401, got %d", changeWithoutTokenRec.Code)
+	}
+
+	unlockAgainRec := performJSON(handler, http.MethodPost, "/api/auth/unlock", `{"pin":"123456"}`)
+	if unlockAgainRec.Code != http.StatusOK {
+		t.Fatalf("expected second unlock 200, got %d: %s", unlockAgainRec.Code, unlockAgainRec.Body.String())
+	}
+	var unlockAgainBody struct {
+		Data struct {
+			AccessToken string `json:"accessToken"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(unlockAgainRec.Body.Bytes(), &unlockAgainBody); err != nil {
+		t.Fatalf("decode second unlock response: %v", err)
+	}
+	changeReq := httptest.NewRequest(http.MethodPost, "/api/auth/change-pin", strings.NewReader(`{"currentPin":"123456","newPin":"654321"}`))
+	changeReq.Header.Set("Content-Type", "application/json")
+	changeReq.Header.Set("Authorization", "Bearer "+unlockAgainBody.Data.AccessToken)
+	changeRec := httptest.NewRecorder()
+	handler.ServeHTTP(changeRec, changeReq)
+	if changeRec.Code != http.StatusOK {
+		t.Fatalf("expected change pin with token 200, got %d: %s", changeRec.Code, changeRec.Body.String())
 	}
 }
 

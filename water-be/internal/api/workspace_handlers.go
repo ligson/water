@@ -89,6 +89,15 @@ func (r *Router) handleWorkspaceByID(w http.ResponseWriter, req *http.Request, r
 		return
 	}
 
+	if action == "terminal-profiles" {
+		if actionID != "" {
+			WriteError(req.Context(), w, http.StatusNotFound, "not found")
+			return
+		}
+		r.handleWorkspaceTerminalProfiles(w, req, id)
+		return
+	}
+
 	if action == "files" {
 		if req.Method != http.MethodGet {
 			WriteError(req.Context(), w, http.StatusMethodNotAllowed, "method not allowed")
@@ -674,6 +683,9 @@ func splitWorkspacePath(rest string) (id string, action string, actionID string,
 		return parts[0], parts[1], "", true
 	}
 	if len(parts) == 2 && parts[1] == "approvals" {
+		return parts[0], parts[1], "", true
+	}
+	if len(parts) == 2 && parts[1] == "terminal-profiles" {
 		return parts[0], parts[1], "", true
 	}
 	if len(parts) == 2 && parts[1] == "files" {
