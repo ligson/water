@@ -272,7 +272,7 @@ npm run build
 
 ## 发版
 
-推送 `vMAJOR.MINOR.PATCH` 标签会触发 GitHub Actions：运行后端测试，构建 Linux/macOS 的 amd64、arm64 后端包和架构无关的前端静态包，生成 SHA-256，并发布到 GitHub Release。
+推送 `vMAJOR.MINOR.PATCH` 标签会触发 GitHub Actions：运行后端测试，构建 Linux/macOS 的 amd64、arm64 后端包和架构无关的前端静态包，生成 SHA-256，并使用 `CHANGELOG.md` 对应版本章节发布 GitHub Release。
 
 完整版本规则、产物列表和本地打包方式见 [发版流程](docs/releasing.md)。
 

@@ -195,7 +195,7 @@ water-be/
    所有 LLM 调用都走可配置的 OpenAI-compatible 接口，方便对接 Ollama / vLLM / LM Studio / 内网模型网关。
 
 10. **明确的发版流程**
-    用户明确说“发版”时，先完成测试、敏感信息审计、CHANGELOG 更新、提交和推送，再创建并推送 `vMAJOR.MINOR.PATCH` annotated tag 触发 GitHub Actions。用户未指定版本时，在最新 SemVer 标签基础上递增 patch；仓库没有标签时从 `v0.1.0` 开始。不得复用或强制移动已发布标签。
+    用户明确说“发版”时，先完成测试、敏感信息审计，并将 `CHANGELOG.md` 的 `Unreleased` 内容归档到对应版本章节，再提交和推送，最后创建并推送 `vMAJOR.MINOR.PATCH` annotated tag 触发 GitHub Actions。用户未指定版本时，在最新 SemVer 标签基础上递增 patch；仓库没有标签时从 `v0.1.0` 开始。不得复用或强制移动已发布标签。
 
 ## 当前阶段建议
 

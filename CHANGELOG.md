@@ -2,7 +2,13 @@
 
 所有对本仓库的文件改动都必须记录在这里。文档优先中文，记录应包含日期、改动内容和影响范围。
 
-## 2026-08-16
+## [Unreleased]
+
+## [0.1.1] - 2026-08-16
+
+- GitHub Release 说明改为从 `CHANGELOG.md` 的对应版本章节严格提取；缺少版本章节时发版工作流会失败，避免发布空白或仅包含提交列表的说明。
+
+## [0.1.0] - 2026-08-16
 
 - 发版前依赖审计将 Vite 构建链中的 `nanoid` 从 3.3.17 升级到 3.3.18，修复 `GHSA-2v37-7h3g-55p8` high severity 漏洞，生产依赖审计恢复为 0 vulnerabilities。
 - 新增标签驱动的 GitHub Actions 发版流程：`v*` SemVer 标签会运行 Go 测试与静态检查，构建 Linux/macOS 的 amd64、arm64 后端包和前端静态包，生成 SHA-256 并发布 GitHub Release。

@@ -45,6 +45,9 @@ jobs:
             exit 1
           fi
 
+      - name: Extract release notes
+        run: ./scripts/extract-release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/release-notes.md"
+
       - name: Test backend
         working-directory: water-be
         run: |
@@ -70,10 +73,12 @@ jobs:
           assets=(output/release/*)
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --title "若水 $GITHUB_REF_NAME"
           else
             gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
               --verify-tag \
-              --generate-notes \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
               --title "若水 $GITHUB_REF_NAME"
           fi
-
