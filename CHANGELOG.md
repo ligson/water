@@ -4,6 +4,9 @@
 
 ## 2026-08-16
 
+- 发版前依赖审计将 Vite 构建链中的 `nanoid` 从 3.3.17 升级到 3.3.18，修复 `GHSA-2v37-7h3g-55p8` high severity 漏洞，生产依赖审计恢复为 0 vulnerabilities。
+- 新增标签驱动的 GitHub Actions 发版流程：`v*` SemVer 标签会运行 Go 测试与静态检查，构建 Linux/macOS 的 amd64、arm64 后端包和前端静态包，生成 SHA-256 并发布 GitHub Release。
+- 新增可本地复用的 `scripts/package-release.sh` 与发版文档，并在仓库规则中固化“测试与敏感信息审计 -> 提交推送 -> annotated tag -> Actions 验证”的发版顺序。
 - 从版本控制中移除历史误提交的 Playwright 本地会话日志和页面快照；目录继续由 `.gitignore` 排除，本机调试文件不会参与后续提交或推送。
 - 新增若水 Docker 部署能力：后端采用 Go 构建与 Node 22 运行环境的多阶段镜像，预置 Go、Node.js、Python、Git、ripgrep 等 Agent 常用工具；前端采用 Node 构建与 Nginx 运行镜像。
 - 新增同源 Nginx 代理，支持 HTTP API、任务与终端 WebSocket Upgrade、长连接超时、关闭代理缓冲和前端 SPA 回退。
