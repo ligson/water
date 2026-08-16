@@ -1,5 +1,6 @@
 # Runtime data
 /water-be/data/
+/water-be/.venv-document/
 /scripts/run/
 /scripts/logs/
 /.playwright-cli/

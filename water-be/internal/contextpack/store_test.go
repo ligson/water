@@ -163,4 +163,7 @@ VALUES ('task_test', 'ws_test', 'Task', 'created', '2026-08-05T00:00:00Z', '2026
 	if !strings.HasSuffix(pack.FileSummaries[0].Path, "tools.go") {
 		t.Fatalf("expected tools.go to be ranked first, got %q", pack.FileSummaries[0].Path)
 	}
+	if !strings.Contains(pack.FileSummaries[0].MatchReason, "文件名") && !strings.Contains(pack.FileSummaries[0].MatchReason, "符号") && !strings.Contains(pack.FileSummaries[0].MatchReason, "摘要") {
+		t.Fatalf("expected relevance reason for tools.go, got %q", pack.FileSummaries[0].MatchReason)
+	}
 }

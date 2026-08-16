@@ -1,0 +1,8 @@
+{
+  "id": "document-review",
+  "name": "文档审阅",
+  "version": "1.0.0",
+  "description": "为长文档提取、分段读取和证据核对提供工作流。",
+  "keywords": ["PDF", "DOCX", "XLSX", "PPTX"],
+  "entry": "SKILL.md"
+}

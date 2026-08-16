@@ -17,6 +17,7 @@ import (
 	"github.com/ligson/water/water-be/internal/event"
 	"github.com/ligson/water/water-be/internal/realtime"
 	"github.com/ligson/water/water-be/internal/requestid"
+	"github.com/ligson/water/water-be/internal/skill"
 	"github.com/ligson/water/water-be/internal/task"
 )
 
@@ -27,6 +28,7 @@ type Router struct {
 	hub    *realtime.Hub
 	agent  *agent.Runner
 	auth   *auth.Store
+	skills *skill.Store
 	mu     sync.Mutex
 	cancel map[string]taskRun
 }
@@ -43,6 +45,7 @@ func NewRouter(db *sql.DB, cfg config.Config, logger *slog.Logger) http.Handler 
 		logger: logger,
 		hub:    realtime.NewHub(),
 		auth:   auth.NewStore(db),
+		skills: skill.NewStore(db, cfg.DataDir),
 		cancel: make(map[string]taskRun),
 	}
 	r.agent = agent.NewRunner(db, r.appendTaskEvent)
@@ -67,6 +70,14 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.handleProviderModels(w, req)
 	case "/api/workspaces":
 		r.handleWorkspaces(w, req)
+	case "/api/skills":
+		r.handleSkills(w, req)
+	case "/api/skills/install":
+		if req.Method != http.MethodPost {
+			WriteError(req.Context(), w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		r.installSkillFromURL(w, req)
 	default:
 		if strings.HasPrefix(req.URL.Path, "/api/auth/") {
 			r.handleAuth(w, req, strings.TrimPrefix(req.URL.Path, "/api/auth/"))
@@ -104,12 +115,20 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			r.handleProviderByID(w, req, strings.TrimPrefix(req.URL.Path, "/api/providers/"))
 			return
 		}
+		if strings.HasPrefix(req.URL.Path, "/api/skills/") {
+			r.handleSkillByID(w, req, strings.TrimPrefix(req.URL.Path, "/api/skills/"))
+			return
+		}
 		if strings.HasPrefix(req.URL.Path, "/api/workspaces/") {
 			r.handleWorkspaceByID(w, req, strings.TrimPrefix(req.URL.Path, "/api/workspaces/"))
 			return
 		}
 		WriteError(req.Context(), w, http.StatusNotFound, "not found")
 	}
+}
+
+func (r *Router) skillStore() *skill.Store {
+	return r.skills
 }
 
 func (r *Router) isPublicRoute(path string) bool {

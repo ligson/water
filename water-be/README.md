@@ -33,6 +33,8 @@ WATER_ACCESS_PIN=123456 go run ./cmd/water
 
 通过 `WATER_ACCESS_PIN` 重新启动会重置本地 PIN，并清理旧 session。前端设置页也可以在已解锁状态下修改 PIN。
 
+PIN 校验带有持久化递增锁定：连续错误第 3 次锁定 1 分钟，第 4 次锁定 5 分钟，第 5 次锁定 15 分钟，第 6 次及以后每次锁定 30 分钟。锁定期间即使提交正确 PIN 也会返回 HTTP `429`，响应包含 `Retry-After`、`retryAfterSeconds` 和 `lockedUntil`；成功解锁或成功修改 PIN 后清零失败次数。失败次数和锁定截止时间保存在 SQLite 中，刷新页面或重启服务不会绕过限制。
+
 ## 健康检查
 
 ```bash
@@ -65,11 +67,15 @@ curl -X POST http://localhost:8080/api/providers \
     "model": "qwen2.5-coder:7b",
     "apiKey": "",
     "contextWindowTokens": 8192,
+    "timeoutMs": 30000,
+    "streamIdleTimeoutMs": 60000,
     "isDefault": true
   }'
 ```
 
 `contextWindowTokens` 表示该模型的上下文窗口长度，默认 `8192`。Agent 构建 Context Pack 时默认使用其中 80% 作为输入预算，剩余部分留给回复、工具结果回填和 tokenizer 估算误差。
+
+`timeoutMs` 表示连接模型服务及等待响应头的超时，默认 30 秒；它不限制 SSE 流的总持续时间。`streamIdleTimeoutMs` 表示流建立后连续没有收到任何数据的最长时间，默认 60 秒，用于识别模型服务卡死。两项都可以在前端 Provider 弹窗的“高级参数”中调整。
 
 常用接口：
 
@@ -131,10 +137,49 @@ curl -X POST http://localhost:8080/api/workspaces/{workspaceId}/tasks \
 - `PUT /api/tasks/{taskId}`
 - `DELETE /api/tasks/{taskId}`
 - `POST /api/tasks/{taskId}/turns`
+- `GET /api/tasks/{taskId}/attachments?id={attachmentId}`
 - `GET /api/tasks/{taskId}/events`
 - `POST /api/tasks/{taskId}/cancel`
 
+Skill 管理接口：
+
+- `GET /api/skills`
+- `POST /api/skills`：使用 multipart `file` 上传 ZIP；安装后默认停用
+- `POST /api/skills/install`：JSON `{ "url": "https://.../skill.zip" }`
+- `POST /api/skills/{id}/enable`
+- `POST /api/skills/{id}/disable`
+- `DELETE /api/skills/{id}`
+
+Skill 包必须包含同一目录下的 `skill.json` 和 `SKILL.md`。Agent 上下文只常驻已启用 Skill 的轻量目录，匹配任务时通过 `read_skill` 按需加载完整工作流；普通 Skill 不执行包内程序。完整格式和安全边界见 `docs/skills.md`。
+
 删除任务会先取消该任务当前运行中的 Agent Turn，然后硬删除 `tasks` 记录；该任务下的 Turns、Events、Approvals、Task Summaries 和 Pinned Contexts 依赖 SQLite 外键级联清理。
+
+创建 Turn 时可携带附件。单个附件最大 8 MiB，每轮最多 6 个、合计最大 20 MiB；附件使用 base64 data URL 传入，后端写入当前工作区的 `.water/attachments/{taskId}/` 并将该目录加入 Git 本地 exclude，避免误提交：
+
+```json
+{
+  "userInput": "分析这张截图里的错误",
+  "attachments": [
+    {
+      "name": "error.png",
+      "mimeType": "image/png",
+      "dataUrl": "data:image/png;base64,..."
+    }
+  ]
+}
+```
+
+支持视觉的 OpenAI-compatible 模型会收到标准 `image_url` 内容块；文本/代码使用 `read_file`。DOCX、XLSX、PPTX 和带文本层 PDF 默认由 Go 内置的 `water-native` 引擎离线提取，无需在部署机器安装 Python、Office 或额外命令。
+
+旧 XLS 或需要对比增强解析效果时，可选安装 MarkItDown。这个步骤不是若水基础部署的前置条件：
+
+```bash
+./scripts/setup-document-runtime.sh
+```
+
+安装后设置 `WATER_DOCUMENT_ENGINE=markitdown` 才会启用该引擎，也可以用 `WATER_DOCUMENT_PYTHON` 指定解释器。扫描 PDF OCR 和旧 DOC/PPT 暂未内置，建议先离线转换为 PDF 或新版 Office 格式。
+
+`read_document` 默认返回 24576 个字符，最多 65536 个字符；结果截断时返回 `nextOffset`，Agent 会按需继续读取。单个文档安全上限为 50 MiB。解析器只接受 Harness 校验后的本地工作区或已授权路径；MarkItDown 模式关闭插件和网络 URI。
 
 ## Task WebSocket
 
@@ -217,6 +262,8 @@ curl -X POST http://localhost:8080/api/tasks/{taskId}/tools \
 
 - `list_dir`
 - `read_file`
+- `read_document`
+- `read_skill`
 - `write_file`
 - `run_command`
 

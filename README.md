@@ -46,7 +46,7 @@
 ### 本地 Provider 管理
 
 - 支持多个 OpenAI-compatible Provider。
-- 可配置名称、接口地址、模型、API Key、上下文窗口和默认 Provider。
+- 可配置名称、接口地址、模型、API Key、上下文窗口、流式超时和默认 Provider。
 - API Key 页面脱敏展示，日志不输出明文。
 - 支持连接测试，便于快速确认本地模型服务是否可用。
 
@@ -54,6 +54,9 @@
 
 - 支持多个工作区，每个工作区有独立根路径、权限模式和任务列表。
 - 任务以对话形式承载多轮 Turn。
+- 输入器支持选择、拖拽和粘贴图片/文件；附件随 Turn 持久化，图片可通过 OpenAI-compatible 多模态消息交给支持视觉的本地模型。
+- DOCX、XLSX、PPTX 和带文本层 PDF 由 Go 内置解析器离线读取，无需在部署机器安装 Python 或 Office；旧 XLS 可按需启用 MarkItDown 增强运行时。
+- 文档通过受控 `read_document` 工具按上下文预算分段读取；扫描 PDF OCR、旧 DOC/PPT 暂不属于内置能力。
 - 所有消息、工具调用、审批、错误和完成状态都会写入事件历史。
 - 删除任务时会取消正在运行的 Turn，并级联清理相关历史。
 
@@ -75,9 +78,17 @@
 
 - 三栏式 Coding Agent 工作台：工作区/任务、对话、审批/上下文/设置。
 - 支持 Markdown 回复、流式打字机渲染、执行过程折叠展示。
+- 支持图片缩略图、文件卡片、附件移除、剪贴板截图粘贴和发送后附件回显。
 - 支持当前任务打断、审批批准/拒绝、外部路径授权管理。
 - 设置页按分类折叠，包含 Provider、工作区和主题配置。
 - 预置若水、青瓷、宣纸、朱砂、玄墨等主题，面向中文开发者的审美语境。
+
+### Skills 扩展
+
+- 设置页支持上传 Skill ZIP，或从 HTTP/HTTPS 地址安装，适配公网 Git 托管和内网制品服务。
+- Skill 可启用、停用、删除和重新安装；新安装默认停用，并展示版本、来源和 SHA-256 摘要。
+- 第一版 Skill 只扩展领域规则与工作流，不自动执行包内代码，也不能绕过 Harness、审批或工作区权限。
+- 包格式、安全边界和能力 Skill 规划见 [Skill 管理与扩展设计](docs/skills.md)。
 
 ## 架构
 
@@ -122,6 +133,14 @@ cd water
 ./scripts/start-all.sh
 ```
 
+DOCX、XLSX、PPTX 和带文本层 PDF 已由后端内置解析，不需要额外安装 Python。只有需要读取旧 XLS 或对比增强解析效果时，才可选安装 MarkItDown：
+
+```bash
+./scripts/setup-document-runtime.sh
+```
+
+可选运行时安装在 `water-be/.venv-document/`，不会进入 Git；启用时需设置 `WATER_DOCUMENT_ENGINE=markitdown`。安装过程需要联网下载依赖，基础文档识别和正常启动不经过这一步。
+
 默认地址：
 
 - 前端：`http://127.0.0.1:5173`
@@ -163,6 +182,17 @@ npm install
 VITE_API_BASE=http://127.0.0.1:8080 npm run dev
 ```
 
+### Docker 部署
+
+仓库提供独立的后端与前端镜像，以及 `docker/docker-compose.yml` 部署模板。真实访问 PIN、宿主机工作区路径和运行数据只保存在部署主机，不进入 Git：
+
+```bash
+docker build --platform linux/amd64 -f water-be/docker/Dockerfile -t ligson/water-be:latest .
+docker build --platform linux/amd64 -f water-fe/Dockerfile -t ligson/water-fe:latest .
+```
+
+部署时必须显式挂载一个受控工作区目录。不要挂载宿主机根目录、Docker Socket 或 SSH 私钥目录。完整配置、升级和备份说明见 [Docker 部署](docs/docker-deployment.md)。
+
 ## 第一次使用
 
 1. 打开前端工作台。
@@ -183,6 +213,8 @@ VITE_API_BASE=http://127.0.0.1:8080 npm run dev
 | `WATER_DATA_DIR` | `data` | 数据目录 |
 | `WATER_DATABASE_PATH` | `data/water.db` | SQLite 数据库路径 |
 | `WATER_ACCESS_PIN` | 首次启动自动生成 | 单用户访问 PIN；设置后会重置本地 PIN 并使旧会话失效 |
+| `WATER_DOCUMENT_ENGINE` | `native` | 文档解析引擎；仅显式设为 `markitdown` 时使用可选增强运行时 |
+| `WATER_DOCUMENT_PYTHON` | 自动发现 `.venv-document` | 可选 MarkItDown 运行时的 Python 路径 |
 
 前端常用环境变量：
 
@@ -219,6 +251,7 @@ water/
 - [后端说明](water-be/README.md)
 - [前端说明](water-fe/README.md)
 - [开发脚本](scripts/README.md)
+- [Docker 部署](docs/docker-deployment.md)
 
 ## 开发命令
 
@@ -251,7 +284,8 @@ npm run build
 
 近期重点：
 
-- 更完整的工具注册、参数校验和执行审计。
+- 为带可执行运行时的能力 Skill 增加签名、权限预览、隔离执行和版本回滚。
+- 文档解析缓存、扫描 PDF 本地 OCR 和旧版 Office 转换。
 - 更细粒度的权限策略与审批预览。
 - 更稳定的本地模型上下文压缩和长任务恢复。
 - Python 脚本隔离执行环境。
@@ -260,7 +294,7 @@ npm run build
 
 中长期方向：
 
-- Skills / 子智能体能力。
+- Skill 市场、可信源和子智能体能力。
 - 长期记忆与项目知识库。
 - 多工作区上下文协作。
 - 更丰富的模型 Provider 适配。

@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -15,11 +17,15 @@ import (
 
 	"github.com/ligson/water/water-be/internal/approval"
 	"github.com/ligson/water/water-be/internal/contextpack"
+	"github.com/ligson/water/water-be/internal/document"
 	"github.com/ligson/water/water-be/internal/event"
 	"github.com/ligson/water/water-be/internal/llm"
 	"github.com/ligson/water/water-be/internal/provider"
 	"github.com/ligson/water/water-be/internal/sandbox"
+	"github.com/ligson/water/water-be/internal/skill"
 	"github.com/ligson/water/water-be/internal/task"
+	"github.com/ligson/water/water-be/internal/taskcontract"
+	"github.com/ligson/water/water-be/internal/taskplan"
 	"github.com/ligson/water/water-be/internal/tools"
 	"github.com/ligson/water/water-be/internal/workspace"
 )
@@ -29,8 +35,10 @@ const DefaultSystemPrompt = `你是若水（Water），一个运行在用户内�
 const (
 	defaultToolLoopMaxRounds  = 24
 	approvedToolLoopMaxRounds = 12
+	maxExecutionPhases        = 3
+	continuedPhaseMaxRounds   = 8
 	repeatedToolFailureLimit  = 2
-	repeatedToolSuccessLimit  = 6
+	repeatedToolSuccessLimit  = 3
 )
 
 var errTurnInterrupted = errors.New("turn interrupted")
@@ -43,15 +51,32 @@ type Runner struct {
 	clientFactory  ClientFactory
 	toolExecutor   *tools.Executor
 	contextBuilder *contextpack.Builder
+	skillStore     *skill.Store
 	systemPrompt   string
 	requestTimeout time.Duration
 }
 
 type toolLoopObservation struct {
-	name      string
-	signature string
-	args      string
-	outcome   string
+	name           string
+	signature      string
+	args           string
+	outcome        string
+	hypothesisID   string
+	resource       string
+	operation      string
+	newInformation bool
+	repeatCount    int
+	evidenceID     string
+}
+
+type cachedToolResult struct {
+	result      tools.Result
+	fingerprint string
+}
+
+type toolExecutionState struct {
+	readCache     map[string]cachedToolResult
+	resourceCache map[string]cachedToolResult
 }
 
 type toolLoopGuard struct {
@@ -60,6 +85,7 @@ type toolLoopGuard struct {
 	lastToolName  string
 	lastToolArgs  string
 	repeatCount   int
+	repeatCounts  map[string]int
 }
 
 type toolLoopInterrupt struct {
@@ -77,6 +103,7 @@ type RunTurnInput struct {
 	TurnSequence int
 	WorkspaceID  string
 	UserInput    string
+	Attachments  []task.Attachment
 }
 
 func NewRunner(db *sql.DB, appendEvent EventAppender) *Runner {
@@ -86,8 +113,13 @@ func NewRunner(db *sql.DB, appendEvent EventAppender) *Runner {
 		clientFactory: func(p provider.Provider) (llm.Client, error) {
 			return llm.NewOpenAIClient(p)
 		},
-		toolExecutor:   tools.NewExecutor(sandbox.NewPermissionEngine(workspace.NewStore(db)), approval.NewStore(db)),
+		toolExecutor: tools.NewExecutor(
+			sandbox.NewPermissionEngine(workspace.NewStore(db)),
+			approval.NewStore(db),
+			tools.WithSkillReader(skill.NewStore(db, "")),
+		),
 		contextBuilder: contextpack.NewBuilder(contextpack.NewStore(db)),
+		skillStore:     skill.NewStore(db, ""),
 		systemPrompt:   DefaultSystemPrompt,
 		requestTimeout: 10 * time.Minute,
 	}
@@ -146,60 +178,57 @@ func (r *Runner) runTurn(ctx context.Context, input RunTurnInput) error {
 	if err != nil {
 		return fmt.Errorf("load task: %w", err)
 	}
-
-	messages, err := r.buildMessages(ctx, input, ws, p, currentTask)
+	contract, err := r.ensureTaskContract(ctx, input)
+	if err != nil {
+		return fmt.Errorf("prepare task contract: %w", err)
+	}
+	if contract.Stage == taskcontract.StageBlocked && isGenericContinuationInput(input.UserInput) {
+		return r.blockTurn(ctx, input, ws, contract, completionDecision{
+			Outcome:       completionBlocked,
+			Reason:        "missing_required_input",
+			MissingInputs: contract.MissingInputs,
+		})
+	}
+	if _, err := r.ensureTaskPlan(ctx, input, contract); err != nil {
+		return fmt.Errorf("prepare task plan: %w", err)
+	}
+	if err := r.ensureHypothesisLedger(ctx, input, contract); err != nil {
+		return fmt.Errorf("prepare hypothesis ledger: %w", err)
+	}
+	contract, err = r.updateContractStage(ctx, input, contract, taskcontract.StageCollectingEvidence, nil)
 	if err != nil {
 		return err
 	}
 
-	return r.continueWithMessages(ctx, client, messages, input, ws, currentTask, defaultToolLoopMaxRounds)
+	messages, err := r.buildMessages(ctx, input, ws, p, currentTask, contract)
+	if err != nil {
+		return err
+	}
+
+	return r.continueWithMessages(ctx, client, messages, input, ws, currentTask, contract, p, defaultToolLoopMaxRounds)
 }
 
-func (r *Runner) continueWithMessages(ctx context.Context, client llm.Client, messages []llm.Message, input RunTurnInput, ws workspace.Workspace, currentTask task.Task, maxRounds int) error {
+func (r *Runner) continueWithMessages(ctx context.Context, client llm.Client, messages []llm.Message, input RunTurnInput, ws workspace.Workspace, currentTask task.Task, contract taskcontract.Contract, p provider.Provider, maxRounds int) error {
+	return r.continueExecutionPhase(ctx, client, messages, input, ws, currentTask, contract, p, maxRounds, maxRounds, 1, nil)
+}
+
+func (r *Runner) continueExecutionPhase(ctx context.Context, client llm.Client, messages []llm.Message, input RunTurnInput, ws workspace.Workspace, currentTask task.Task, contract taskcontract.Contract, p provider.Provider, maxRounds int, initialMaxRounds int, phase int, deferredToolCalls []llm.ToolCall) error {
 	if maxRounds <= 0 {
 		maxRounds = 1
 	}
 	guard := &toolLoopGuard{}
-	for round := 0; round < maxRounds; round++ {
-		if err := r.ensureTurnActive(ctx, input.TurnID); err != nil {
+	toolState := newToolExecutionState()
+	lastDroppedMessages := 0
+	if len(deferredToolCalls) > 0 {
+		if err := r.appendJSONEvent(ctx, input, "agent.deferred_tool_calls.executing", map[string]interface{}{
+			"phase":     phase,
+			"toolCalls": deferredToolCalls,
+			"message":   "若水正在执行上一阶段末尾提出的有效工具动作，然后从结果继续。",
+		}); err != nil {
 			return err
 		}
-		assistantMsg, toolCalls, finishReason, err := r.collectAssistantRound(ctx, client, messages, input, ws, currentTask)
-		if err != nil {
-			return err
-		}
-		messages = append(messages, assistantMsg)
-
-		if len(toolCalls) == 0 {
-			if assistantPromisedToolUse(assistantMsg.Content) {
-				if _, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, input.TurnID, task.TurnStatusInterrupted); err != nil {
-					if errors.Is(err, task.ErrTurnNotActive) {
-						return errTurnInterrupted
-					}
-					return err
-				}
-				return r.appendJSONEvent(ctx, input, "turn.interrupted", map[string]interface{}{
-					"message": "模型表示需要查看工作区或环境信息，但没有实际发起工具调用，本轮未完成。",
-				})
-			}
-			if err := r.appendTurnSummary(ctx, input, ws); err != nil {
-				return err
-			}
-			if err := r.updateTaskRollingSummary(ctx, input, ws); err != nil {
-				return err
-			}
-			if _, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, input.TurnID, task.TurnStatusCompleted); err != nil {
-				if errors.Is(err, task.ErrTurnNotActive) {
-					return errTurnInterrupted
-				}
-				return err
-			}
-			return r.appendJSONEvent(ctx, input, "turn.completed", map[string]interface{}{
-				"finishReason": finishReason,
-			})
-		}
-
-		toolMessages, pendingApproval, observations, err := r.executeToolCalls(ctx, input, ws, currentTask, toolCalls)
+		messages = append(messages, llm.Message{Role: llm.RoleAssistant, ToolCalls: deferredToolCalls})
+		toolMessages, pendingApproval, _, err := r.executeToolCalls(ctx, input, ws, currentTask, contract, toolState, deferredToolCalls)
 		if err != nil {
 			return err
 		}
@@ -212,30 +241,110 @@ func (r *Runner) continueWithMessages(ctx context.Context, client llm.Client, me
 			}
 			return nil
 		}
-		if interrupt, reason := guard.observe(observations); interrupt {
-			if err := r.appendTurnSummary(ctx, input, ws); err != nil {
+		messages = append(messages, toolMessages...)
+	}
+	for round := 0; round < maxRounds; round++ {
+		if err := r.ensureTurnActive(ctx, input.TurnID); err != nil {
+			return err
+		}
+		requestMessages, compaction := compactToolLoopMessages(messages, p.ContextWindowTokens)
+		if compaction.DroppedMessages > lastDroppedMessages {
+			if err := r.appendJSONEvent(ctx, input, "context.turn.compacted", map[string]interface{}{
+				"round":                    round + 1,
+				"contextWindowTokens":      p.ContextWindowTokens,
+				"tokenBudget":              compaction.TokenBudget,
+				"originalEstimatedTokens":  compaction.OriginalEstimatedTokens,
+				"compactedEstimatedTokens": compaction.CompactedEstimatedTokens,
+				"droppedMessages":          compaction.DroppedMessages,
+			}); err != nil {
 				return err
 			}
-			if err := r.updateTaskRollingSummary(ctx, input, ws); err != nil {
+			lastDroppedMessages = compaction.DroppedMessages
+		}
+
+		finalRound := round == maxRounds-1
+		requestTools := tools.Definitions()
+		if finalRound {
+			requestMessages = append(requestMessages, llm.Message{Role: llm.RoleSystem, Content: toolLoopFinalInstruction(maxRounds)})
+			requestTools = nil
+		} else if instruction := toolLoopConvergenceInstruction(round, maxRounds); instruction != "" {
+			requestMessages = append(requestMessages, llm.Message{Role: llm.RoleSystem, Content: instruction})
+		}
+		if err := r.appendContextRequestEstimate(ctx, input, p, requestMessages, requestTools, phase, round+1); err != nil {
+			return err
+		}
+
+		assistantMsg, toolCalls, finishReason, err := r.collectAssistantRound(ctx, client, requestMessages, requestTools, input, ws, currentTask)
+		if err != nil {
+			return err
+		}
+		messages = append(messages, assistantMsg)
+
+		if len(toolCalls) == 0 {
+			decision, err := r.arbitrateCompletion(ctx, input, contract, assistantMsg.Content)
+			if err != nil {
 				return err
 			}
-			if _, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, input.TurnID, task.TurnStatusInterrupted); err != nil {
+			if decision.Outcome == completionCompleted {
+				return r.completeTurn(ctx, input, ws, contract, finishReason, finalRound, "")
+			}
+			if decision.Outcome == completionBlocked {
+				return r.blockTurn(ctx, input, ws, contract, decision)
+			}
+			if finalRound {
+				return r.continueNextExecutionPhase(ctx, client, input, ws, currentTask, contract, p, maxRounds, initialMaxRounds, phase, decision.Reason, nil)
+			}
+			messages = append(messages, llm.Message{Role: llm.RoleSystem, Content: completionRetryInstruction(decision, contract)})
+			continue
+		}
+		if finalRound {
+			if err := r.appendJSONEvent(ctx, input, "agent.final_tool_calls.deferred", map[string]interface{}{
+				"phase":     phase,
+				"toolCalls": toolCalls,
+				"message":   "最终回合工具已关闭，若水已保留模型提出的工具动作，并将在下一阶段优先执行。",
+			}); err != nil {
+				return err
+			}
+			return r.continueNextExecutionPhase(ctx, client, input, ws, currentTask, contract, p, maxRounds, initialMaxRounds, phase, "tool_requested_after_final_round", toolCalls)
+		}
+		if stage := contractStageForToolCalls(toolCalls); stage != "" && stage != contract.Stage {
+			contract, err = r.updateContractStage(ctx, input, contract, stage, nil)
+			if err != nil {
+				return err
+			}
+		}
+
+		toolMessages, pendingApproval, observations, err := r.executeToolCalls(ctx, input, ws, currentTask, contract, toolState, toolCalls)
+		if err != nil {
+			return err
+		}
+		if pendingApproval {
+			if _, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, input.TurnID, task.TurnStatusWaitingApproval); err != nil {
 				if errors.Is(err, task.ErrTurnNotActive) {
 					return errTurnInterrupted
 				}
 				return err
 			}
-			return r.appendJSONEvent(ctx, input, "turn.interrupted", map[string]interface{}{
-				"reason":             reason.reason,
-				"message":            reason.message,
-				"canContinue":        true,
-				"continuationPrompt": reason.continuationPrompt,
-				"blockedTool":        guard.lastToolName,
-				"blockedTarget":      guard.lastToolArgs,
-				"repeatCount":        guard.repeatCount,
-			})
+			return nil
 		}
 		messages = append(messages, toolMessages...)
+		if action, reason := semanticNoProgress(observations); action != "" {
+			if action == "replan" {
+				if err := r.appendJSONEvent(ctx, input, "agent.replan.requested", map[string]interface{}{
+					"reason":  reason.reason,
+					"message": reason.message,
+				}); err != nil {
+					return err
+				}
+				messages = append(messages, llm.Message{Role: llm.RoleSystem, Content: evidenceReplanInstruction(reason)})
+				continue
+			}
+			guard.captureSemanticObservation(observations)
+			return r.finalizeAfterToolLoopGuard(ctx, client, messages, input, ws, currentTask, contract, p, maxRounds, initialMaxRounds, phase, guard, reason)
+		}
+		if interrupt, reason := guard.observe(observations); interrupt {
+			return r.finalizeAfterToolLoopGuard(ctx, client, messages, input, ws, currentTask, contract, p, maxRounds, initialMaxRounds, phase, guard, reason)
+		}
 	}
 
 	if err := r.appendTurnSummary(ctx, input, ws); err != nil {
@@ -244,39 +353,265 @@ func (r *Runner) continueWithMessages(ctx context.Context, client llm.Client, me
 	if err := r.updateTaskRollingSummary(ctx, input, ws); err != nil {
 		return err
 	}
-	return r.interruptToolLoopExceeded(ctx, input, maxRounds)
+	return r.continueNextExecutionPhase(ctx, client, input, ws, currentTask, contract, p, maxRounds, initialMaxRounds, phase, "tool_round_limit", nil)
 }
 
-func (r *Runner) interruptToolLoopExceeded(ctx context.Context, input RunTurnInput, maxRounds int) error {
-	if _, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, input.TurnID, task.TurnStatusInterrupted); err != nil {
+func (r *Runner) finalizeAfterToolLoopGuard(
+	ctx context.Context,
+	client llm.Client,
+	messages []llm.Message,
+	input RunTurnInput,
+	ws workspace.Workspace,
+	currentTask task.Task,
+	contract taskcontract.Contract,
+	p provider.Provider,
+	maxRounds int,
+	initialMaxRounds int,
+	phase int,
+	guard *toolLoopGuard,
+	reason toolLoopInterrupt,
+) error {
+	if err := r.appendJSONEvent(ctx, input, "agent.loop.guard.triggered", map[string]interface{}{
+		"reason":        reason.reason,
+		"message":       reason.message,
+		"blockedTool":   guard.lastToolName,
+		"blockedTarget": guard.lastToolArgs,
+		"repeatCount":   guard.repeatCount,
+		"action":        "force_final_response",
+	}); err != nil {
+		return err
+	}
+	requestMessages, _ := compactToolLoopMessages(messages, p.ContextWindowTokens)
+	requestMessages = append(requestMessages, llm.Message{
+		Role:    llm.RoleSystem,
+		Content: toolLoopGuardFinalInstruction(reason),
+	})
+	if err := r.appendContextRequestEstimate(ctx, input, p, requestMessages, nil, phase, 0); err != nil {
+		return err
+	}
+	assistantMsg, toolCalls, finishReason, err := r.collectAssistantRound(
+		ctx,
+		client,
+		requestMessages,
+		nil,
+		input,
+		ws,
+		currentTask,
+	)
+	if err != nil {
+		return err
+	}
+	if len(toolCalls) > 0 || strings.TrimSpace(assistantMsg.Content) == "" {
+		return r.failIncompleteTurn(ctx, input, ws, contract, reason.reason, executionRoundBudget(initialMaxRounds))
+	}
+	decision, err := r.arbitrateCompletion(ctx, input, contract, assistantMsg.Content)
+	if err != nil {
+		return err
+	}
+	if decision.Outcome == completionBlocked {
+		return r.blockTurn(ctx, input, ws, contract, decision)
+	}
+	if decision.Outcome != completionCompleted {
+		return r.failIncompleteTurn(ctx, input, ws, contract, decision.Reason, executionRoundBudget(initialMaxRounds))
+	}
+	return r.completeTurn(ctx, input, ws, contract, finishReason, true, reason.reason)
+}
+
+func (r *Runner) continueNextExecutionPhase(ctx context.Context, client llm.Client, input RunTurnInput, ws workspace.Workspace, currentTask task.Task, contract taskcontract.Contract, p provider.Provider, maxRounds int, initialMaxRounds int, phase int, reason string, deferredToolCalls []llm.ToolCall) error {
+	if phase >= maxExecutionPhases {
+		if len(deferredToolCalls) > 0 {
+			return r.finalizeDeferredToolCalls(ctx, client, input, ws, currentTask, contract, p, deferredToolCalls, reason, initialMaxRounds)
+		}
+		return r.failIncompleteTurn(ctx, input, ws, contract, reason, executionRoundBudget(initialMaxRounds))
+	}
+	refreshedContract, err := taskcontract.NewStore(r.db).Get(ctx, input.TaskID)
+	if err != nil {
+		return err
+	}
+	plan, err := taskplan.NewStore(r.db).Get(ctx, input.TaskID, refreshedContract.Goal)
+	if err != nil {
+		return err
+	}
+	if err := r.appendJSONEvent(ctx, input, "agent.execution.phase.continued", map[string]interface{}{
+		"completedPhase": phase,
+		"nextPhase":      phase + 1,
+		"reason":         reason,
+		"deferredTools":  len(deferredToolCalls),
+		"currentStep":    currentPlanStep(plan),
+		"message":        "当前任务尚未完成，若水已清理本阶段工具上下文并继续执行当前计划。",
+	}); err != nil {
+		return err
+	}
+	messages, err := r.buildMessages(ctx, input, ws, p, currentTask, refreshedContract)
+	if err != nil {
+		return err
+	}
+	messages = append(messages, llm.Message{Role: llm.RoleSystem, Content: executionPhaseRestartInstruction(phase+1, plan, ws)})
+	nextMaxRounds := min(maxRounds, continuedPhaseMaxRounds)
+	return r.continueExecutionPhase(ctx, client, messages, input, ws, currentTask, refreshedContract, p, nextMaxRounds, initialMaxRounds, phase+1, deferredToolCalls)
+}
+
+func (r *Runner) finalizeDeferredToolCalls(ctx context.Context, client llm.Client, input RunTurnInput, ws workspace.Workspace, currentTask task.Task, contract taskcontract.Contract, p provider.Provider, toolCalls []llm.ToolCall, reason string, initialMaxRounds int) error {
+	if err := r.appendJSONEvent(ctx, input, "agent.deferred_tool_calls.executing", map[string]interface{}{
+		"phase":     maxExecutionPhases,
+		"toolCalls": toolCalls,
+		"message":   "若水正在执行最后阶段提出的有效工具动作，并将根据结果做最终判断。",
+	}); err != nil {
+		return err
+	}
+	messages, err := r.buildMessages(ctx, input, ws, p, currentTask, contract)
+	if err != nil {
+		return err
+	}
+	messages = append(messages, llm.Message{Role: llm.RoleAssistant, ToolCalls: toolCalls})
+	toolMessages, pendingApproval, _, err := r.executeToolCalls(ctx, input, ws, currentTask, contract, newToolExecutionState(), toolCalls)
+	if err != nil {
+		return err
+	}
+	if pendingApproval {
+		if _, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, input.TurnID, task.TurnStatusWaitingApproval); err != nil {
+			if errors.Is(err, task.ErrTurnNotActive) {
+				return errTurnInterrupted
+			}
+			return err
+		}
+		return nil
+	}
+	messages = append(messages, toolMessages...)
+	messages = append(messages, llm.Message{
+		Role:    llm.RoleSystem,
+		Content: "这是本轮最后一次收敛判断。请严格基于刚才的工具结果判断当前计划是否完成；不得继续请求工具。若尚未完成，准确说明下一未完成步骤，不要宣称完成。",
+	})
+	requestMessages, _ := compactToolLoopMessages(messages, p.ContextWindowTokens)
+	if err := r.appendContextRequestEstimate(ctx, input, p, requestMessages, nil, maxExecutionPhases, 0); err != nil {
+		return err
+	}
+	assistantMsg, extraToolCalls, finishReason, err := r.collectAssistantRound(ctx, client, requestMessages, nil, input, ws, currentTask)
+	if err != nil {
+		return err
+	}
+	if len(extraToolCalls) == 0 && strings.TrimSpace(assistantMsg.Content) != "" {
+		decision, err := r.arbitrateCompletion(ctx, input, contract, assistantMsg.Content)
+		if err != nil {
+			return err
+		}
+		if decision.Outcome == completionCompleted {
+			return r.completeTurn(ctx, input, ws, contract, finishReason, true, reason)
+		}
+		if decision.Outcome == completionBlocked {
+			return r.blockTurn(ctx, input, ws, contract, decision)
+		}
+	}
+	return r.failIncompleteTurn(ctx, input, ws, contract, reason, executionRoundBudget(initialMaxRounds))
+}
+
+func executionRoundBudget(initialMaxRounds int) int {
+	if initialMaxRounds <= 0 {
+		initialMaxRounds = 1
+	}
+	return initialMaxRounds + (maxExecutionPhases-1)*min(initialMaxRounds, continuedPhaseMaxRounds)
+}
+
+func (r *Runner) completeTurn(ctx context.Context, input RunTurnInput, ws workspace.Workspace, contract taskcontract.Contract, finishReason string, forcedFinal bool, forcedReason string) error {
+	if err := r.appendTurnSummary(ctx, input, ws); err != nil {
+		return err
+	}
+	if err := r.updateTaskRollingSummary(ctx, input, ws); err != nil {
+		return err
+	}
+	if _, err := r.updateContractStage(ctx, input, contract, taskcontract.StageCompleted, nil); err != nil {
+		return err
+	}
+	if err := r.updateHypothesesForTurnOutcome(ctx, input, contract, "resolved", nil); err != nil {
+		return err
+	}
+	if _, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, input.TurnID, task.TurnStatusCompleted); err != nil {
 		if errors.Is(err, task.ErrTurnNotActive) {
 			return errTurnInterrupted
 		}
 		return err
 	}
-	return r.appendJSONEvent(ctx, input, "turn.interrupted", map[string]interface{}{
-		"reason":             "tool_round_limit",
-		"message":            "本轮已运行较多步骤并暂告一段落。若任务还没完成，可以继续上一轮结果，若水会沿用当前上下文和已生成文件继续推进。",
+	return r.appendJSONEvent(ctx, input, "turn.completed", map[string]interface{}{
+		"finishReason":      finishReason,
+		"forcedFinal":       forcedFinal,
+		"forcedFinalReason": forcedReason,
+		"arbiter":           "completion_criteria_satisfied",
+	})
+}
+
+func (r *Runner) blockTurn(ctx context.Context, input RunTurnInput, ws workspace.Workspace, contract taskcontract.Contract, decision completionDecision) error {
+	if err := r.appendTurnSummary(ctx, input, ws); err != nil {
+		return err
+	}
+	if err := r.updateTaskRollingSummary(ctx, input, ws); err != nil {
+		return err
+	}
+	if _, err := r.updateContractStage(ctx, input, contract, taskcontract.StageBlocked, decision.MissingInputs); err != nil {
+		return err
+	}
+	if err := r.updateHypothesesForTurnOutcome(ctx, input, contract, "blocked", decision.MissingInputs); err != nil {
+		return err
+	}
+	if _, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, input.TurnID, task.TurnStatusBlocked); err != nil {
+		if errors.Is(err, task.ErrTurnNotActive) {
+			return errTurnInterrupted
+		}
+		return err
+	}
+	return r.appendJSONEvent(ctx, input, "turn.blocked", map[string]interface{}{
+		"reason":        decision.Reason,
+		"message":       "继续任务需要你补充关键信息。",
+		"missingInputs": decision.MissingInputs,
+	})
+}
+
+func (r *Runner) failIncompleteTurn(ctx context.Context, input RunTurnInput, ws workspace.Workspace, contract taskcontract.Contract, reason string, maxRounds int) error {
+	if err := r.appendTurnSummary(ctx, input, ws); err != nil {
+		return err
+	}
+	if err := r.updateTaskRollingSummary(ctx, input, ws); err != nil {
+		return err
+	}
+	if _, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, input.TurnID, task.TurnStatusPaused); err != nil {
+		if errors.Is(err, task.ErrTurnNotActive) {
+			return errTurnInterrupted
+		}
+		return err
+	}
+	plan, planErr := taskplan.NewStore(r.db).Get(ctx, input.TaskID, contract.Goal)
+	if planErr != nil && !errors.Is(planErr, taskplan.ErrNotFound) {
+		return planErr
+	}
+	message := "本轮已达到安全执行上限，但任务尚未完成。当前计划和证据已经保留，可从未通过的步骤继续。"
+	if reason == "semantic_no_progress" || reason == "semantic_replan_required" {
+		message = "若水连续多个执行阶段没有获得足以推进任务的新证据，本轮已暂停。任务仍未完成，当前计划和证据已经保留。"
+	}
+	return r.appendJSONEvent(ctx, input, "turn.paused", map[string]interface{}{
+		"reason":             reason,
+		"message":            message,
 		"maxRounds":          maxRounds,
+		"doneWhen":           contract.DoneWhen,
+		"currentStep":        currentPlanStep(plan),
 		"canContinue":        true,
-		"continuationPrompt": "继续上一轮任务，从最后一个未完成点接着做；先快速确认已生成的文件，再补齐剩余代码和验证，不要重复已完成工作。",
+		"continuationPrompt": "继续当前任务，从持久化计划中尚未通过的步骤开始；优先运行项目已有测试或验收脚本，不要重复读取已有证据。",
 	})
 }
 
 func (g *toolLoopGuard) observe(observations []toolLoopObservation) (bool, toolLoopInterrupt) {
+	if g.repeatCounts == nil {
+		g.repeatCounts = make(map[string]int)
+	}
 	for _, observation := range observations {
 		if observation.signature == "" || observation.outcome == "" {
 			continue
 		}
-		if observation.signature == g.lastSignature && observation.outcome == g.lastOutcome {
-			g.repeatCount++
-		} else {
-			g.lastSignature = observation.signature
-			g.lastOutcome = observation.outcome
-			g.lastToolName = observation.name
-			g.lastToolArgs = observation.args
-			g.repeatCount = 1
-		}
+		key := observation.signature + "\x00" + observation.outcome
+		g.repeatCounts[key]++
+		g.lastSignature = observation.signature
+		g.lastOutcome = observation.outcome
+		g.lastToolName = observation.name
+		g.lastToolArgs = observation.args
+		g.repeatCount = g.repeatCounts[key]
 
 		if strings.HasPrefix(observation.outcome, "error:") && g.repeatCount >= repeatedToolFailureLimit {
 			return true, toolLoopInterrupt{
@@ -294,6 +629,18 @@ func (g *toolLoopGuard) observe(observations []toolLoopObservation) (bool, toolL
 		}
 	}
 	return false, toolLoopInterrupt{}
+}
+
+func (g *toolLoopGuard) captureSemanticObservation(observations []toolLoopObservation) {
+	for _, observation := range observations {
+		if observation.resource == "" {
+			continue
+		}
+		g.lastToolName = observation.name
+		g.lastToolArgs = observation.resource
+		g.lastOutcome = observation.outcome
+		g.repeatCount = observation.repeatCount
+	}
 }
 
 func assistantPromisedToolUse(content string) bool {
@@ -382,6 +729,7 @@ func (r *Runner) resumeApprovedTool(ctx context.Context, appr approval.Approval,
 		TurnSequence: turn.Sequence,
 		WorkspaceID:  appr.WorkspaceID,
 		UserInput:    turn.UserInput,
+		Attachments:  turn.Attachments,
 	}
 	if _, err := task.NewStore(r.db).UpdateActiveTurnStatus(ctx, input.TurnID, task.TurnStatusRunning); err != nil {
 		if errors.Is(err, task.ErrTurnNotActive) {
@@ -406,7 +754,17 @@ func (r *Runner) resumeApprovedTool(ctx context.Context, appr approval.Approval,
 	if err != nil {
 		return input, fmt.Errorf("load task: %w", err)
 	}
-	messages, err := r.buildMessages(ctx, input, ws, p, currentTask)
+	contract, err := r.ensureTaskContract(ctx, input)
+	if err != nil {
+		return input, fmt.Errorf("prepare task contract: %w", err)
+	}
+	if _, err := r.ensureTaskPlan(ctx, input, contract); err != nil {
+		return input, fmt.Errorf("prepare task plan: %w", err)
+	}
+	if err := r.ensureHypothesisLedger(ctx, input, contract); err != nil {
+		return input, fmt.Errorf("prepare hypothesis ledger: %w", err)
+	}
+	messages, err := r.buildMessages(ctx, input, ws, p, currentTask, contract)
 	if err != nil {
 		return input, err
 	}
@@ -431,7 +789,7 @@ func (r *Runner) resumeApprovedTool(ctx context.Context, appr approval.Approval,
 			Arguments: string(req.Arguments),
 		},
 	}
-	toolMessages, pendingApproval, _, err := r.executeToolCalls(ctx, input, ws, currentTask, []llm.ToolCall{toolCall}, req.ApprovalID)
+	toolMessages, pendingApproval, _, err := r.executeToolCalls(ctx, input, ws, currentTask, contract, newToolExecutionState(), []llm.ToolCall{toolCall}, req.ApprovalID)
 	if err != nil {
 		return input, err
 	}
@@ -442,14 +800,15 @@ func (r *Runner) resumeApprovedTool(ctx context.Context, appr approval.Approval,
 		return input, nil
 	}
 	messages = append(messages, toolMessages...)
-	return input, r.continueWithMessages(ctx, client, messages, input, ws, currentTask, approvedToolLoopMaxRounds)
+	return input, r.continueWithMessages(ctx, client, messages, input, ws, currentTask, contract, p, approvedToolLoopMaxRounds)
 }
 
-func (r *Runner) buildMessages(ctx context.Context, input RunTurnInput, ws workspace.Workspace, p provider.Provider, currentTask task.Task) ([]llm.Message, error) {
+func (r *Runner) buildMessages(ctx context.Context, input RunTurnInput, ws workspace.Workspace, p provider.Provider, currentTask task.Task, contract taskcontract.Contract) ([]llm.Message, error) {
 	systemPrompt := r.systemPrompt
 	if r.contextBuilder != nil {
 		pack, err := r.contextBuilder.Build(ctx, contextpack.BuildInput{
 			WorkspaceID:   ws.ID,
+			RootPath:      ws.RootPath,
 			TaskID:        input.TaskID,
 			UserInput:     input.UserInput,
 			ContextTokens: p.ContextWindowTokens,
@@ -459,6 +818,7 @@ func (r *Runner) buildMessages(ctx context.Context, input RunTurnInput, ws works
 		}
 		if err := r.appendJSONEvent(ctx, input, "context.pack.built", map[string]interface{}{
 			"estimatedTokens":     pack.EstimatedTokens,
+			"packEstimatedTokens": pack.EstimatedTokens,
 			"tokenBudget":         pack.TokenBudget,
 			"contextWindowTokens": p.ContextWindowTokens,
 			"budgetRatio":         contextpack.DefaultBudgetRatio,
@@ -466,6 +826,7 @@ func (r *Runner) buildMessages(ctx context.Context, input RunTurnInput, ws works
 			"selectedFilePaths":   contextPackFilePaths(pack.FileSummaries),
 			"hasTaskSummary":      pack.TaskSummary != "",
 			"truncated":           pack.Truncated,
+			"indexStats":          pack.IndexStats,
 		}); err != nil {
 			return nil, err
 		}
@@ -474,25 +835,138 @@ func (r *Runner) buildMessages(ctx context.Context, input RunTurnInput, ws works
 			systemPrompt += "\n\n" + contextText
 		}
 	}
+	skillContext, err := r.renderSkillContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("build skill context: %w", err)
+	}
+	if skillContext != "" {
+		systemPrompt += "\n\n" + skillContext
+	}
 	systemPrompt += fmt.Sprintf("\n\n当前运行环境：os=%s，arch=%s。用户询问“本机/电脑/当前机器”的系统信息时，指的是运行若水（Water）后端的这台机器。", runtime.GOOS, runtime.GOARCH)
-	systemPrompt += "\n\n可用通用工具：list_dir、read_file、write_file、run_command。遇到文件、目录、磁盘空间、内存使用、CPU 使用率、系统信息、Git 状态、测试结果或其他真实环境信息时，先自己选择合适的通用工具，再基于工具结果继续推理；不要猜测，也不要等待专用工具。系统信息可优先用只读命令，例如磁盘 df -h /，macOS(darwin) 内存 vm_stat 与 sysctl hw.memsize、CPU top -l 1 -s 0 -n 0，Linux 内存 free -h、CPU top -bn1，Windows 内存 wmic OS get FreePhysicalMemory,TotalVisibleMemorySize /Value、CPU wmic cpu get loadpercentage /Value。如果工具返回 command not found 或命令不适合当前系统，应继续选择当前 os 对应的替代只读命令。"
+	systemPrompt += fmt.Sprintf("\n\n服务边界：当前工作区根目录是 `%s`。若水后端是控制面，不是工作区里的业务后端。测试工作区 API 前，必须从 application.yml、application.properties、Vite 配置、启动脚本或真实启动输出确认业务端口；禁止把若水自身 API 地址当成业务地址，禁止用猜测账号反复请求。", ws.RootPath)
+	systemPrompt += " 当前工作区根目录已由 Harness 提供，不得向用户追问工作区路径；只有确实需要访问该根目录之外且尚未授权的路径时，才请求具体的外部路径授权。"
+	systemPrompt += fmt.Sprintf(
+		"\n\n任务契约（由 Harness 维护，不可忽略）：\n目标：%s\n任务类型：%s\n当前阶段：%s\n完成条件：\n- %s\n"+
+			"你不能自行决定数据库中的完成状态。停止调用工具时，Harness 会根据真实工具事件复核这些条件；缺少用户输入时必须明确列出具体缺失项。",
+		contract.Goal,
+		contract.TaskType,
+		contract.Stage,
+		strings.Join(contract.DoneWhen, "\n- "),
+	)
+	ledgerContext, err := r.hypothesisContext(ctx, input.TaskID, contract)
+	if err != nil {
+		return nil, fmt.Errorf("build hypothesis context: %w", err)
+	}
+	if ledgerContext != "" {
+		systemPrompt += "\n\n" + ledgerContext
+	}
+	plan, err := taskplan.NewStore(r.db).Get(ctx, input.TaskID, contract.Goal)
+	if err != nil {
+		return nil, fmt.Errorf("load task plan: %w", err)
+	}
+	systemPrompt += "\n\n" + renderTaskPlan(plan)
+	systemPrompt += "\n\n可用通用工具：list_dir、read_file、read_document、read_skill、write_file、run_command。文本和代码使用 read_file；PDF、DOCX、XLS/XLSX、PPTX 必须使用 read_document，并在 truncated=true 时按 nextOffset 继续读取；任务匹配已启用 Skill 时使用 read_skill 按需加载完整说明。遇到文件、目录、磁盘空间、内存使用、CPU 使用率、系统信息、Git 状态、测试结果或其他真实环境信息时，先自己选择合适的通用工具，再基于工具结果继续推理；不要猜测，也不要等待专用工具。系统信息可优先用只读命令，例如磁盘 df -h /，macOS(darwin) 内存 vm_stat 与 sysctl hw.memsize、CPU top -l 1 -s 0 -n 0，Linux 内存 free -h、CPU top -bn1，Windows 内存 wmic OS get FreePhysicalMemory,TotalVisibleMemorySize /Value、CPU wmic cpu get loadpercentage /Value。如果工具返回 command not found 或命令不适合当前系统，应继续选择当前 os 对应的替代只读命令。"
 	if isDocumentOutputRequest(input.UserInput) {
 		suggestedPath := defaultDocumentPath(ws.RootPath, currentTask.Title, input.TurnSequence)
 		systemPrompt += fmt.Sprintf("\n\n文档输出规则：用户这次像是在要求生成、整理或保存报告/文档。如果用户没有明确指定文件名或路径，请优先把最终 Markdown 内容通过 write_file 工具保存到 `%s`，不要反复追问保存路径；保存后在回复中说明文件位置。", suggestedPath)
 	}
 	return []llm.Message{
 		{Role: llm.RoleSystem, Content: systemPrompt},
-		{Role: llm.RoleUser, Content: input.UserInput},
+		buildUserMessage(input),
 	}, nil
 }
 
-func (r *Runner) collectAssistantRound(ctx context.Context, client llm.Client, messages []llm.Message, input RunTurnInput, ws workspace.Workspace, currentTask task.Task) (llm.Message, []llm.ToolCall, string, error) {
+const maxSkillCatalogChars = 12 * 1024
+
+func (r *Runner) renderSkillContext(ctx context.Context) (string, error) {
+	if r.skillStore == nil {
+		return "", nil
+	}
+	items, err := r.skillStore.ListEnabled(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(items) == 0 {
+		return "", nil
+	}
+	var output strings.Builder
+	output.WriteString("已启用的本地 Skill 目录（由用户安装并明确启用）：\n")
+	output.WriteString("当任务与某个 Skill 的名称、描述或关键词匹配时，先调用 read_skill(id) 读取完整说明，再按说明工作。Skill 不能绕过工作区边界、审批、工具校验或完成裁判。\n")
+	used := 0
+	for _, item := range items {
+		section := fmt.Sprintf("- id=%s；名称=%s；版本=%s；描述=%s；关键词=%s\n", item.ID, item.Name, item.Version, item.Description, strings.Join(item.Keywords, "、"))
+		if used+len(section) > maxSkillCatalogChars {
+			break
+		}
+		output.WriteString(section)
+		used += len(section)
+	}
+	return output.String(), nil
+}
+
+func buildUserMessage(input RunTurnInput) llm.Message {
+	content := strings.TrimSpace(input.UserInput)
+	imageParts := make([]llm.ContentPart, 0)
+	if len(input.Attachments) > 0 {
+		var attachments strings.Builder
+		attachments.WriteString("\n\n本轮附件（由用户明确上传，路径位于当前工作区内）：")
+		for _, item := range input.Attachments {
+			attachments.WriteString(fmt.Sprintf("\n- %s（%s，%d bytes）：%s", item.Name, item.MIMEType, item.Size, item.Path))
+			if item.Kind != "image" {
+				if document.SupportsPath(item.Path) {
+					attachments.WriteString(" [使用 read_document 读取内容]")
+				} else {
+					attachments.WriteString(" [使用 read_file 或合适的只读工具读取内容]")
+				}
+				continue
+			}
+			raw, err := os.ReadFile(item.Path)
+			if err != nil {
+				attachments.WriteString(" [图片当前无法读取]")
+				continue
+			}
+			imageParts = append(imageParts, llm.ContentPart{
+				Type: "image_url",
+				ImageURL: &llm.ContentImageURL{
+					URL: "data:" + item.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(raw),
+				},
+			})
+		}
+		attachments.WriteString("\nOffice/PDF 文档使用 read_document，文本和代码使用 read_file；图片已经随消息直接提供给支持视觉的模型。")
+		content += attachments.String()
+	}
+
+	message := llm.Message{Role: llm.RoleUser, Content: content}
+	if len(imageParts) > 0 {
+		message.ContentParts = append([]llm.ContentPart{{Type: "text", Text: content}}, imageParts...)
+	}
+	return message
+}
+
+func (r *Runner) appendContextRequestEstimate(ctx context.Context, input RunTurnInput, p provider.Provider, messages []llm.Message, requestTools []llm.Tool, phase int, round int) error {
+	tokenBudget := int(float64(p.ContextWindowTokens) * contextpack.DefaultBudgetRatio)
+	if tokenBudget <= 0 {
+		tokenBudget = 8192
+	}
+	return r.appendJSONEvent(ctx, input, "context.request.estimated", map[string]interface{}{
+		"estimatedTokens":     estimateChatRequestTokens(messages, requestTools),
+		"tokenBudget":         tokenBudget,
+		"contextWindowTokens": p.ContextWindowTokens,
+		"round":               round,
+		"phase":               phase,
+		"messageCount":        len(messages),
+		"toolCount":           len(requestTools),
+		"source":              "llm_request",
+	})
+}
+
+func (r *Runner) collectAssistantRound(ctx context.Context, client llm.Client, messages []llm.Message, requestTools []llm.Tool, input RunTurnInput, ws workspace.Workspace, currentTask task.Task) (llm.Message, []llm.ToolCall, string, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	stream, err := client.ChatStream(ctx, llm.ChatRequest{
 		Messages: messages,
-		Tools:    tools.Definitions(),
+		Tools:    requestTools,
 	})
 	if err != nil {
 		return llm.Message{}, nil, "", fmt.Errorf("start chat stream: %w", err)
@@ -583,9 +1057,6 @@ func (r *Runner) collectAssistantRound(ctx context.Context, client llm.Client, m
 }
 
 func toolCallKey(call llm.ToolCall) string {
-	if call.ID != "" {
-		return "id:" + call.ID
-	}
 	return fmt.Sprintf("index:%d", call.Index)
 }
 
@@ -803,7 +1274,10 @@ func buildTaskRollingSummary(ws workspace.Workspace, events []event.Event) strin
 	changedFiles := make([]turnSummaryFile, 0)
 	changedByPath := make(map[string]int)
 	validations := make([]turnSummaryCommand, 0)
+	validationByCommand := make(map[string]int)
 	failures := make([]string, 0)
+	seenUserInputs := make(map[string]struct{})
+	seenFailures := make(map[string]struct{})
 
 	for _, item := range events {
 		switch item.Type {
@@ -811,8 +1285,14 @@ func buildTaskRollingSummary(ws workspace.Workspace, events []event.Event) strin
 			var payload struct {
 				UserInput string `json:"userInput"`
 			}
-			if err := json.Unmarshal([]byte(item.PayloadJSON), &payload); err == nil && strings.TrimSpace(payload.UserInput) != "" {
-				userInputs = append(userInputs, compactSummaryLine(payload.UserInput, 160))
+			if err := json.Unmarshal([]byte(item.PayloadJSON), &payload); err == nil {
+				input := compactSummaryLine(payload.UserInput, 160)
+				if input != "" && !isGenericContinuationInput(input) {
+					if _, exists := seenUserInputs[input]; !exists {
+						seenUserInputs[input] = struct{}{}
+						userInputs = append(userInputs, input)
+					}
+				}
 			}
 		case "turn.summary":
 			var payload turnSummaryPayload
@@ -834,16 +1314,27 @@ func buildTaskRollingSummary(ws workspace.Workspace, events []event.Event) strin
 				changedFiles = append(changedFiles, file)
 			}
 			for _, validation := range payload.Validations {
-				if validation.Command != "" {
-					validations = append(validations, validation)
+				command := strings.TrimSpace(validation.Command)
+				if command == "" {
+					continue
 				}
+				if index, exists := validationByCommand[command]; exists {
+					validations[index] = validation
+					continue
+				}
+				validationByCommand[command] = len(validations)
+				validations = append(validations, validation)
 			}
 		case "turn.failed", "turn.interrupted":
 			var payload struct {
 				Message string `json:"message"`
 			}
 			if err := json.Unmarshal([]byte(item.PayloadJSON), &payload); err == nil && strings.TrimSpace(payload.Message) != "" {
-				failures = append(failures, compactSummaryLine(item.Type+": "+payload.Message, 180))
+				failure := compactSummaryLine(item.Type+": "+payload.Message, 180)
+				if _, exists := seenFailures[failure]; !exists {
+					seenFailures[failure] = struct{}{}
+					failures = append(failures, failure)
+				}
 			}
 		}
 	}
@@ -863,6 +1354,14 @@ func buildTaskRollingSummary(ws workspace.Workspace, events []event.Event) strin
 		return ""
 	}
 	return text
+}
+
+func isGenericContinuationInput(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "继续" || value == "继续任务" || value == "继续修复" {
+		return true
+	}
+	return strings.HasPrefix(value, "继续上一轮任务")
 }
 
 func writeRecentLines(out *strings.Builder, title string, values []string, limit int) {
@@ -988,15 +1487,48 @@ func looksLikeValidationCommand(command string) bool {
 	needles := []string{
 		"go test",
 		"go vet",
+		"go build",
 		"npm run build",
 		"npm test",
 		"npm run test",
+		"npm run lint",
 		"pnpm test",
 		"pnpm run build",
+		"pnpm run lint",
 		"yarn test",
 		"yarn build",
+		"yarn lint",
 		"vite build",
 		"vue-tsc",
+		"mvn test",
+		"mvn verify",
+		"mvn package",
+		"mvn compile",
+		"mvnw test",
+		"mvnw verify",
+		"mvnw package",
+		"mvnw compile",
+		"gradle test",
+		"gradle build",
+		"gradlew test",
+		"gradlew build",
+		"cargo test",
+		"cargo check",
+		"cargo build",
+		"pytest",
+		"python -m pytest",
+		"python3 -m pytest",
+		"unittest",
+		"dotnet test",
+		"dotnet build",
+		"make test",
+		"make check",
+		"verify:e2e",
+		"verify-e2e",
+		"verify:register",
+		"verify:login",
+		"verify:user_crud",
+		"acceptance",
 	}
 	for _, needle := range needles {
 		if strings.Contains(lower, needle) {
@@ -1080,7 +1612,7 @@ func stringWithDefault(value string, fallback string) string {
 	return value
 }
 
-func (r *Runner) executeToolCalls(ctx context.Context, input RunTurnInput, ws workspace.Workspace, currentTask task.Task, calls []llm.ToolCall, approvalID ...string) ([]llm.Message, bool, []toolLoopObservation, error) {
+func (r *Runner) executeToolCalls(ctx context.Context, input RunTurnInput, ws workspace.Workspace, currentTask task.Task, contract taskcontract.Contract, state *toolExecutionState, calls []llm.ToolCall, approvalID ...string) ([]llm.Message, bool, []toolLoopObservation, error) {
 	if r.toolExecutor == nil {
 		return nil, false, nil, nil
 	}
@@ -1090,9 +1622,78 @@ func (r *Runner) executeToolCalls(ctx context.Context, input RunTurnInput, ws wo
 		if err := r.ensureTurnActive(ctx, input.TurnID); err != nil {
 			return nil, false, nil, err
 		}
+		originalCall := call
+		call, normalization := normalizeToolCall(call, ws.RootPath)
+		if normalization.Corrected() {
+			if err := r.appendJSONEvent(ctx, input, "tool.call.corrected", map[string]interface{}{
+				"from":            normalization.OriginalName,
+				"to":              normalization.CanonicalName,
+				"argumentAliases": normalization.ArgumentAliases,
+				"defaulted":       normalization.Defaults,
+				"toolCallId":      call.ID,
+				"message":         "已在 Harness 边界自动归一化工具名称或参数。",
+			}); err != nil {
+				return nil, false, nil, err
+			}
+		}
+		signature := toolCallSignature(call)
+		intent := toolResourceIntent(call, ws)
+		if state != nil && isCacheableReadTool(call.Function.Name) {
+			if state.readCache == nil {
+				state.readCache = make(map[string]cachedToolResult)
+			}
+			if state.resourceCache == nil {
+				state.resourceCache = make(map[string]cachedToolResult)
+			}
+			var cached *cachedToolResult
+			cacheReason := ""
+			if item, ok := state.readCache[signature]; ok {
+				cachedCopy := item
+				cached = &cachedCopy
+				cacheReason = "same_call"
+			} else if key := resourceCacheKey(intent); key != "" {
+				if item, ok := state.resourceCache[key]; ok {
+					cachedCopy := item
+					cached = &cachedCopy
+					cacheReason = "same_resource"
+				}
+			}
+			if cached != nil {
+				if err := r.appendJSONEvent(ctx, input, "tool.call.cached", map[string]interface{}{
+					"name":        call.Function.Name,
+					"toolCallId":  call.ID,
+					"signature":   signature,
+					"contentHash": cached.fingerprint,
+					"cacheReason": cacheReason,
+					"message":     "资源未发生已知修改，复用本轮已有结果；模型应直接使用缓存结果推进。",
+				}); err != nil {
+					return nil, false, nil, err
+				}
+				toolMessages = append(toolMessages, llm.Message{
+					Role:       llm.RoleTool,
+					ToolCallID: call.ID,
+					Name:       call.Function.Name,
+					Content:    cachedToolOutputForLLM(cached.result.Output, cached.fingerprint),
+				})
+				observation, evidenceErr := r.recordToolEvidence(ctx, input, contract, call, intent, cached.result.Output, nil)
+				if evidenceErr != nil {
+					return nil, false, nil, evidenceErr
+				}
+				observations = append(observations, observation)
+				planMessage, planErr := r.assessTaskPlan(ctx, input, contract, call, cached.result, nil, observation.evidenceID)
+				if planErr != nil {
+					return nil, false, nil, planErr
+				}
+				if planMessage != "" {
+					toolMessages = append(toolMessages, llm.Message{Role: llm.RoleSystem, Content: planMessage})
+				}
+				continue
+			}
+		}
 		if err := r.appendJSONEvent(ctx, input, "tool.call.started", map[string]interface{}{
-			"name":       call.Function.Name,
-			"toolCallId": call.ID,
+			"name":         call.Function.Name,
+			"toolCallId":   call.ID,
+			"originalName": originalCall.Function.Name,
 		}); err != nil {
 			return nil, false, nil, err
 		}
@@ -1111,6 +1712,30 @@ func (r *Runner) executeToolCalls(ctx context.Context, input RunTurnInput, ws wo
 			ApprovalID: reqApprovalID,
 			ToolCallID: call.ID,
 		})
+		if code, suggestedTool, ok := tools.ErrorDetails(err); ok && suggestedTool == tools.NameListDir {
+			if appendErr := r.appendJSONEvent(ctx, input, "tool.call.corrected", map[string]interface{}{
+				"from":       call.Function.Name,
+				"to":         suggestedTool,
+				"code":       code,
+				"toolCallId": call.ID,
+			}); appendErr != nil {
+				return nil, false, nil, appendErr
+			}
+			result, err = r.toolExecutor.Execute(ctx, tools.Context{
+				Workspace: ws,
+				Task:      currentTask,
+				TurnID:    input.TurnID,
+			}, tools.Request{
+				RequestID:  input.RequestID,
+				Name:       suggestedTool,
+				Arguments:  json.RawMessage(call.Function.Arguments),
+				ApprovalID: reqApprovalID,
+				ToolCallID: call.ID,
+			})
+			if err == nil {
+				result.Output = correctedToolOutput(result.Output, call.Function.Name, suggestedTool)
+			}
+		}
 		if errors.Is(err, tools.ErrApprovalRequired) {
 			if err := r.appendJSONEvent(ctx, input, "approval.requested", map[string]interface{}{"approval": result.Approval}); err != nil {
 				return nil, false, nil, err
@@ -1118,10 +1743,19 @@ func (r *Runner) executeToolCalls(ctx context.Context, input RunTurnInput, ws wo
 			return toolMessages, true, observations, nil
 		}
 		if err != nil {
+			code, suggestedTool, retryable, structuredHint, structured := tools.ErrorMetadata(err)
+			hint := toolFailureHint(err, ws)
+			if structuredHint != "" {
+				hint = structuredHint
+			}
 			if appendErr := r.appendJSONEvent(ctx, input, "tool.failed", map[string]interface{}{
-				"name":    call.Function.Name,
-				"message": err.Error(),
-				"hint":    toolFailureHint(err, ws),
+				"name":          call.Function.Name,
+				"message":       err.Error(),
+				"hint":          hint,
+				"code":          code,
+				"suggestedTool": suggestedTool,
+				"retryable":     retryable,
+				"structured":    structured,
 			}); appendErr != nil {
 				return nil, false, nil, appendErr
 			}
@@ -1131,13 +1765,16 @@ func (r *Runner) executeToolCalls(ctx context.Context, input RunTurnInput, ws wo
 				Name:       call.Function.Name,
 				Content:    toolErrorContent(err, ws),
 			})
-			observations = append(observations, toolLoopObservation{
-				name:      call.Function.Name,
-				signature: toolCallSignature(call),
-				args:      strings.TrimSpace(call.Function.Arguments),
-				outcome:   "error:" + normalizeLoopMessage(err.Error()),
-			})
+			observation, evidenceErr := r.recordToolEvidence(ctx, input, contract, call, intent, nil, err)
+			if evidenceErr != nil {
+				return nil, false, nil, evidenceErr
+			}
+			observations = append(observations, observation)
 			continue
+		}
+		if state != nil && !isCacheableReadTool(call.Function.Name) {
+			clear(state.readCache)
+			clear(state.resourceCache)
 		}
 		if err := r.appendJSONEvent(ctx, input, "tool.completed", map[string]interface{}{
 			"name":   result.Name,
@@ -1151,14 +1788,109 @@ func (r *Runner) executeToolCalls(ctx context.Context, input RunTurnInput, ws wo
 			Name:       call.Function.Name,
 			Content:    stringifyToolOutputForLLM(result.Output),
 		})
-		observations = append(observations, toolLoopObservation{
-			name:      call.Function.Name,
-			signature: toolCallSignature(call),
-			args:      strings.TrimSpace(call.Function.Arguments),
-			outcome:   "ok:" + toolOutputFingerprint(result.Output),
-		})
+		if kind, suggestion, ok := toolOutputRecovery(result.Output); ok {
+			if err := r.appendJSONEvent(ctx, input, "agent.recovery.suggested", map[string]interface{}{
+				"tool":       call.Function.Name,
+				"kind":       kind,
+				"suggestion": suggestion,
+				"toolCallId": call.ID,
+			}); err != nil {
+				return nil, false, nil, err
+			}
+			toolMessages = append(toolMessages, llm.Message{
+				Role:    llm.RoleSystem,
+				Content: suggestion,
+			})
+		}
+		observation, evidenceErr := r.recordToolEvidence(ctx, input, contract, call, intent, result.Output, nil)
+		if evidenceErr != nil {
+			return nil, false, nil, evidenceErr
+		}
+		observations = append(observations, observation)
+		planMessage, planErr := r.assessTaskPlan(ctx, input, contract, call, result, nil, observation.evidenceID)
+		if planErr != nil {
+			return nil, false, nil, planErr
+		}
+		if planMessage != "" {
+			toolMessages = append(toolMessages, llm.Message{Role: llm.RoleSystem, Content: planMessage})
+		}
+		if state != nil && isCacheableReadTool(call.Function.Name) {
+			cached := cachedToolResult{
+				result:      result,
+				fingerprint: toolOutputFingerprint(result.Output),
+			}
+			state.readCache[toolCallSignature(call)] = cached
+			cacheIntent := intent
+			if values, ok := result.Output.(map[string]interface{}); ok && stringFromMap(values, "correctedTo") == tools.NameListDir {
+				cacheIntent.Kind = "directory"
+			}
+			if key := resourceCacheKey(cacheIntent); key != "" {
+				state.resourceCache[key] = cached
+			}
+		}
 	}
 	return toolMessages, false, observations, nil
+}
+
+func newToolExecutionState() *toolExecutionState {
+	return &toolExecutionState{
+		readCache:     make(map[string]cachedToolResult),
+		resourceCache: make(map[string]cachedToolResult),
+	}
+}
+
+func normalizeToolCall(call llm.ToolCall, workspaceRoot string) (llm.ToolCall, tools.Normalization) {
+	req, normalization := tools.NormalizeRequest(tools.Request{
+		Name:      call.Function.Name,
+		Arguments: json.RawMessage(call.Function.Arguments),
+	}, workspaceRoot)
+	call.Function.Name = req.Name
+	call.Function.Arguments = string(req.Arguments)
+	return call, normalization
+}
+
+func resourceCacheKey(intent resourceIntent) string {
+	if intent.Resource == "" || (intent.Kind != "file" && intent.Kind != "directory") {
+		return ""
+	}
+	return intent.Kind + "|" + filepath.Clean(intent.Resource)
+}
+
+func isCacheableReadTool(name string) bool {
+	return name == tools.NameReadFile || name == tools.NameListDir
+}
+
+func cachedToolOutputForLLM(output interface{}, fingerprint string) string {
+	value := map[string]interface{}{
+		"cached":      true,
+		"contentHash": fingerprint,
+		"message":     "该资源在本轮没有已知修改，以下是此前读取到的真实结果；直接复用它推进，不要继续重复读取。",
+		"output":      output,
+	}
+	if outputMap, ok := output.(map[string]interface{}); ok {
+		if path := stringFromMap(outputMap, "path"); path != "" {
+			value["path"] = path
+		}
+	}
+	return stringifyToolOutputForLLM(value)
+}
+
+func correctedToolOutput(output interface{}, from string, to string) interface{} {
+	value, ok := output.(map[string]interface{})
+	if !ok {
+		return map[string]interface{}{
+			"output":        output,
+			"correctedFrom": from,
+			"correctedTo":   to,
+		}
+	}
+	corrected := make(map[string]interface{}, len(value)+2)
+	for key, item := range value {
+		corrected[key] = item
+	}
+	corrected["correctedFrom"] = from
+	corrected["correctedTo"] = to
+	return corrected
 }
 
 func toolCallSignature(call llm.ToolCall) string {
@@ -1179,16 +1911,65 @@ func normalizeLoopMessage(value string) string {
 }
 
 func toolFailureHint(err error, ws workspace.Workspace) string {
+	if _, _, _, hint, ok := tools.ErrorMetadata(err); ok && hint != "" {
+		return hint
+	}
 	if errors.Is(err, sandbox.ErrAccessDenied) {
 		return "只能访问工作区根目录 " + ws.RootPath + " 或已经授权的外部路径；不要重复尝试未授权绝对路径。"
 	}
+	if code, suggestedTool, _, _, ok := tools.ErrorMetadata(err); ok {
+		switch code {
+		case "target_is_directory":
+			return "目标是目录，请改用 " + suggestedTool + " 查看目录内容。"
+		case "missing_path":
+			return "先使用 " + stringWithDefault(suggestedTool, tools.NameListDir) + " 确认工作区内的具体路径。"
+		case "invalid_arguments":
+			return "修正参数 JSON，并使用工具定义中的标准字段名后重试。"
+		}
+	}
 	return ""
+}
+
+func toolOutputRecovery(output interface{}) (kind string, suggestion string, ok bool) {
+	values, exists := output.(map[string]interface{})
+	if !exists || values == nil {
+		return "", "", false
+	}
+	if success, exists := values["success"]; exists {
+		if value, isBool := success.(bool); !isBool || value {
+			return "", "", false
+		}
+	} else if stringFromMap(values, "error") == "" {
+		return "", "", false
+	}
+	command := stringFromMap(values, "command")
+	errorKind := stringFromMap(values, "errorKind")
+	hint := stringFromMap(values, "hint")
+	switch errorKind {
+	case "timeout":
+		return "timeout", fmt.Sprintf("命令 `%s` 超时。不要原样重试；请拆分为更小的检查或测试，缩小范围并设置明确的 timeoutMs。", command), true
+	case "canceled":
+		return "canceled", "命令被取消。请确认当前任务仍在运行，再选择一个可在前台结束的短命令继续。", true
+	}
+	if hint != "" {
+		return "command_recovery", "命令未成功，禁止原样重试。请按 Harness 提供的替代建议执行：" + hint, true
+	}
+	if command != "" {
+		return "command_failure", fmt.Sprintf("命令 `%s` 未成功。请先读取失败输出涉及的文件或配置，修正原因后再运行同一个验证；不要连续重复失败命令。", command), true
+	}
+	return "command_failure", "工具返回 success=false。请根据错误输出切换到具体的替代路径，不要原样重试。", true
 }
 
 func toolErrorContent(err error, ws workspace.Workspace) string {
 	hint := toolFailureHint(err, ws)
 	payload := map[string]interface{}{
-		"error": err.Error(),
+		"error":   err.Error(),
+		"success": false,
+	}
+	if code, suggestedTool, retryable, _, ok := tools.ErrorMetadata(err); ok {
+		payload["code"] = code
+		payload["suggestedTool"] = suggestedTool
+		payload["retryable"] = retryable
 	}
 	if hint != "" {
 		payload["hint"] = hint
@@ -1213,6 +1994,10 @@ func renderContextPack(pack contextpack.Pack) string {
 		out.WriteString(item.Path)
 		out.WriteString("\n摘要: ")
 		out.WriteString(item.Summary)
+		if item.MatchReason != "" {
+			out.WriteString("\n命中原因: ")
+			out.WriteString(item.MatchReason)
+		}
 		out.WriteString("\n")
 	}
 	if pack.Truncated {
@@ -1273,7 +2058,7 @@ func (r *Runner) turnStopped(ctx context.Context, turnID string) (bool, error) {
 		return false, err
 	}
 	switch turn.Status {
-	case task.TurnStatusInterrupted, task.TurnStatusCompleted, task.TurnStatusFailed:
+	case task.TurnStatusBlocked, task.TurnStatusPaused, task.TurnStatusInterrupted, task.TurnStatusCompleted, task.TurnStatusFailed:
 		return true, nil
 	default:
 		return false, nil
@@ -1281,11 +2066,16 @@ func (r *Runner) turnStopped(ctx context.Context, turnID string) (bool, error) {
 }
 
 func (r *Runner) appendJSONEvent(ctx context.Context, input RunTurnInput, eventType string, payload map[string]interface{}) error {
+	_, err := r.appendJSONEventResult(ctx, input, eventType, payload)
+	return err
+}
+
+func (r *Runner) appendJSONEventResult(ctx context.Context, input RunTurnInput, eventType string, payload map[string]interface{}) (event.Event, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("encode event payload: %w", err)
+		return event.Event{}, fmt.Errorf("encode event payload: %w", err)
 	}
-	_, err = r.appendEvent(ctx, event.AppendInput{
+	item, err := r.appendEvent(ctx, event.AppendInput{
 		RequestID:   input.RequestID,
 		WorkspaceID: input.WorkspaceID,
 		TaskID:      input.TaskID,
@@ -1293,7 +2083,7 @@ func (r *Runner) appendJSONEvent(ctx context.Context, input RunTurnInput, eventT
 		Type:        eventType,
 		PayloadJSON: string(raw),
 	})
-	return err
+	return item, err
 }
 
 func selectProvider(ctx context.Context, store *provider.Store, ws workspace.Workspace) (provider.Provider, error) {

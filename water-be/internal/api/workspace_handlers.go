@@ -587,6 +587,11 @@ func contentDispositionAttachment(filename string) string {
 	return fmt.Sprintf(`attachment; filename=%q; filename*=UTF-8''%s`, fallback, url.PathEscape(filename))
 }
 
+func contentDispositionInline(filename string) string {
+	fallback := strings.NewReplacer("\\", "_", `"`, "_", "\r", "_", "\n", "_").Replace(filename)
+	return fmt.Sprintf(`inline; filename=%q; filename*=UTF-8''%s`, fallback, url.PathEscape(filename))
+}
+
 func safeDownloadName(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {

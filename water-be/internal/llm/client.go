@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -35,11 +36,44 @@ type ModelOption struct {
 }
 
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	Name       string     `json:"name,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	Role         string        `json:"role"`
+	Content      string        `json:"-"`
+	ContentParts []ContentPart `json:"-"`
+	Name         string        `json:"name,omitempty"`
+	ToolCallID   string        `json:"tool_call_id,omitempty"`
+	ToolCalls    []ToolCall    `json:"tool_calls,omitempty"`
+}
+
+type ContentPart struct {
+	Type     string           `json:"type"`
+	Text     string           `json:"text,omitempty"`
+	ImageURL *ContentImageURL `json:"image_url,omitempty"`
+}
+
+type ContentImageURL struct {
+	URL string `json:"url"`
+}
+
+func (m Message) MarshalJSON() ([]byte, error) {
+	var content interface{}
+	if len(m.ContentParts) > 0 {
+		content = m.ContentParts
+	} else if m.Content != "" {
+		content = m.Content
+	}
+	return json.Marshal(struct {
+		Role       string      `json:"role"`
+		Content    interface{} `json:"content,omitempty"`
+		Name       string      `json:"name,omitempty"`
+		ToolCallID string      `json:"tool_call_id,omitempty"`
+		ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
+	}{
+		Role:       m.Role,
+		Content:    content,
+		Name:       m.Name,
+		ToolCallID: m.ToolCallID,
+		ToolCalls:  m.ToolCalls,
+	})
 }
 
 type ToolCall struct {
@@ -88,8 +122,9 @@ type ChatEvent struct {
 }
 
 type OpenAIClient struct {
-	provider provider.Provider
-	http     *http.Client
+	provider   provider.Provider
+	http       *http.Client
+	streamHTTP *http.Client
 }
 
 func NewOpenAIClient(p provider.Provider) (*OpenAIClient, error) {
@@ -106,10 +141,15 @@ func NewOpenAIClient(p provider.Provider) (*OpenAIClient, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
+	streamTransport := http.DefaultTransport.(*http.Transport).Clone()
+	streamTransport.DialContext = (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext
+	streamTransport.TLSHandshakeTimeout = timeout
+	streamTransport.ResponseHeaderTimeout = timeout
 
 	return &OpenAIClient{
-		provider: p,
-		http:     &http.Client{Timeout: timeout},
+		provider:   p,
+		http:       &http.Client{Timeout: timeout},
+		streamHTTP: &http.Client{Transport: streamTransport},
 	}, nil
 }
 
@@ -161,7 +201,7 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan 
 		return nil, err
 	}
 
-	resp, err := c.http.Do(httpReq)
+	resp, err := c.streamHTTP.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("chat stream request failed: %w", err)
 	}
@@ -174,16 +214,17 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan 
 	go func() {
 		defer close(events)
 		defer resp.Body.Close()
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			select {
-			case <-ctx.Done():
-				_ = resp.Body.Close()
-			case <-done:
-			}
-		}()
-		readOpenAIStream(ctx, resp.Body, events)
+
+		idleTimeout := time.Duration(c.provider.StreamIdleTimeoutMS) * time.Millisecond
+		if idleTimeout <= 0 {
+			idleTimeout = 60 * time.Second
+		}
+		activity := make(chan struct{}, 1)
+		monitorDone := make(chan struct{})
+		idleExpired := make(chan struct{})
+		go monitorStreamIdle(ctx, resp.Body, idleTimeout, activity, monitorDone, idleExpired)
+		readOpenAIStream(ctx, resp.Body, events, activity, idleExpired, idleTimeout)
+		close(monitorDone)
 	}()
 
 	return events, nil
@@ -330,7 +371,33 @@ func checkOpenAIResponse(resp *http.Response) error {
 	return fmt.Errorf("provider returned HTTP %d: %s", resp.StatusCode, message)
 }
 
-func readOpenAIStream(ctx context.Context, body io.Reader, events chan<- ChatEvent) {
+func monitorStreamIdle(ctx context.Context, body io.Closer, timeout time.Duration, activity <-chan struct{}, done <-chan struct{}, expired chan<- struct{}) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			_ = body.Close()
+			return
+		case <-done:
+			return
+		case <-activity:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(timeout)
+		case <-timer.C:
+			close(expired)
+			_ = body.Close()
+			return
+		}
+	}
+}
+
+func readOpenAIStream(ctx context.Context, body io.Reader, events chan<- ChatEvent, activity chan<- struct{}, idleExpired <-chan struct{}, idleTimeout time.Duration) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -367,6 +434,10 @@ func readOpenAIStream(ctx context.Context, body io.Reader, events chan<- ChatEve
 
 	for scanner.Scan() {
 		select {
+		case activity <- struct{}{}:
+		default:
+		}
+		select {
 		case <-ctx.Done():
 			events <- ChatEvent{Type: "error", Err: ctx.Err()}
 			return
@@ -387,6 +458,12 @@ func readOpenAIStream(ctx context.Context, body io.Reader, events chan<- ChatEve
 	if err := ctx.Err(); err != nil {
 		events <- ChatEvent{Type: "error", Err: err}
 		return
+	}
+	select {
+	case <-idleExpired:
+		events <- ChatEvent{Type: "error", Err: fmt.Errorf("模型流式响应空闲超时：连续 %s 未收到新数据", idleTimeout)}
+		return
+	default:
 	}
 	if err := scanner.Err(); err != nil {
 		events <- ChatEvent{Type: "error", Err: fmt.Errorf("read stream: %w", err)}

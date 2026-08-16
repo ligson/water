@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -58,6 +59,110 @@ func TestTaskTurnEventFlow(t *testing.T) {
 	}
 	if events.Data.Items[0].Sequence != 1 || events.Data.Items[1].Sequence != 2 {
 		t.Fatalf("expected event sequences 1,2 got %d,%d", events.Data.Items[0].Sequence, events.Data.Items[1].Sequence)
+	}
+}
+
+func TestTaskTurnStoresUploadedImageAttachment(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".git", "info"), 0o755); err != nil {
+		t.Fatalf("create git info: %v", err)
+	}
+	db := openTestDB(t)
+	defer db.Close()
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws := createWorkspaceForTest(t, handler, "Water", root, "request_approval")
+	createdTask := createTaskForTest(t, handler, ws.ID, "Inspect image")
+	body := `{"userInput":"看看这张图","attachments":[{"name":"screen.png","mimeType":"image/png","dataUrl":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}]}`
+	rec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope turnEnvelope
+	decodeTestEnvelope(t, rec, &envelope)
+	stored, err := task.NewStore(db).GetTurn(context.Background(), envelope.Data.ID)
+	if err != nil {
+		t.Fatalf("get stored turn: %v", err)
+	}
+	if len(stored.Attachments) != 1 {
+		t.Fatalf("expected one attachment, got %#v", stored.Attachments)
+	}
+	attachment := stored.Attachments[0]
+	if attachment.Name != "screen.png" || attachment.MIMEType != "image/png" || attachment.Kind != "image" {
+		t.Fatalf("unexpected attachment metadata: %#v", attachment)
+	}
+	if !strings.HasPrefix(attachment.Path, filepath.Join(root, ".water", "attachments", createdTask.ID)) {
+		t.Fatalf("expected attachment inside workspace storage, got %q", attachment.Path)
+	}
+	if _, err := os.Stat(attachment.Path); err != nil {
+		t.Fatalf("expected stored attachment file: %v", err)
+	}
+	exclude, err := os.ReadFile(filepath.Join(root, ".git", "info", "exclude"))
+	if err != nil {
+		t.Fatalf("read local git exclude: %v", err)
+	}
+	if !strings.Contains(string(exclude), ".water/attachments/") {
+		t.Fatalf("expected attachment directory in local git exclude, got %q", string(exclude))
+	}
+}
+
+func TestFailedAttachmentBatchKeepsExistingFiles(t *testing.T) {
+	root := t.TempDir()
+	valid := []turnAttachmentRequest{{
+		Name:     "first.txt",
+		MIMEType: "text/plain",
+		DataURL:  "data:text/plain;base64,aGVsbG8=",
+	}}
+	stored, _, err := storeTurnAttachments(root, "task-1", valid)
+	if err != nil {
+		t.Fatalf("store first attachment: %v", err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("expected first attachment, got %#v", stored)
+	}
+
+	_, _, err = storeTurnAttachments(root, "task-1", []turnAttachmentRequest{{
+		Name:     "broken.txt",
+		MIMEType: "text/plain",
+		DataURL:  "not-a-data-url",
+	}})
+	if err == nil {
+		t.Fatal("expected invalid attachment batch to fail")
+	}
+	if _, err := os.Stat(stored[0].Path); err != nil {
+		t.Fatalf("expected prior attachment to survive failed batch: %v", err)
+	}
+}
+
+func TestTaskAttachmentForcesNonImageDownload(t *testing.T) {
+	root := t.TempDir()
+	db := openTestDB(t)
+	defer db.Close()
+
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ws := createWorkspaceForTest(t, handler, "Water", root, "request_approval")
+	createdTask := createTaskForTest(t, handler, ws.ID, "Inspect file")
+	body := `{"userInput":"查看文件","attachments":[{"name":"page.html","mimeType":"text/html","dataUrl":"data:text/html;base64,PGgxPmhlbGxvPC9oMT4="}]}`
+	rec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope turnEnvelope
+	decodeTestEnvelope(t, rec, &envelope)
+	stored, err := task.NewStore(db).GetTurn(context.Background(), envelope.Data.ID)
+	if err != nil {
+		t.Fatalf("get stored turn: %v", err)
+	}
+
+	download := performJSON(handler, http.MethodGet, "/api/tasks/"+createdTask.ID+"/attachments?id="+stored.Attachments[0].ID, "")
+	if download.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", download.Code, download.Body.String())
+	}
+	if disposition := download.Header().Get("Content-Disposition"); !strings.HasPrefix(disposition, "attachment;") {
+		t.Fatalf("expected attachment disposition, got %q", disposition)
+	}
+	if got := download.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("expected nosniff header, got %q", got)
 	}
 }
 
@@ -203,7 +308,304 @@ func TestAgentLoopExecutesReadOnlyToolCall(t *testing.T) {
 	}
 }
 
-func TestAgentLoopRepeatedSameOutputInterruptsTurn(t *testing.T) {
+func TestAgentLoopCorrectsReadFileDirectoryToListDir(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte("evidence"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	var requestCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode llm body: %v", err)
+		}
+		count := atomic.AddInt32(&requestCount, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if count == 1 {
+			chunk := map[string]interface{}{
+				"choices": []map[string]interface{}{{
+					"delta": map[string]interface{}{
+						"tool_calls": []map[string]interface{}{{
+							"index": 0,
+							"id":    "call_read_directory",
+							"type":  "function",
+							"function": map[string]interface{}{
+								"name":      "read_file",
+								"arguments": `{"path":"` + root + `"}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			}
+			raw, _ := json.Marshal(chunk)
+			_, _ = w.Write([]byte("data: " + string(raw) + "\n\ndata: [DONE]\n\n"))
+			return
+		}
+		messagesRaw, _ := json.Marshal(body["messages"])
+		if !strings.Contains(string(messagesRaw), "note.txt") {
+			t.Fatalf("expected corrected directory listing in model context, got %s", messagesRaw)
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"目录中包含 note.txt。\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer llmServer.Close()
+
+	db := openTestDB(t)
+	defer db.Close()
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	provider := createProviderForTestWithBaseURL(t, handler, "Local", llmServer.URL+"/v1", true)
+	ws := createWorkspaceForTestWithProvider(t, handler, "Water", root, "request_approval", provider.ID)
+	createdTask := createTaskForTest(t, handler, ws.ID, "Directory correction")
+
+	turnRec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", `{"userInput":"查看工作区目录内容"}`)
+	if turnRec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", turnRec.Code, turnRec.Body.String())
+	}
+	events := waitTaskEvents(t, handler, createdTask.ID, "turn.completed")
+	if !hasEventType(events, "tool.call.corrected") {
+		t.Fatalf("expected tool.call.corrected event, got %#v", events)
+	}
+	if hasEventType(events, "tool.failed") {
+		t.Fatalf("expected corrected directory call not to fail")
+	}
+}
+
+func TestAgentLoopCompactsToolHistoryAndForcesFinalResponse(t *testing.T) {
+	const defaultAgentToolRoundsForTest = 24
+
+	root := t.TempDir()
+	for index := 1; index < defaultAgentToolRoundsForTest; index++ {
+		content := fmt.Sprintf("evidence-%02d %s", index, strings.Repeat(fmt.Sprintf("line-%02d ", index), 220))
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("evidence-%02d.log", index)), []byte(content), 0o644); err != nil {
+			t.Fatalf("write evidence fixture: %v", err)
+		}
+	}
+
+	var requestCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode llm body: %v", err)
+		}
+		count := int(atomic.AddInt32(&requestCount, 1))
+		w.Header().Set("Content-Type", "text/event-stream")
+		if count < defaultAgentToolRoundsForTest {
+			if toolsValue, ok := body["tools"].([]interface{}); !ok || len(toolsValue) == 0 {
+				t.Fatalf("expected tools before final request %d, got %#v", count, body["tools"])
+			}
+			arguments, _ := json.Marshal(map[string]interface{}{
+				"path": filepath.Join(root, fmt.Sprintf("evidence-%02d.log", count)),
+			})
+			chunk := map[string]interface{}{
+				"choices": []map[string]interface{}{{
+					"delta": map[string]interface{}{
+						"tool_calls": []map[string]interface{}{{
+							"index": 0,
+							"id":    fmt.Sprintf("call-%02d", count),
+							"type":  "function",
+							"function": map[string]interface{}{
+								"name":      "read_file",
+								"arguments": string(arguments),
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			}
+			raw, _ := json.Marshal(chunk)
+			_, _ = w.Write([]byte("data: " + string(raw) + "\n\ndata: [DONE]\n\n"))
+			return
+		}
+
+		if _, ok := body["tools"]; ok {
+			t.Fatalf("expected tools to be disabled on final request, got %#v", body["tools"])
+		}
+		messagesRaw, _ := json.Marshal(body["messages"])
+		if !strings.Contains(string(messagesRaw), "工具已关闭") {
+			t.Fatalf("expected forced final instruction, got %s", messagesRaw)
+		}
+		if !strings.Contains(string(messagesRaw), "本轮较早的工具上下文已压缩") {
+			t.Fatalf("expected compacted tool history, got %s", messagesRaw)
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"结论：已根据现有证据完成收敛。\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer llmServer.Close()
+
+	db := openTestDB(t)
+	defer db.Close()
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	provider := createProviderForTestWithBaseURL(t, handler, "Local", llmServer.URL+"/v1", true)
+	ws := createWorkspaceForTestWithProvider(t, handler, "Water", root, "request_approval", provider.ID)
+	createdTask := createTaskForTest(t, handler, ws.ID, "Agent context convergence")
+
+	turnRec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", `{"userInput":"持续检查后给出结论"}`)
+	if turnRec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", turnRec.Code, turnRec.Body.String())
+	}
+	events := waitTaskEvents(t, handler, createdTask.ID, "turn.completed")
+	if got := atomic.LoadInt32(&requestCount); got != defaultAgentToolRoundsForTest {
+		t.Fatalf("expected %d model requests, got %d", defaultAgentToolRoundsForTest, got)
+	}
+	if !hasEventType(events, "context.turn.compacted") {
+		t.Fatalf("expected context.turn.compacted event")
+	}
+	if hasEventType(events, "turn.interrupted") {
+		t.Fatalf("expected forced final response to complete instead of interrupt")
+	}
+}
+
+func TestAgentLoopContinuesWhenFinalRoundStillRequestsTool(t *testing.T) {
+	const firstPhaseRounds = 24
+	root := t.TempDir()
+	for index := 1; index < firstPhaseRounds; index++ {
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("phase-evidence-%02d.txt", index)), []byte(fmt.Sprintf("evidence-%02d", index)), 0o644); err != nil {
+			t.Fatalf("write phase fixture: %v", err)
+		}
+	}
+
+	var requestCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode llm body: %v", err)
+		}
+		count := int(atomic.AddInt32(&requestCount, 1))
+		w.Header().Set("Content-Type", "text/event-stream")
+		if count <= firstPhaseRounds {
+			arguments, _ := json.Marshal(map[string]interface{}{
+				"path": filepath.Join(root, fmt.Sprintf("phase-evidence-%02d.txt", min(count, firstPhaseRounds-1))),
+			})
+			chunk := map[string]interface{}{
+				"choices": []map[string]interface{}{{
+					"delta": map[string]interface{}{
+						"tool_calls": []map[string]interface{}{{
+							"index": 0,
+							"id":    fmt.Sprintf("call-phase-%02d", count),
+							"type":  "function",
+							"function": map[string]interface{}{
+								"name":      "read_file",
+								"arguments": string(arguments),
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			}
+			raw, _ := json.Marshal(chunk)
+			_, _ = w.Write([]byte("data: " + string(raw) + "\n\ndata: [DONE]\n\n"))
+			return
+		}
+
+		messagesRaw, _ := json.Marshal(body["messages"])
+		if !strings.Contains(string(messagesRaw), "自动续跑的第 2 个执行阶段") {
+			t.Fatalf("expected clean phase restart instruction, got %s", messagesRaw)
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"已基于持久化计划重新规划并给出结论。\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer llmServer.Close()
+
+	db := openTestDB(t)
+	defer db.Close()
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	provider := createProviderForTestWithBaseURL(t, handler, "Local", llmServer.URL+"/v1", true)
+	ws := createWorkspaceForTestWithProvider(t, handler, "Water", root, "request_approval", provider.ID)
+	createdTask := createTaskForTest(t, handler, ws.ID, "Final tool call recovery")
+
+	turnRec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", `{"userInput":"持续检查后给出分析结论"}`)
+	if turnRec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", turnRec.Code, turnRec.Body.String())
+	}
+	events := waitTaskEvents(t, handler, createdTask.ID, "turn.completed")
+	if got := atomic.LoadInt32(&requestCount); got != firstPhaseRounds+1 {
+		t.Fatalf("expected final tool request plus one continued phase request, got %d", got)
+	}
+	if !hasEventType(events, "agent.final_tool_calls.deferred") || !hasEventType(events, "agent.deferred_tool_calls.executing") || !hasEventType(events, "agent.execution.phase.continued") {
+		t.Fatalf("expected final tool recovery events, got %#v", events)
+	}
+	if hasEventType(events, "turn.failed") {
+		t.Fatalf("expected automatic phase continuation instead of failure")
+	}
+}
+
+func TestAgentLoopPausesAfterAllExecutionPhasesAndAllowsNextTurn(t *testing.T) {
+	const totalRoundBudget = 24 + 8 + 8
+	root := t.TempDir()
+	for index := 1; index <= totalRoundBudget; index++ {
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("bounded-evidence-%02d.txt", index)), []byte(fmt.Sprintf("evidence-%02d", index)), 0o644); err != nil {
+			t.Fatalf("write bounded execution fixture: %v", err)
+		}
+	}
+
+	var requestCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := int(atomic.AddInt32(&requestCount, 1))
+		arguments, _ := json.Marshal(map[string]interface{}{
+			"path": filepath.Join(root, fmt.Sprintf("bounded-evidence-%02d.txt", min(count, totalRoundBudget))),
+		})
+		chunk := map[string]interface{}{
+			"choices": []map[string]interface{}{{
+				"delta": map[string]interface{}{
+					"tool_calls": []map[string]interface{}{{
+						"index": 0,
+						"id":    fmt.Sprintf("call-bounded-%02d", count),
+						"type":  "function",
+						"function": map[string]interface{}{
+							"name":      "read_file",
+							"arguments": string(arguments),
+						},
+					}},
+				},
+				"finish_reason": "tool_calls",
+			}},
+		}
+		raw, _ := json.Marshal(chunk)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + string(raw) + "\n\ndata: [DONE]\n\n"))
+	}))
+	defer llmServer.Close()
+
+	db := openTestDB(t)
+	defer db.Close()
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	provider := createProviderForTestWithBaseURL(t, handler, "Local", llmServer.URL+"/v1", true)
+	ws := createWorkspaceForTestWithProvider(t, handler, "Water", root, "request_approval", provider.ID)
+	createdTask := createTaskForTest(t, handler, ws.ID, "Bounded execution pause")
+
+	turnRec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", `{"userInput":"持续检查全部证据，满足条件后再结束"}`)
+	if turnRec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", turnRec.Code, turnRec.Body.String())
+	}
+	var createdTurn turnEnvelope
+	decodeTestEnvelope(t, turnRec, &createdTurn)
+	events := waitTaskEvents(t, handler, createdTask.ID, "turn.paused")
+	if got := int(atomic.LoadInt32(&requestCount)); got != totalRoundBudget+1 {
+		t.Fatalf("expected %d bounded requests plus one final judgment, got %d", totalRoundBudget, got)
+	}
+	if hasEventType(events, "turn.failed") || hasEventType(events, "turn.completed") {
+		t.Fatalf("expected incomplete task to pause without failure or completion")
+	}
+
+	pausedTurn, err := task.NewStore(db).GetTurn(context.Background(), createdTurn.Data.ID)
+	if err != nil {
+		t.Fatalf("get paused turn: %v", err)
+	}
+	if pausedTurn.Status != task.TurnStatusPaused || pausedTurn.CompletedAt == nil {
+		t.Fatalf("expected terminal paused turn, got %#v", pausedTurn)
+	}
+	nextTurn, err := task.NewStore(db).CreateTurn(context.Background(), task.CreateTurnInput{
+		TaskID:    createdTask.ID,
+		UserInput: "继续当前任务",
+	})
+	if err != nil {
+		t.Fatalf("create continuation turn after pause: %v", err)
+	}
+	if nextTurn.Sequence != 2 {
+		t.Fatalf("expected continuation sequence 2, got %d", nextTurn.Sequence)
+	}
+}
+
+func TestAgentLoopRepeatedSameOutputForcesFinalResponse(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte("loop"), 0o644); err != nil {
 		t.Fatalf("write fixture: %v", err)
@@ -214,8 +616,23 @@ func TestAgentLoopRepeatedSameOutputInterruptsTurn(t *testing.T) {
 		if r.URL.Path != "/v1/chat/completions" {
 			t.Fatalf("unexpected llm path %s", r.URL.Path)
 		}
-		atomic.AddInt32(&requestCount, 1)
+		count := atomic.AddInt32(&requestCount, 1)
 		w.Header().Set("Content-Type", "text/event-stream")
+		if count == 4 {
+			var body map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode final request: %v", err)
+			}
+			if _, ok := body["tools"]; ok {
+				t.Fatalf("expected tools disabled after repeated output")
+			}
+			messagesRaw, _ := json.Marshal(body["messages"])
+			if !strings.Contains(string(messagesRaw), "工具循环保护已触发") {
+				t.Fatalf("expected loop guard final instruction, got %s", messagesRaw)
+			}
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"目录结果没有变化，停止重复检查。\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+			return
+		}
 		chunk := map[string]interface{}{
 			"choices": []map[string]interface{}{
 				{
@@ -257,40 +674,100 @@ func TestAgentLoopRepeatedSameOutputInterruptsTurn(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if atomic.LoadInt32(&requestCount) >= 6 {
+		if atomic.LoadInt32(&requestCount) >= 4 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if got := atomic.LoadInt32(&requestCount); got != 6 {
-		t.Fatalf("expected 6 llm requests before reading events, got %d", got)
+	if got := atomic.LoadInt32(&requestCount); got != 4 {
+		t.Fatalf("expected 3 tool rounds and one final request, got %d", got)
 	}
 
-	events := waitTaskEvents(t, handler, createdTask.ID, "turn.interrupted")
+	events := waitTaskEvents(t, handler, createdTask.ID, "turn.completed")
 	if hasEventType(events, "turn.failed") {
-		t.Fatalf("expected repeated tool output to interrupt instead of fail, got %#v", events)
+		t.Fatalf("expected repeated tool output to finalize instead of fail, got %#v", events)
 	}
-	var interruptedPayload map[string]interface{}
+	if hasEventType(events, "turn.interrupted") {
+		t.Fatalf("expected repeated tool output to produce a final response instead of interrupt")
+	}
+	if !hasEventType(events, "agent.loop.guard.triggered") {
+		t.Fatalf("expected loop guard observability event")
+	}
+	var completedPayload map[string]interface{}
 	for _, item := range events {
-		if item.Type == "turn.interrupted" {
-			interruptedPayload = item.Payload()
+		if item.Type == "turn.completed" {
+			completedPayload = item.Payload()
 			break
 		}
 	}
-	message, ok := interruptedPayload["message"].(string)
-	if !ok || !strings.Contains(message, "没有新的信息") {
-		t.Fatalf("expected Chinese interruption message, got %#v", interruptedPayload)
-	}
-	if interruptedPayload["reason"] != "tool_repeated_output" || interruptedPayload["canContinue"] != true {
-		t.Fatalf("expected continuable repeated-output payload, got %#v", interruptedPayload)
-	}
-	prompt, ok := interruptedPayload["continuationPrompt"].(string)
-	if !ok || !strings.Contains(prompt, "换一个新的检查点") {
-		t.Fatalf("expected continuation prompt, got %#v", interruptedPayload)
+	if completedPayload["forcedFinal"] != true || completedPayload["forcedFinalReason"] != "semantic_no_progress" {
+		t.Fatalf("expected forced final completion payload, got %#v", completedPayload)
 	}
 }
 
-func TestAgentLoopRepeatedPathFailureInterruptsTurn(t *testing.T) {
+func TestAgentLoopGuardPausesWhenFinalEvidenceIsInsufficient(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte("loop"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	var requestCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected llm path %s", r.URL.Path)
+		}
+		count := atomic.AddInt32(&requestCount, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if count == 4 {
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"目前还没有完成实现，也没有通过验收。\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+			return
+		}
+		chunk := map[string]interface{}{
+			"choices": []map[string]interface{}{{
+				"delta": map[string]interface{}{
+					"tool_calls": []map[string]interface{}{{
+						"index": 0,
+						"id":    "call_list_dir",
+						"type":  "function",
+						"function": map[string]interface{}{
+							"name":      "list_dir",
+							"arguments": `{"path":"` + root + `"}`,
+						},
+					}},
+				},
+				"finish_reason": "tool_calls",
+			}},
+		}
+		raw, _ := json.Marshal(chunk)
+		_, _ = w.Write([]byte("data: " + string(raw) + "\n\ndata: [DONE]\n\n"))
+	}))
+	defer llmServer.Close()
+
+	db := openTestDB(t)
+	defer db.Close()
+	handler := NewRouter(db, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	provider := createProviderForTestWithBaseURL(t, handler, "Local", llmServer.URL+"/v1", true)
+	ws := createWorkspaceForTestWithProvider(t, handler, "Water", root, "request_approval", provider.ID)
+	createdTask := createTaskForTest(t, handler, ws.ID, "实现登录功能")
+
+	turnRec := performJSON(handler, http.MethodPost, "/api/tasks/"+createdTask.ID+"/turns", `{"userInput":"实现登录功能并运行测试"}`)
+	if turnRec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", turnRec.Code, turnRec.Body.String())
+	}
+
+	events := waitTaskEvents(t, handler, createdTask.ID, "turn.paused")
+	if got := atomic.LoadInt32(&requestCount); got != 4 {
+		t.Fatalf("expected 3 tool requests and one guarded final request, got %d", got)
+	}
+	if hasEventType(events, "agent.execution.phase.continued") {
+		t.Fatalf("expected loop guard to stop the turn without starting another execution phase")
+	}
+	if hasEventType(events, "turn.completed") || hasEventType(events, "turn.failed") {
+		t.Fatalf("expected insufficient evidence to pause, got %#v", events)
+	}
+}
+
+func TestAgentLoopRepeatedPathFailureBlocksForRequiredInput(t *testing.T) {
 	root := t.TempDir()
 
 	var requestCount int32
@@ -314,7 +791,7 @@ func TestAgentLoopRepeatedPathFailureInterruptsTurn(t *testing.T) {
 									"type":  "function",
 									"function": map[string]interface{}{
 										"name":      "run_command",
-										"arguments": `{"command":"ls -la /Users/ligson/workspace/dev/sdk/demo-be"}`,
+										"arguments": `{"command":"ls -la /outside/workspace/demo-be"}`,
 									},
 								},
 							},
@@ -326,6 +803,15 @@ func TestAgentLoopRepeatedPathFailureInterruptsTurn(t *testing.T) {
 			raw, _ := json.Marshal(chunk)
 			_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 3:
+			var body map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode final request: %v", err)
+			}
+			if _, ok := body["tools"]; ok {
+				t.Fatalf("expected tools disabled after repeated failure")
+			}
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"目标路径未授权，需要用户提供正确路径或授权。\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
 		default:
 			t.Fatalf("unexpected llm request count %d", count)
 		}
@@ -345,9 +831,9 @@ func TestAgentLoopRepeatedPathFailureInterruptsTurn(t *testing.T) {
 		t.Fatalf("expected status 201, got %d: %s", turnRec.Code, turnRec.Body.String())
 	}
 
-	events := waitTaskEvents(t, handler, createdTask.ID, "turn.interrupted")
-	if got := atomic.LoadInt32(&requestCount); got != 2 {
-		t.Fatalf("expected 2 llm requests before interrupt, got %d", got)
+	events := waitTaskEvents(t, handler, createdTask.ID, "turn.blocked")
+	if got := atomic.LoadInt32(&requestCount); got != 3 {
+		t.Fatalf("expected 2 tool requests and one final request, got %d", got)
 	}
 	if !hasEventType(events, "tool.failed") {
 		t.Fatalf("expected tool.failed event, got %#v", events)
@@ -365,15 +851,22 @@ func TestAgentLoopRepeatedPathFailureInterruptsTurn(t *testing.T) {
 	if hint, ok := failedPayload["hint"].(string); !ok || !strings.Contains(hint, "工作区根目录") {
 		t.Fatalf("expected path hint in failed payload, got %#v", failedPayload)
 	}
-	var interruptedPayload map[string]interface{}
+	if hasEventType(events, "turn.completed") || hasEventType(events, "turn.interrupted") {
+		t.Fatalf("expected repeated path failure to block instead of complete or interrupt")
+	}
+	if !hasEventType(events, "agent.loop.guard.triggered") {
+		t.Fatalf("expected loop guard observability event")
+	}
+	var blockedPayload map[string]interface{}
 	for _, item := range events {
-		if item.Type == "turn.interrupted" {
-			interruptedPayload = item.Payload()
+		if item.Type == "turn.blocked" {
+			blockedPayload = item.Payload()
 			break
 		}
 	}
-	if interruptedPayload["reason"] != "tool_repeated_failure" {
-		t.Fatalf("expected repeated failure reason, got %#v", interruptedPayload)
+	missingInputs, ok := blockedPayload["missingInputs"].([]interface{})
+	if !ok || len(missingInputs) == 0 {
+		t.Fatalf("expected blocked event to list missing inputs, got %#v", blockedPayload)
 	}
 }
 

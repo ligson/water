@@ -16,10 +16,27 @@ export interface Provider {
   isDefault: boolean
   enabled: boolean
   contextWindowTokens: number
+  timeoutMs: number
+  maxRetries: number
+  streamIdleTimeoutMs: number
 }
 
 export interface ProviderModelOption {
   id: string
+}
+
+export interface Skill {
+  id: string
+  name: string
+  version: string
+  description: string
+  keywords: string[]
+  source: 'upload' | 'url' | string
+  sourceUrl?: string
+  sha256: string
+  enabled: boolean
+  installedAt: string
+  updatedAt: string
 }
 
 export interface Workspace {
@@ -49,6 +66,12 @@ export interface TaskEvent {
   createdAt: string
   payload?: unknown
   payloadJson?: string
+}
+
+export interface TurnAttachmentInput {
+  name: string
+  mimeType: string
+  dataUrl: string
 }
 
 export interface Approval {
@@ -107,6 +130,8 @@ export interface AuthStatus {
   locked: boolean
   sessionExpiresAt: string
   lastUnlockedAt: string
+  pinLockedUntil: string
+  pinRetryAfterSeconds: number
 }
 
 export interface AuthSession {
@@ -137,7 +162,7 @@ export function clearAccessToken() {
 
 function buildHeaders(init?: RequestInit): HeadersInit {
   const headers = new Headers(init?.headers ?? {})
-  if (!headers.has('Content-Type')) {
+  if (!headers.has('Content-Type') && !(init?.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json')
   }
   const token = getAccessToken()
@@ -154,8 +179,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
   const body = (await res.json()) as Envelope<T>
   if (!res.ok || !body.success) {
-    const error = new Error(body.message || `HTTP ${res.status}`) as Error & { status?: number }
+    const error = new Error(body.message || `HTTP ${res.status}`) as Error & {
+      status?: number
+      data?: unknown
+    }
     error.status = res.status
+    error.data = body.data
     throw error
   }
   return body.data
@@ -211,6 +240,26 @@ export const api = {
     request<{ items: ProviderModelOption[] }>('/api/provider-models', {
       method: 'POST',
       body: JSON.stringify(body),
+    }),
+
+  listSkills: () => request<{ items: Skill[] }>('/api/skills'),
+  installSkillArchive: (file: File) => {
+    const body = new FormData()
+    body.set('file', file)
+    return request<Skill>('/api/skills', { method: 'POST', body })
+  },
+  installSkillURL: (url: string) =>
+    request<Skill>('/api/skills/install', {
+      method: 'POST',
+      body: JSON.stringify({ url }),
+    }),
+  setSkillEnabled: (skillId: string, enabled: boolean) =>
+    request<Skill>(`/api/skills/${encodeURIComponent(skillId)}/${enabled ? 'enable' : 'disable'}`, {
+      method: 'POST',
+    }),
+  deleteSkill: (skillId: string) =>
+    request<Record<string, never>>(`/api/skills/${encodeURIComponent(skillId)}`, {
+      method: 'DELETE',
     }),
 
   listWorkspaces: () => request<{ items: Workspace[] }>('/api/workspaces'),
@@ -273,10 +322,10 @@ export const api = {
     request<Record<string, never>>(`/api/tasks/${taskId}`, {
       method: 'DELETE',
     }),
-  createTurn: (taskId: string, userInput: string) =>
+  createTurn: (taskId: string, userInput: string, attachments: TurnAttachmentInput[] = []) =>
     request<{ id: string }>(`/api/tasks/${taskId}/turns`, {
       method: 'POST',
-      body: JSON.stringify({ userInput }),
+      body: JSON.stringify({ userInput, attachments }),
     }),
   cancelTask: (taskId: string) =>
     request<Record<string, never>>(`/api/tasks/${taskId}/cancel`, {
@@ -306,6 +355,15 @@ export function workspaceFileDownloadURL(workspaceId: string, path: string): str
 export function workspaceArchiveDownloadURL(workspaceId: string): string {
   const url = new URL(API_BASE || window.location.origin, window.location.origin)
   url.pathname = `/api/workspaces/${workspaceId}/archive`
+  const token = getAccessToken()
+  if (token) url.searchParams.set('accessToken', token)
+  return url.toString()
+}
+
+export function taskAttachmentURL(taskId: string, attachmentId: string): string {
+  const url = new URL(API_BASE || window.location.origin, window.location.origin)
+  url.pathname = `/api/tasks/${taskId}/attachments`
+  url.searchParams.set('id', attachmentId)
   const token = getAccessToken()
   if (token) url.searchParams.set('accessToken', token)
   return url.toString()

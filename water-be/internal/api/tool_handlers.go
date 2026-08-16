@@ -11,6 +11,7 @@ import (
 	"github.com/ligson/water/water-be/internal/event"
 	"github.com/ligson/water/water-be/internal/requestid"
 	"github.com/ligson/water/water-be/internal/sandbox"
+	"github.com/ligson/water/water-be/internal/skill"
 	"github.com/ligson/water/water-be/internal/task"
 	"github.com/ligson/water/water-be/internal/tools"
 	"github.com/ligson/water/water-be/internal/uid"
@@ -52,7 +53,11 @@ func (r *Router) executeTaskTool(w http.ResponseWriter, req *http.Request, taskI
 		input.RequestID = requestid.FromContext(req.Context())
 	}
 
-	executor := tools.NewExecutor(sandbox.NewPermissionEngine(workspace.NewStore(r.db)), approval.NewStore(r.db))
+	executor := tools.NewExecutor(
+		sandbox.NewPermissionEngine(workspace.NewStore(r.db)),
+		approval.NewStore(r.db),
+		tools.WithSkillReader(skill.NewStore(r.db, "")),
+	)
 	result, err := executor.Execute(req.Context(), tools.Context{
 		Workspace: ws,
 		Task:      currentTask,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/ligson/water/water-be/internal/agent"
@@ -22,7 +23,8 @@ type taskRequest struct {
 }
 
 type turnRequest struct {
-	UserInput string `json:"userInput"`
+	UserInput   string                  `json:"userInput"`
+	Attachments []turnAttachmentRequest `json:"attachments"`
 }
 
 func (r *Router) handleWorkspaceTasks(w http.ResponseWriter, req *http.Request, workspaceID string) {
@@ -58,6 +60,15 @@ func (r *Router) handleTaskByID(w http.ResponseWriter, req *http.Request, rest s
 			return
 		}
 		r.listTaskEvents(w, req, taskID)
+		return
+	}
+
+	if action == "attachments" {
+		if req.Method != http.MethodGet {
+			WriteError(req.Context(), w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		r.readTaskAttachment(w, req, taskID)
 		return
 	}
 
@@ -219,10 +230,31 @@ func (r *Router) createTurn(w http.ResponseWriter, req *http.Request, taskID str
 		WriteError(req.Context(), w, http.StatusInternalServerError, "get task failed")
 		return
 	}
+	ws, err := workspace.NewStore(r.db).Get(req.Context(), currentTask.WorkspaceID)
+	if err != nil {
+		r.logger.ErrorContext(req.Context(), "get workspace for turn attachments", "error", err)
+		WriteError(req.Context(), w, http.StatusInternalServerError, "get workspace failed")
+		return
+	}
+	attachments, attachmentDir, err := storeTurnAttachments(ws.RootPath, taskID, input.Attachments)
+	if err != nil {
+		WriteError(req.Context(), w, http.StatusBadRequest, err.Error())
+		return
+	}
+	keepAttachments := false
+	defer func() {
+		if !keepAttachments && attachmentDir != "" {
+			_ = os.RemoveAll(attachmentDir)
+		}
+	}()
+	if input.UserInput == "" {
+		input.UserInput = "请查看并处理本轮上传的附件。"
+	}
 
 	created, err := task.NewStore(r.db).CreateTurn(req.Context(), task.CreateTurnInput{
-		TaskID:    taskID,
-		UserInput: input.UserInput,
+		TaskID:      taskID,
+		UserInput:   input.UserInput,
+		Attachments: attachments,
 	})
 	if errors.Is(err, task.ErrTaskHasActiveTurn) {
 		WriteError(req.Context(), w, http.StatusConflict, "当前任务仍在执行，请等待完成、审批或打断后再继续")
@@ -233,14 +265,24 @@ func (r *Router) createTurn(w http.ResponseWriter, req *http.Request, taskID str
 		WriteError(req.Context(), w, http.StatusInternalServerError, "create turn failed")
 		return
 	}
+	keepAttachments = true
 
+	payload, err := json.Marshal(map[string]interface{}{
+		"sequence":    created.Sequence,
+		"userInput":   created.UserInput,
+		"attachments": created.Attachments,
+	})
+	if err != nil {
+		WriteError(req.Context(), w, http.StatusInternalServerError, "create turn event failed")
+		return
+	}
 	if _, err := r.appendTaskEvent(req.Context(), event.AppendInput{
 		RequestID:   requestid.FromContext(req.Context()),
 		WorkspaceID: currentTask.WorkspaceID,
 		TaskID:      taskID,
 		TurnID:      created.ID,
 		Type:        "turn.started",
-		PayloadJSON: `{"sequence":` + intJSON(created.Sequence) + `,"userInput":` + quoteJSON(created.UserInput) + `}`,
+		PayloadJSON: string(payload),
 	}); err != nil {
 		r.logger.ErrorContext(req.Context(), "append turn started event", "error", err)
 		WriteError(req.Context(), w, http.StatusInternalServerError, "create turn event failed")
@@ -287,6 +329,7 @@ func (r *Router) startAgentTurn(req *http.Request, currentTask task.Task, turn t
 		TurnSequence: turn.Sequence,
 		WorkspaceID:  currentTask.WorkspaceID,
 		UserInput:    turn.UserInput,
+		Attachments:  turn.Attachments,
 	}
 	go func() {
 		defer func() {
@@ -417,6 +460,49 @@ func (r *Router) listTaskEvents(w http.ResponseWriter, req *http.Request, taskID
 	WriteOK(req.Context(), w, "ok", map[string]interface{}{"items": items})
 }
 
+func (r *Router) readTaskAttachment(w http.ResponseWriter, req *http.Request, taskID string) {
+	attachmentID := strings.TrimSpace(req.URL.Query().Get("id"))
+	if attachmentID == "" {
+		WriteError(req.Context(), w, http.StatusBadRequest, "attachment id is required")
+		return
+	}
+	attachment, err := task.NewStore(r.db).GetAttachment(req.Context(), taskID, attachmentID)
+	if errors.Is(err, task.ErrNotFound) {
+		WriteError(req.Context(), w, http.StatusNotFound, "attachment not found")
+		return
+	}
+	if err != nil {
+		r.logger.ErrorContext(req.Context(), "get task attachment", "error", err)
+		WriteError(req.Context(), w, http.StatusInternalServerError, "get attachment failed")
+		return
+	}
+	file, err := os.Open(attachment.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		WriteError(req.Context(), w, http.StatusNotFound, "attachment file not found")
+		return
+	}
+	if err != nil {
+		r.logger.ErrorContext(req.Context(), "open task attachment", "error", err)
+		WriteError(req.Context(), w, http.StatusInternalServerError, "open attachment failed")
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		WriteError(req.Context(), w, http.StatusInternalServerError, "read attachment failed")
+		return
+	}
+	w.Header().Set("Content-Type", attachment.MIMEType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if attachment.Kind == "image" && strings.HasPrefix(attachment.MIMEType, "image/") {
+		w.Header().Set("Content-Disposition", contentDispositionInline(attachment.Name))
+	} else {
+		w.Header().Set("Content-Disposition", contentDispositionAttachment(attachment.Name))
+	}
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	http.ServeContent(w, req, attachment.Name, info.ModTime(), file)
+}
+
 func decodeTaskRequest(w http.ResponseWriter, req *http.Request) (taskRequest, bool) {
 	defer req.Body.Close()
 
@@ -435,15 +521,21 @@ func decodeTaskRequest(w http.ResponseWriter, req *http.Request) (taskRequest, b
 
 func decodeTurnRequest(w http.ResponseWriter, req *http.Request) (turnRequest, bool) {
 	defer req.Body.Close()
+	req.Body = http.MaxBytesReader(w, req.Body, maxTurnRequestBodyBytes)
 
 	var input turnRequest
 	if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			WriteError(req.Context(), w, http.StatusRequestEntityTooLarge, "附件请求超过 28 MiB")
+			return turnRequest{}, false
+		}
 		WriteError(req.Context(), w, http.StatusBadRequest, "invalid json body")
 		return turnRequest{}, false
 	}
 	input.UserInput = strings.TrimSpace(input.UserInput)
-	if input.UserInput == "" {
-		WriteError(req.Context(), w, http.StatusBadRequest, "userInput is required")
+	if input.UserInput == "" && len(input.Attachments) == 0 {
+		WriteError(req.Context(), w, http.StatusBadRequest, "userInput or attachments is required")
 		return turnRequest{}, false
 	}
 	return input, true
@@ -458,7 +550,7 @@ func splitTaskPath(rest string) (taskID string, action string, ok bool) {
 	if len(parts) == 1 {
 		return parts[0], "", true
 	}
-	if len(parts) == 2 && (parts[1] == "turns" || parts[1] == "events" || parts[1] == "tools" || parts[1] == "cancel") {
+	if len(parts) == 2 && (parts[1] == "turns" || parts[1] == "events" || parts[1] == "attachments" || parts[1] == "tools" || parts[1] == "cancel") {
 		return parts[0], parts[1], true
 	}
 	return "", "", false

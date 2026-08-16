@@ -3,8 +3,10 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 
 const riverbedStonesSrc = new URL('../../assets/auth/riverbed-stones.jpg', import.meta.url).href
-const topCarpSrc = new URL('../../assets/auth/fish-carp-top.png', import.meta.url).href
-const topKoiSrc = new URL('../../assets/auth/fish-koi-top.png', import.meta.url).href
+const kohakuKoiSrc = new URL('../../assets/auth/fish-koi-kohaku-right.png', import.meta.url).href
+const showaKoiSrc = new URL('../../assets/auth/fish-koi-showa-left.png', import.meta.url).href
+const yamabukiKoiSrc = new URL('../../assets/auth/fish-koi-yamabuki-right.png', import.meta.url).href
+const shiroKoiSrc = new URL('../../assets/auth/fish-koi-shiro-left.png', import.meta.url).href
 
 type WaterThemeName = 'ruoshui' | 'qingci' | 'xuanzhi' | 'zhusha' | 'xuanmo'
 
@@ -13,6 +15,22 @@ type WaterThemePalette = {
   mid: string
   glow: string
   light: string
+}
+
+type FishMotionConfig = {
+  radius: number
+  strength: number
+}
+
+type FishMotionState = {
+  offset: THREE.Vector2
+  velocity: THREE.Vector2
+  escapeDirection: THREE.Vector2
+  effort: number
+  startleTime: number
+  startleStrength: number
+  threatLatched: boolean
+  swimClock: number
 }
 
 const props = defineProps<{
@@ -44,8 +62,10 @@ let scene: THREE.Scene | undefined
 let camera: THREE.OrthographicCamera | undefined
 let waterPlane: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial> | undefined
 let stonesTexture: THREE.Texture | undefined
-let topCarpTexture: THREE.Texture | undefined
-let topKoiTexture: THREE.Texture | undefined
+let kohakuKoiTexture: THREE.Texture | undefined
+let showaKoiTexture: THREE.Texture | undefined
+let yamabukiKoiTexture: THREE.Texture | undefined
+let shiroKoiTexture: THREE.Texture | undefined
 let frameId: number | undefined
 let resizeObserver: ResizeObserver | undefined
 let destroyed = false
@@ -53,10 +73,33 @@ let rootWidth = 0
 let rootHeight = 0
 let interactionPulse = 0
 let pointerEnergy = 0
+let pointerActive = false
+let fishSeed = 0
+let lastFrameTime = 0
 
 const pointer = new THREE.Vector2(0.5, 0.5)
 const pointerTarget = new THREE.Vector2(0.5, 0.5)
 const pulseOrigin = new THREE.Vector2(0.5, 0.5)
+const fishMotionConfigs: FishMotionConfig[] = [
+  { radius: 0.16, strength: 0.045 },
+  { radius: 0.17, strength: 0.05 },
+  { radius: 0.18, strength: 0.06 },
+  { radius: 0.15, strength: 0.04 },
+]
+const fishPhaseOffsets = [0, 2.1, 4.3, 6.7]
+const fishMotionStates: FishMotionState[] = fishMotionConfigs.map((_, index) => ({
+  offset: new THREE.Vector2(),
+  velocity: new THREE.Vector2(),
+  escapeDirection: new THREE.Vector2(0, index % 2 === 0 ? 1 : -1),
+  effort: 0,
+  startleTime: 0,
+  startleStrength: 0,
+  threatLatched: false,
+  swimClock: 0,
+}))
+const fishCenters = fishMotionConfigs.map(() => new THREE.Vector2())
+const fishMotionCenter = new THREE.Vector2()
+const fishMotionDelta = new THREE.Vector2()
 
 const vertexShader = `
   varying vec2 vUv;
@@ -69,8 +112,10 @@ const vertexShader = `
 
 const fragmentShader = `
   uniform sampler2D uStones;
-  uniform sampler2D uTopCarp;
-  uniform sampler2D uTopKoi;
+  uniform sampler2D uKohakuKoi;
+  uniform sampler2D uShowaKoi;
+  uniform sampler2D uYamabukiKoi;
+  uniform sampler2D uShiroKoi;
   uniform vec2 uResolution;
   uniform vec2 uTextureResolution;
   uniform vec2 uPointer;
@@ -79,6 +124,16 @@ const fragmentShader = `
   uniform float uPulse;
   uniform float uTime;
   uniform float uFishSeed;
+  uniform vec4 uFishEffort;
+  uniform vec4 uFishSwimClock;
+  uniform vec2 uFishOffset1;
+  uniform vec2 uFishOffset2;
+  uniform vec2 uFishOffset3;
+  uniform vec2 uFishOffset4;
+  uniform vec2 uFishEscape1;
+  uniform vec2 uFishEscape2;
+  uniform vec2 uFishEscape3;
+  uniform vec2 uFishEscape4;
   uniform vec3 uDeep;
   uniform vec3 uMid;
   uniform vec3 uGlow;
@@ -143,6 +198,9 @@ const fragmentShader = `
     float angle,
     vec2 size,
     float phase,
+    float swimClock,
+    float effort,
+    float turnBend,
     float headDirection
   ) {
     float aspect = uResolution.x / max(uResolution.y, 1.0);
@@ -155,12 +213,13 @@ const fragmentShader = `
     float tailProgress = clamp(0.5 - headDirection * longitudinal, 0.0, 1.0);
     float tailBend = smoothstep(0.12, 1.0, tailProgress);
     float motionVariation = 0.5 + 0.5 * sin(phase * 1.731 + 0.7);
-    float swimRate = mix(3.7, 6.4, motionVariation);
-    float tailAmount = mix(0.1, 0.24, motionVariation);
-    float swimPhase = uTime * swimRate + phase + headDirection * longitudinal * 3.1;
+    float tailAmount = mix(0.1, 0.24, motionVariation) * mix(1.0, 1.32, smoothstep(0.12, 0.9, effort));
+    float swimPhase = swimClock + phase + headDirection * longitudinal * 3.1;
     float swim = sin(swimPhase);
     float tailWeight = tailBend * tailBend;
-    local.y += swim * size.y * (0.012 + tailWeight * tailAmount);
+    float bodyWave = smoothstep(0.06, 0.94, tailProgress);
+    local.y += swim * size.y * (0.006 + bodyWave * 0.035 + tailWeight * tailAmount);
+    local.y += turnBend * size.y * (bodyWave * 0.1 + tailWeight * 0.46);
     local.x += cos(swimPhase * 0.9 + motionVariation) * size.x * tailWeight * mix(0.028, 0.07, motionVariation);
     return local / size + 0.5;
   }
@@ -180,18 +239,12 @@ const fragmentShader = `
     return atan(value.y, value.x);
   }
 
-  vec2 fleeOffset(vec2 center, float radius, float strength, float spin) {
-    float aspect = uResolution.x / max(uResolution.y, 1.0);
-    vec2 delta = center - uPointer;
-    delta.x *= aspect;
-    float distanceToPointer = length(delta);
-    float fear = 1.0 - smoothstep(radius * 0.04, radius * 1.12, distanceToPointer);
-    fear *= 0.58 + clamp(uPointerEnergy * 1.2 + uPulse * 0.95, 0.0, 1.45);
-    vec2 direction = safeNormalize(delta);
-    float jitter = 0.58 + 0.42 * sin(uTime * spin + center.x * 12.7 + center.y * 9.3);
-    vec2 flee = direction * fear * strength * jitter;
-    flee.x /= aspect;
-    return flee;
+  vec2 turnResponse(float from, float to, float amount) {
+    float delta = atan(sin(to - from), cos(to - from));
+    float response = smoothstep(0.08, 0.9, amount);
+    float heading = from + clamp(delta, -0.28, 0.28) * response;
+    float bend = clamp(delta / 1.2, -1.0, 1.0) * response;
+    return vec2(heading, bend);
   }
 
   float fishWake(vec2 uv, vec2 center, float aspect, float falloff, float intensity) {
@@ -217,22 +270,12 @@ const fragmentShader = `
     return step(0.0, uv.x) * step(uv.x, 1.0) * step(0.0, uv.y) * step(uv.y, 1.0);
   }
 
-  vec4 sampleTopCarp(vec2 uv, vec2 center, float angle, vec2 size, float phase) {
-    vec2 spriteUv = fishSpriteUv(uv, center, angle, size, phase, 1.0);
+  vec4 sampleKoi(sampler2D sprite, vec2 uv, vec2 center, float angle, vec2 size, float phase, float swimClock, float effort, float turnBend, float headDirection) {
+    vec2 spriteUv = fishSpriteUv(uv, center, angle, size, phase, swimClock, effort, turnBend, headDirection);
     vec2 safeUv = clamp(spriteUv, vec2(0.0), vec2(1.0));
-    vec4 fish = texture2D(uTopCarp, safeUv) * 0.84;
-    fish += texture2D(uTopCarp, clamp(safeUv + vec2(0.0018, 0.0), vec2(0.0), vec2(1.0))) * 0.15;
-    fish += texture2D(uTopCarp, clamp(safeUv - vec2(0.0018, 0.0), vec2(0.0), vec2(1.0))) * 0.15;
-    fish.a *= spriteBounds(spriteUv);
-    return fish;
-  }
-
-  vec4 sampleTopKoi(vec2 uv, vec2 center, float angle, vec2 size, float phase) {
-    vec2 spriteUv = fishSpriteUv(uv, center, angle, size, phase, -1.0);
-    vec2 safeUv = clamp(spriteUv, vec2(0.0), vec2(1.0));
-    vec4 fish = texture2D(uTopKoi, safeUv) * 0.84;
-    fish += texture2D(uTopKoi, clamp(safeUv + vec2(0.0018, 0.0), vec2(0.0), vec2(1.0))) * 0.15;
-    fish += texture2D(uTopKoi, clamp(safeUv - vec2(0.0018, 0.0), vec2(0.0), vec2(1.0))) * 0.15;
+    vec4 fish = texture2D(sprite, safeUv) * 0.84;
+    fish += texture2D(sprite, clamp(safeUv + vec2(0.0018, 0.0), vec2(0.0), vec2(1.0))) * 0.15;
+    fish += texture2D(sprite, clamp(safeUv - vec2(0.0018, 0.0), vec2(0.0), vec2(1.0))) * 0.15;
     fish.a *= spriteBounds(spriteUv);
     return fish;
   }
@@ -243,13 +286,13 @@ const fragmentShader = `
     float responsiveScale = clamp(aspect / 0.75, 0.62, 1.0);
     float x1 = -0.12 + mod(uTime * 0.052 + seed * 0.17, 1.24);
     vec2 p1 = vec2(x1, 0.24 + sin(uTime * 0.56 + seed) * 0.045);
-    vec2 flee1 = fleeOffset(p1, 0.16, 0.045, 4.6);
-    p1 += flee1;
-    float panic1 = clamp(length(flee1) * 10.0, 0.0, 1.0);
+    p1 += uFishOffset1;
+    float panic1 = uFishEffort.x;
     float baseAngle1 = cos(uTime * 0.52 + seed) * 0.1;
-    float angle1 = mix(baseAngle1, -safeAngle(flee1, 0.0), panic1);
+    vec2 turn1 = turnResponse(baseAngle1, -safeAngle(uFishEscape1, 0.0), panic1);
+    float angle1 = turn1.x;
     vec2 size1 = vec2(0.18, 0.072) * responsiveScale;
-    vec4 fish1 = sampleTopCarp(uv, p1, angle1, size1, seed);
+    vec4 fish1 = sampleKoi(uKohakuKoi, uv, p1, angle1, size1, seed, uFishSwimClock.x, panic1, turn1.y, 1.0);
     vec2 dir1 = safeNormalize(vec2(cos(angle1), sin(angle1)));
     float aura1 = fishAura(uv, p1, angle1, size1);
     float glow1 = fishWake(uv, p1, aspect, 17.0, 0.018 + panic1 * 0.04);
@@ -259,13 +302,13 @@ const fragmentShader = `
 
     float x2 = 1.12 - mod(uTime * 0.04 + seed * 0.29, 1.24);
     vec2 p2 = vec2(x2, 0.69 + sin(uTime * 0.48 + seed * 1.7) * 0.055);
-    vec2 flee2 = fleeOffset(p2, 0.17, 0.05, 4.1);
-    p2 += flee2;
-    float panic2 = clamp(length(flee2) * 10.0, 0.0, 1.0);
+    p2 += uFishOffset2;
+    float panic2 = uFishEffort.y;
     float baseAngle2 = -cos(uTime * 0.43 + seed) * 0.12;
-    float angle2 = mix(baseAngle2, safeAngle(flee2, 0.0), panic2);
+    vec2 turn2 = turnResponse(baseAngle2, safeAngle(uFishEscape2, 0.0), panic2);
+    float angle2 = turn2.x;
     vec2 size2 = vec2(0.2, 0.062) * responsiveScale;
-    vec4 fish2 = sampleTopKoi(uv, p2, angle2, size2, seed + 2.1);
+    vec4 fish2 = sampleKoi(uShowaKoi, uv, p2, angle2, size2, seed + 2.1, uFishSwimClock.y, panic2, turn2.y, -1.0);
     vec2 dir2 = safeNormalize(vec2(cos(angle2), sin(angle2)));
     float aura2 = fishAura(uv, p2, angle2, size2);
     float glow2 = fishWake(uv, p2, aspect, 17.0, 0.018 + panic2 * 0.04);
@@ -275,13 +318,13 @@ const fragmentShader = `
 
     float x3 = -0.12 + mod(uTime * 0.034 + seed * 0.41, 1.24);
     vec2 p3 = vec2(x3, 0.5 + sin(uTime * 0.42 + seed * 0.73) * 0.07);
-    vec2 flee3 = fleeOffset(p3, 0.18, 0.06, 3.8);
-    p3 += flee3;
-    float panic3 = clamp(length(flee3) * 10.0, 0.0, 1.0);
+    p3 += uFishOffset3;
+    float panic3 = uFishEffort.z;
     float baseAngle3 = cos(uTime * 0.37 + seed) * 0.15;
-    float angle3 = mix(baseAngle3, -safeAngle(flee3, 0.0), panic3);
+    vec2 turn3 = turnResponse(baseAngle3, -safeAngle(uFishEscape3, 0.0), panic3);
+    float angle3 = turn3.x;
     vec2 size3 = vec2(0.23, 0.092) * responsiveScale;
-    vec4 fish3 = sampleTopCarp(uv, p3, angle3, size3, seed + 4.3);
+    vec4 fish3 = sampleKoi(uYamabukiKoi, uv, p3, angle3, size3, seed + 4.3, uFishSwimClock.z, panic3, turn3.y, 1.0);
     vec2 dir3 = safeNormalize(vec2(cos(angle3), sin(angle3)));
     float aura3 = fishAura(uv, p3, angle3, size3);
     float glow3 = fishWake(uv, p3, aspect, 16.0, 0.02 + panic3 * 0.04);
@@ -291,13 +334,13 @@ const fragmentShader = `
 
     float x4 = 1.12 - mod(uTime * 0.046 + seed * 0.53, 1.24);
     vec2 p4 = vec2(x4, 0.84 + sin(uTime * 0.66 + seed * 1.31) * 0.035);
-    vec2 flee4 = fleeOffset(p4, 0.15, 0.04, 5.2);
-    p4 += flee4;
-    float panic4 = clamp(length(flee4) * 10.0, 0.0, 1.0);
+    p4 += uFishOffset4;
+    float panic4 = uFishEffort.w;
     float baseAngle4 = -cos(uTime * 0.61 + seed) * 0.09;
-    float angle4 = mix(baseAngle4, safeAngle(flee4, 0.0), panic4);
+    vec2 turn4 = turnResponse(baseAngle4, safeAngle(uFishEscape4, 0.0), panic4);
+    float angle4 = turn4.x;
     vec2 size4 = vec2(0.16, 0.052) * responsiveScale;
-    vec4 fish4 = sampleTopKoi(uv, p4, angle4, size4, seed + 6.7);
+    vec4 fish4 = sampleKoi(uShiroKoi, uv, p4, angle4, size4, seed + 6.7, uFishSwimClock.w, panic4, turn4.y, -1.0);
     vec2 dir4 = safeNormalize(vec2(cos(angle4), sin(angle4)));
     float aura4 = fishAura(uv, p4, angle4, size4);
     float glow4 = fishWake(uv, p4, aspect, 17.0, 0.016 + panic4 * 0.035);
@@ -368,6 +411,161 @@ function applyPalette() {
   uniforms.uLight.value.set(palette.value.light)
 }
 
+function smoothUnit(value: number) {
+  const clamped = THREE.MathUtils.clamp(value, 0, 1)
+  return clamped * clamped * (3 - 2 * clamped)
+}
+
+function resetFishMotion() {
+  fishMotionStates.forEach((state, index) => {
+    state.offset.set(0, 0)
+    state.velocity.set(0, 0)
+    state.escapeDirection.set(0, index % 2 === 0 ? 1 : -1)
+    state.effort = 0
+    state.startleTime = 0
+    state.startleStrength = 0
+    state.threatLatched = false
+    state.swimClock = 0
+  })
+}
+
+function updateFishCenters(time: number) {
+  fishCenters[0].set(
+    -0.12 + THREE.MathUtils.euclideanModulo(time * 0.052 + fishSeed * 0.17, 1.24),
+    0.24 + Math.sin(time * 0.56 + fishSeed) * 0.045,
+  )
+  fishCenters[1].set(
+    1.12 - THREE.MathUtils.euclideanModulo(time * 0.04 + fishSeed * 0.29, 1.24),
+    0.69 + Math.sin(time * 0.48 + fishSeed * 1.7) * 0.055,
+  )
+  fishCenters[2].set(
+    -0.12 + THREE.MathUtils.euclideanModulo(time * 0.034 + fishSeed * 0.41, 1.24),
+    0.5 + Math.sin(time * 0.42 + fishSeed * 0.73) * 0.07,
+  )
+  fishCenters[3].set(
+    1.12 - THREE.MathUtils.euclideanModulo(time * 0.046 + fishSeed * 0.53, 1.24),
+    0.84 + Math.sin(time * 0.66 + fishSeed * 1.31) * 0.035,
+  )
+}
+
+function updateFishMotion(time: number, deltaSeconds: number) {
+  if (!waterPlane || !rootHeight) return
+
+  updateFishCenters(time)
+  const aspect = rootWidth / rootHeight
+
+  fishMotionStates.forEach((state, index) => {
+    const config = fishMotionConfigs[index]
+    fishMotionCenter.copy(fishCenters[index]).add(state.offset)
+    fishMotionDelta.copy(fishMotionCenter).sub(pointer)
+    fishMotionDelta.x *= aspect
+
+    const distance = fishMotionDelta.length()
+    const rawThreat = pointerActive
+      ? 1 - THREE.MathUtils.smoothstep(distance, config.radius * 0.04, config.radius * 1.12)
+      : 0
+    const targetThreat = rawThreat * rawThreat * (3 - 2 * rawThreat)
+
+    if (distance > 0.0001 && targetThreat > 0.001) {
+      fishMotionDelta.multiplyScalar(1 / distance)
+      fishMotionDelta.x /= aspect
+      state.escapeDirection.lerp(fishMotionDelta, 1 - Math.exp(-14 * deltaSeconds))
+    }
+
+    if (targetThreat > 0.16 && !state.threatLatched) {
+      state.threatLatched = true
+      state.startleTime = 0.0001
+      state.startleStrength = THREE.MathUtils.clamp(0.58 + targetThreat * 0.42, 0, 1)
+    } else if (targetThreat < 0.06) {
+      state.threatLatched = false
+    }
+
+    let targetEffort = 0
+    let propulsion = 0
+    let tailRateBoost = 0
+
+    if (state.startleTime > 0) {
+      state.startleTime += deltaSeconds
+
+      if (state.startleTime < 0.11) {
+        const coil = smoothUnit(state.startleTime / 0.11)
+        targetEffort = coil * state.startleStrength
+        tailRateBoost = coil * 0.18
+      } else if (state.startleTime < 0.34) {
+        const burst = smoothUnit((state.startleTime - 0.11) / 0.23)
+        targetEffort = THREE.MathUtils.lerp(1, 0.65, burst) * state.startleStrength
+        propulsion = Math.sin(Math.PI * burst) ** 2
+        tailRateBoost = THREE.MathUtils.lerp(1.3, 0.9, burst)
+      } else if (state.startleTime < 0.88) {
+        const coast = smoothUnit((state.startleTime - 0.34) / 0.54)
+        targetEffort = 0.65 * (1 - coast) * state.startleStrength
+        tailRateBoost = 0.28 * (1 - coast)
+      } else {
+        state.startleTime = 0
+        state.startleStrength = 0
+      }
+    }
+
+    const responseRate = targetEffort > state.effort ? 18 : 5
+    state.effort += (targetEffort - state.effort) * (1 - Math.exp(-responseRate * deltaSeconds))
+
+    const stylePhase = fishSeed + fishPhaseOffsets[index]
+    const motionVariation = 0.5 + 0.5 * Math.sin(stylePhase * 1.731 + 0.7)
+    const cruiseRate = THREE.MathUtils.lerp(3.7, 6.4, motionVariation)
+    state.swimClock = THREE.MathUtils.euclideanModulo(
+      state.swimClock + cruiseRate * (1 + tailRateBoost) * deltaSeconds,
+      Math.PI * 2,
+    )
+
+    const acceleration = config.strength * 34 * state.startleStrength * propulsion
+    state.velocity.addScaledVector(state.escapeDirection, acceleration * deltaSeconds)
+    state.velocity.addScaledVector(
+      state.offset,
+      -6.8 * (1 - targetThreat * 0.85) * deltaSeconds,
+    )
+    const damping = state.startleTime > 0 ? (propulsion > 0 ? 2.1 : 2.8) : 4.2
+    state.velocity.multiplyScalar(Math.exp(-damping * deltaSeconds))
+
+    const screenVelocityX = state.velocity.x * aspect
+    const screenSpeed = Math.hypot(screenVelocityX, state.velocity.y)
+    const maxSpeed = config.strength * 4.5
+    if (screenSpeed > maxSpeed) {
+      state.velocity.multiplyScalar(maxSpeed / screenSpeed)
+    }
+
+    state.offset.addScaledVector(state.velocity, deltaSeconds)
+    const screenOffsetX = state.offset.x * aspect
+    const screenOffset = Math.hypot(screenOffsetX, state.offset.y)
+    const maxOffset = config.strength * 1.35
+    if (screenOffset > maxOffset) {
+      state.offset.multiplyScalar(maxOffset / screenOffset)
+      if (state.velocity.dot(state.offset) > 0) state.velocity.multiplyScalar(0.45)
+    }
+  })
+
+  const uniforms = waterPlane.material.uniforms
+  uniforms.uFishEffort.value.set(
+    fishMotionStates[0].effort,
+    fishMotionStates[1].effort,
+    fishMotionStates[2].effort,
+    fishMotionStates[3].effort,
+  )
+  uniforms.uFishSwimClock.value.set(
+    fishMotionStates[0].swimClock,
+    fishMotionStates[1].swimClock,
+    fishMotionStates[2].swimClock,
+    fishMotionStates[3].swimClock,
+  )
+  uniforms.uFishOffset1.value.copy(fishMotionStates[0].offset)
+  uniforms.uFishOffset2.value.copy(fishMotionStates[1].offset)
+  uniforms.uFishOffset3.value.copy(fishMotionStates[2].offset)
+  uniforms.uFishOffset4.value.copy(fishMotionStates[3].offset)
+  uniforms.uFishEscape1.value.copy(fishMotionStates[0].escapeDirection)
+  uniforms.uFishEscape2.value.copy(fishMotionStates[1].escapeDirection)
+  uniforms.uFishEscape3.value.copy(fishMotionStates[2].escapeDirection)
+  uniforms.uFishEscape4.value.copy(fishMotionStates[3].escapeDirection)
+}
+
 async function initScene() {
   const canvas = canvasRef.value
   const root = rootRef.value
@@ -388,33 +586,65 @@ async function initScene() {
 
   try {
     const loader = new THREE.TextureLoader()
-    ;[stonesTexture, topCarpTexture, topKoiTexture] = await Promise.all([
+    ;[
+      stonesTexture,
+      kohakuKoiTexture,
+      showaKoiTexture,
+      yamabukiKoiTexture,
+      shiroKoiTexture,
+    ] = await Promise.all([
       loader.loadAsync(riverbedStonesSrc),
-      loader.loadAsync(topCarpSrc),
-      loader.loadAsync(topKoiSrc),
+      loader.loadAsync(kohakuKoiSrc),
+      loader.loadAsync(showaKoiSrc),
+      loader.loadAsync(yamabukiKoiSrc),
+      loader.loadAsync(shiroKoiSrc),
     ])
   } catch {
     return
   }
-  if (destroyed || !renderer || !scene || !camera || !stonesTexture || !topCarpTexture || !topKoiTexture) {
+  if (
+    destroyed ||
+    !renderer ||
+    !scene ||
+    !camera ||
+    !stonesTexture ||
+    !kohakuKoiTexture ||
+    !showaKoiTexture ||
+    !yamabukiKoiTexture ||
+    !shiroKoiTexture
+  ) {
     stonesTexture?.dispose()
-    topCarpTexture?.dispose()
-    topKoiTexture?.dispose()
+    kohakuKoiTexture?.dispose()
+    showaKoiTexture?.dispose()
+    yamabukiKoiTexture?.dispose()
+    shiroKoiTexture?.dispose()
     return
   }
 
-  for (const texture of [stonesTexture, topCarpTexture, topKoiTexture]) {
+  for (const texture of [
+    stonesTexture,
+    kohakuKoiTexture,
+    showaKoiTexture,
+    yamabukiKoiTexture,
+    shiroKoiTexture,
+  ]) {
     texture.colorSpace = THREE.SRGBColorSpace
     texture.minFilter = THREE.LinearFilter
     texture.magFilter = THREE.LinearFilter
     texture.anisotropy = Math.min(renderer.capabilities.getMaxAnisotropy(), 8)
   }
 
+  fishSeed = Math.random() * 100
+  lastFrameTime = 0
+  resetFishMotion()
+
   const material = new THREE.ShaderMaterial({
     uniforms: {
       uStones: { value: stonesTexture },
-      uTopCarp: { value: topCarpTexture },
-      uTopKoi: { value: topKoiTexture },
+      uKohakuKoi: { value: kohakuKoiTexture },
+      uShowaKoi: { value: showaKoiTexture },
+      uYamabukiKoi: { value: yamabukiKoiTexture },
+      uShiroKoi: { value: shiroKoiTexture },
       uResolution: { value: new THREE.Vector2(1, 1) },
       uTextureResolution: { value: new THREE.Vector2(1920, 1920) },
       uPointer: { value: pointer.clone() },
@@ -422,7 +652,17 @@ async function initScene() {
       uPointerEnergy: { value: 0 },
       uPulse: { value: 0 },
       uTime: { value: 0 },
-      uFishSeed: { value: Math.random() * 100 },
+      uFishSeed: { value: fishSeed },
+      uFishEffort: { value: new THREE.Vector4() },
+      uFishSwimClock: { value: new THREE.Vector4() },
+      uFishOffset1: { value: new THREE.Vector2() },
+      uFishOffset2: { value: new THREE.Vector2() },
+      uFishOffset3: { value: new THREE.Vector2() },
+      uFishOffset4: { value: new THREE.Vector2() },
+      uFishEscape1: { value: fishMotionStates[0].escapeDirection.clone() },
+      uFishEscape2: { value: fishMotionStates[1].escapeDirection.clone() },
+      uFishEscape3: { value: fishMotionStates[2].escapeDirection.clone() },
+      uFishEscape4: { value: fishMotionStates[3].escapeDirection.clone() },
       uDeep: { value: new THREE.Color(palette.value.deep) },
       uMid: { value: new THREE.Color(palette.value.mid) },
       uGlow: { value: new THREE.Color(palette.value.glow) },
@@ -467,6 +707,7 @@ function updatePointer(event: PointerEvent) {
   const nextX = THREE.MathUtils.clamp((event.clientX - rect.left) / rect.width, 0, 1)
   const nextY = THREE.MathUtils.clamp(1 - (event.clientY - rect.top) / rect.height, 0, 1)
   const distance = pointerTarget.distanceTo(new THREE.Vector2(nextX, nextY))
+  pointerActive = true
   pointerTarget.set(nextX, nextY)
   pointerEnergy = Math.min(0.55, pointerEnergy + distance * 2.4)
 }
@@ -484,10 +725,14 @@ function handlePointerDown(event: PointerEvent) {
 function animate() {
   if (!renderer || !scene || !camera || !waterPlane) return
 
-  const time = performance.now() * 0.001
+  const frameTime = performance.now()
+  const time = frameTime * 0.001
+  const deltaSeconds = lastFrameTime ? Math.min((frameTime - lastFrameTime) * 0.001, 0.033) : 1 / 60
+  lastFrameTime = frameTime
   pointer.lerp(pointerTarget, 0.09)
   interactionPulse *= 0.955
   pointerEnergy *= 0.9
+  updateFishMotion(time, deltaSeconds)
 
   const uniforms = waterPlane.material.uniforms
   uniforms.uTime.value = time
@@ -516,8 +761,10 @@ onBeforeUnmount(() => {
   waterPlane?.geometry.dispose()
   waterPlane?.material.dispose()
   stonesTexture?.dispose()
-  topCarpTexture?.dispose()
-  topKoiTexture?.dispose()
+  kohakuKoiTexture?.dispose()
+  showaKoiTexture?.dispose()
+  yamabukiKoiTexture?.dispose()
+  shiroKoiTexture?.dispose()
   renderer?.dispose()
 })
 </script>

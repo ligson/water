@@ -180,6 +180,107 @@ func TestAuthGateUnlockAndLock(t *testing.T) {
 	}
 }
 
+func TestAuthPINLockoutEscalatesAndBlocksCorrectPIN(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	if _, err := auth.NewStore(db).Ensure(context.Background(), "123456"); err != nil {
+		t.Fatalf("ensure auth: %v", err)
+	}
+	handler := NewRouter(db, config.Config{AuthEnabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		rec := performJSON(handler, http.MethodPost, "/api/auth/unlock", `{"pin":"000000"}`)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("wrong PIN attempt %d: expected 401, got %d: %s", attempt, rec.Code, rec.Body.String())
+		}
+	}
+
+	thirdAttempt := performJSON(handler, http.MethodPost, "/api/auth/unlock", `{"pin":"000000"}`)
+	if thirdAttempt.Code != http.StatusTooManyRequests {
+		t.Fatalf("third wrong PIN attempt: expected 429, got %d: %s", thirdAttempt.Code, thirdAttempt.Body.String())
+	}
+
+	lockedAttempt := performJSON(handler, http.MethodPost, "/api/auth/unlock", `{"pin":"123456"}`)
+	if lockedAttempt.Code != http.StatusTooManyRequests {
+		t.Fatalf("correct PIN during lockout: expected 429, got %d: %s", lockedAttempt.Code, lockedAttempt.Body.String())
+	}
+	if lockedAttempt.Header().Get("Retry-After") == "" {
+		t.Fatal("expected Retry-After header during lockout")
+	}
+	var lockedBody struct {
+		Data struct {
+			RetryAfterSeconds int `json:"retryAfterSeconds"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(lockedAttempt.Body.Bytes(), &lockedBody); err != nil {
+		t.Fatalf("decode lockout response: %v", err)
+	}
+	if lockedBody.Data.RetryAfterSeconds <= 0 {
+		t.Fatalf("expected positive retryAfterSeconds, got %d", lockedBody.Data.RetryAfterSeconds)
+	}
+
+	statusRec := performJSON(handler, http.MethodGet, "/api/auth/status", "")
+	if statusRec.Code != http.StatusOK {
+		t.Fatalf("auth status during lockout: expected 200, got %d", statusRec.Code)
+	}
+	var statusBody struct {
+		Data struct {
+			PINRetryAfterSeconds int `json:"pinRetryAfterSeconds"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &statusBody); err != nil {
+		t.Fatalf("decode auth status: %v", err)
+	}
+	if statusBody.Data.PINRetryAfterSeconds <= 0 {
+		t.Fatalf("expected status lockout countdown, got %d", statusBody.Data.PINRetryAfterSeconds)
+	}
+
+	if _, err := db.Exec(`UPDATE auth_state SET pin_locked_until = ''`); err != nil {
+		t.Fatalf("expire first lockout: %v", err)
+	}
+	fourthAttempt := performJSON(handler, http.MethodPost, "/api/auth/unlock", `{"pin":"000000"}`)
+	if fourthAttempt.Code != http.StatusTooManyRequests {
+		t.Fatalf("fourth wrong PIN attempt: expected 429, got %d: %s", fourthAttempt.Code, fourthAttempt.Body.String())
+	}
+	var escalatedBody struct {
+		Data struct {
+			RetryAfterSeconds int `json:"retryAfterSeconds"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(fourthAttempt.Body.Bytes(), &escalatedBody); err != nil {
+		t.Fatalf("decode escalated lockout response: %v", err)
+	}
+	if escalatedBody.Data.RetryAfterSeconds < 4*60 {
+		t.Fatalf("expected fourth failure to lock for about five minutes, got %d seconds", escalatedBody.Data.RetryAfterSeconds)
+	}
+}
+
+func TestAuthPINSuccessResetsFailureCount(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	if _, err := auth.NewStore(db).Ensure(context.Background(), "123456"); err != nil {
+		t.Fatalf("ensure auth: %v", err)
+	}
+	handler := NewRouter(db, config.Config{AuthEnabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		rec := performJSON(handler, http.MethodPost, "/api/auth/unlock", `{"pin":"000000"}`)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("wrong PIN attempt %d: expected 401, got %d", attempt, rec.Code)
+		}
+	}
+	correct := performJSON(handler, http.MethodPost, "/api/auth/unlock", `{"pin":"123456"}`)
+	if correct.Code != http.StatusOK {
+		t.Fatalf("correct PIN: expected 200, got %d: %s", correct.Code, correct.Body.String())
+	}
+	afterReset := performJSON(handler, http.MethodPost, "/api/auth/unlock", `{"pin":"000000"}`)
+	if afterReset.Code != http.StatusUnauthorized {
+		t.Fatalf("first wrong PIN after success: expected 401, got %d: %s", afterReset.Code, afterReset.Body.String())
+	}
+}
+
 func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 

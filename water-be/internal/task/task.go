@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -19,6 +20,8 @@ const (
 	TurnStatusCreated         = "created"
 	TurnStatusRunning         = "running"
 	TurnStatusWaitingApproval = "waiting_approval"
+	TurnStatusBlocked         = "blocked"
+	TurnStatusPaused          = "paused"
 	TurnStatusCompleted       = "completed"
 	TurnStatusFailed          = "failed"
 	TurnStatusInterrupted     = "interrupted"
@@ -39,13 +42,23 @@ type Task struct {
 }
 
 type Turn struct {
-	ID          string     `json:"id"`
-	TaskID      string     `json:"taskId"`
-	Sequence    int        `json:"sequence"`
-	Status      string     `json:"status"`
-	UserInput   string     `json:"userInput"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	CompletedAt *time.Time `json:"completedAt,omitempty"`
+	ID          string       `json:"id"`
+	TaskID      string       `json:"taskId"`
+	Sequence    int          `json:"sequence"`
+	Status      string       `json:"status"`
+	UserInput   string       `json:"userInput"`
+	Attachments []Attachment `json:"attachments"`
+	CreatedAt   time.Time    `json:"createdAt"`
+	CompletedAt *time.Time   `json:"completedAt,omitempty"`
+}
+
+type Attachment struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	MIMEType string `json:"mimeType"`
+	Kind     string `json:"kind"`
+	Path     string `json:"path"`
+	Size     int64  `json:"size"`
 }
 
 type TurnWithWorkspace struct {
@@ -71,8 +84,9 @@ type UpdateInput struct {
 }
 
 type CreateTurnInput struct {
-	TaskID    string
-	UserInput string
+	TaskID      string
+	UserInput   string
+	Attachments []Attachment
 }
 
 func (s *Store) ListByWorkspace(ctx context.Context, workspaceID string) ([]Task, error) {
@@ -204,22 +218,28 @@ func (s *Store) CreateTurn(ctx context.Context, input CreateTurnInput) (Turn, er
 
 	now := time.Now()
 	turn := Turn{
-		ID:        uid.New("turn"),
-		TaskID:    input.TaskID,
-		Sequence:  nextSequence,
-		Status:    TurnStatusCreated,
-		UserInput: input.UserInput,
-		CreatedAt: now,
+		ID:          uid.New("turn"),
+		TaskID:      input.TaskID,
+		Sequence:    nextSequence,
+		Status:      TurnStatusCreated,
+		UserInput:   input.UserInput,
+		Attachments: input.Attachments,
+		CreatedAt:   now,
+	}
+	attachmentsJSON, err := json.Marshal(turn.Attachments)
+	if err != nil {
+		return Turn{}, fmt.Errorf("encode turn attachments: %w", err)
 	}
 
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO turns (id, task_id, sequence, status, user_input, created_at)
-VALUES (?, ?, ?, ?, ?, ?)`,
+INSERT INTO turns (id, task_id, sequence, status, user_input, attachments_json, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		turn.ID,
 		turn.TaskID,
 		turn.Sequence,
 		turn.Status,
 		turn.UserInput,
+		string(attachmentsJSON),
 		dbutil.FormatTime(turn.CreatedAt),
 	)
 	if err != nil {
@@ -261,7 +281,7 @@ LIMIT 1`,
 
 func (s *Store) GetTurn(ctx context.Context, id string) (Turn, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, task_id, sequence, status, user_input, created_at, COALESCE(completed_at, '')
+SELECT id, task_id, sequence, status, user_input, COALESCE(attachments_json, '[]'), created_at, COALESCE(completed_at, '')
 FROM turns
 WHERE id = ?`, id)
 
@@ -272,9 +292,40 @@ WHERE id = ?`, id)
 	return turn, err
 }
 
+func (s *Store) GetAttachment(ctx context.Context, taskID string, attachmentID string) (Attachment, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT COALESCE(attachments_json, '[]')
+FROM turns
+WHERE task_id = ?
+ORDER BY sequence DESC`, taskID)
+	if err != nil {
+		return Attachment{}, fmt.Errorf("query task attachments: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return Attachment{}, err
+		}
+		var items []Attachment
+		if err := json.Unmarshal([]byte(raw), &items); err != nil {
+			return Attachment{}, fmt.Errorf("decode task attachments: %w", err)
+		}
+		for _, item := range items {
+			if item.ID == attachmentID {
+				return item, nil
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return Attachment{}, fmt.Errorf("iterate task attachments: %w", err)
+	}
+	return Attachment{}, ErrNotFound
+}
+
 func (s *Store) ListTurnsByStatus(ctx context.Context, status string) ([]TurnWithWorkspace, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT turns.id, turns.task_id, turns.sequence, turns.status, turns.user_input, turns.created_at, COALESCE(turns.completed_at, ''), tasks.workspace_id
+SELECT turns.id, turns.task_id, turns.sequence, turns.status, turns.user_input, COALESCE(turns.attachments_json, '[]'), turns.created_at, COALESCE(turns.completed_at, ''), tasks.workspace_id
 FROM turns
 JOIN tasks ON tasks.id = turns.task_id
 WHERE turns.status = ?
@@ -302,7 +353,7 @@ ORDER BY turns.created_at ASC`, status)
 
 func (s *Store) ListActiveTurnsByTask(ctx context.Context, taskID string) ([]TurnWithWorkspace, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT turns.id, turns.task_id, turns.sequence, turns.status, turns.user_input, turns.created_at, COALESCE(turns.completed_at, ''), tasks.workspace_id
+SELECT turns.id, turns.task_id, turns.sequence, turns.status, turns.user_input, COALESCE(turns.attachments_json, '[]'), turns.created_at, COALESCE(turns.completed_at, ''), tasks.workspace_id
 FROM turns
 JOIN tasks ON tasks.id = turns.task_id
 WHERE turns.task_id = ?
@@ -400,7 +451,7 @@ WHERE id = ?
 }
 
 func isTerminalTurnStatus(status string) bool {
-	return status == TurnStatusCompleted || status == TurnStatusFailed || status == TurnStatusInterrupted
+	return status == TurnStatusBlocked || status == TurnStatusPaused || status == TurnStatusCompleted || status == TurnStatusFailed || status == TurnStatusInterrupted
 }
 
 type scanner interface {
@@ -430,14 +481,21 @@ func scanTurn(row scanner) (Turn, error) {
 
 func scanTurnWithWorkspace(row scanner, workspaceID *string) (Turn, error) {
 	var turn Turn
+	var attachmentsJSON string
 	var createdAt string
 	var completedAt string
-	dest := []interface{}{&turn.ID, &turn.TaskID, &turn.Sequence, &turn.Status, &turn.UserInput, &createdAt, &completedAt}
+	dest := []interface{}{&turn.ID, &turn.TaskID, &turn.Sequence, &turn.Status, &turn.UserInput, &attachmentsJSON, &createdAt, &completedAt}
 	if workspaceID != nil {
 		dest = append(dest, workspaceID)
 	}
 	if err := row.Scan(dest...); err != nil {
 		return Turn{}, err
+	}
+	if err := json.Unmarshal([]byte(attachmentsJSON), &turn.Attachments); err != nil {
+		return Turn{}, fmt.Errorf("decode turn attachments: %w", err)
+	}
+	if turn.Attachments == nil {
+		turn.Attachments = make([]Attachment, 0)
 	}
 	turn.CreatedAt = dbutil.ParseTime(createdAt)
 	if completedAt != "" {

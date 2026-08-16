@@ -17,10 +17,13 @@ import {
   KeyRound,
   LockKeyhole,
   LogOut,
+  Link2,
+  PackageOpen,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
+  Paperclip,
   Pencil,
   Plus,
   RefreshCw,
@@ -29,6 +32,8 @@ import {
   Square,
   Terminal,
   Trash2,
+  UploadCloud,
+  X,
 } from '@lucide/vue'
 import MarkdownIt from 'markdown-it'
 import WaterAuthScene from './components/auth/WaterAuthScene.vue'
@@ -37,14 +42,17 @@ import {
   api,
   clearAccessToken,
   setAccessToken,
+  taskAttachmentURL,
   taskWebSocketURL,
   type AuthStatus,
   type Approval,
   type ExternalPath,
   type Provider,
   type ProviderModelOption,
+  type Skill,
   type Task,
   type TaskEvent,
+  type TurnAttachmentInput,
   type Workspace,
   type WorkspaceFileContent,
   type WorkspaceFileItem,
@@ -57,11 +65,20 @@ type ChatBlock = {
   content: string
   sequence: number
   turnId?: string
+  attachments?: ChatAttachment[]
   continuation?: {
     canContinue: boolean
     prompt: string
     reason: string
   }
+}
+
+type ChatAttachment = {
+  id: string
+  name: string
+  mimeType: string
+  kind: 'image' | 'file'
+  size: number
 }
 
 type ChatTimelineItem = {
@@ -97,7 +114,7 @@ type ExecutionGroup = {
   key: string
   title: string
   subtitle: string
-  status: 'running' | 'completed' | 'failed' | 'waiting' | 'interrupted' | 'stopped' | 'idle'
+  status: 'running' | 'completed' | 'failed' | 'waiting' | 'blocked' | 'paused' | 'interrupted' | 'stopped' | 'idle'
   steps: ExecutionStep[]
   lastSequence: number
   startedAt?: string
@@ -106,6 +123,11 @@ type ExecutionGroup = {
     estimatedTokens: number
     tokenBudget: number
     contextWindowTokens: number
+    messageCount?: number
+    toolCount?: number
+    round?: number
+    phase?: number
+    source?: string
     truncated: boolean
     hasTaskSummary: boolean
     selectedFilePaths: string[]
@@ -115,6 +137,67 @@ type ExecutionGroup = {
     contentHash: string
     chars: number
   }
+  contract?: TaskContract
+  ledger?: HypothesisLedger
+  plan?: TaskPlan
+  replay?: ReplayAssessment
+}
+
+type TaskContract = {
+  goal: string
+  taskType: string
+  stage: string
+  doneWhen: string[]
+  missingInputs: string[]
+}
+
+type HypothesisItem = {
+  id: string
+  claim: string
+  status: string
+  missingEvidence: string[]
+}
+
+type EvidenceItem = {
+  id: string
+  hypothesisId: string
+  kind: string
+  operation: string
+  source: string
+  resource: string
+  summary: string
+  outcome: string
+}
+
+type HypothesisLedger = {
+  hypotheses: HypothesisItem[]
+  evidence: EvidenceItem[]
+}
+
+type TaskPlanStep = {
+  id: string
+  position: number
+  title: string
+  description: string
+  status: string
+  gateType: string
+  acceptance: string[]
+}
+
+type TaskPlan = {
+  id: string
+  status: string
+  version: number
+  steps: TaskPlanStep[]
+}
+
+type ReplayAssessment = {
+  score: number
+  turns: number
+  repeatedReads: number
+  validations: number
+  endToEndVerified: boolean
+  findings: string[]
 }
 
 type ContextSnapshot = {
@@ -150,12 +233,19 @@ type TurnSummary = {
 }
 
 type TurnOutcome = {
-  status: 'completed' | 'failed' | 'interrupted'
+  status: 'completed' | 'blocked' | 'failed' | 'interrupted'
   label: string
   tone: 'success' | 'warning' | 'error'
 }
 
+type ComposerAttachment = TurnAttachmentInput & {
+  id: string
+  size: number
+  kind: 'image' | 'file'
+}
+
 const providers = ref<Provider[]>([])
+const skills = ref<Skill[]>([])
 const workspaces = ref<Workspace[]>([])
 const tasks = ref<Task[]>([])
 const events = ref<TaskEvent[]>([])
@@ -178,6 +268,7 @@ const authUnlocked = ref(false)
 const authSubmitting = ref(false)
 const authPIN = ref('')
 const authError = ref('')
+const authLockedUntil = ref(0)
 const authStatus = ref<AuthStatus | null>(null)
 const wsConnected = ref(false)
 const taskModalOpen = ref(false)
@@ -189,6 +280,9 @@ const editingProviderId = ref('')
 const providerModelOptions = ref<ProviderModelOption[]>([])
 const providerModelsLoading = ref(false)
 const providerModelsError = ref('')
+const skillInstalling = ref(false)
+const skillInstallURL = ref('')
+const skillUploadInput = ref<HTMLInputElement>()
 const workspaceModalOpen = ref(false)
 const workspaceSubmitting = ref(false)
 const editingWorkspaceId = ref('')
@@ -245,6 +339,8 @@ const selectedThemeName = ref<ThemeName>(loadThemeName())
 let taskSocket: WebSocket | undefined
 let taskSocketReconnectTimer: number | undefined
 let taskSocketReconnectAttempts = 0
+let taskEventFrame: number | undefined
+const pendingTaskEvents = new Map<string, TaskEvent>()
 const taskSocketReconnectBaseMS = 800
 const taskSocketReconnectMaxMS = 8000
 const terminalPanelMinWidth = 560
@@ -261,7 +357,9 @@ const assistantRawMode = reactive<Record<string, boolean>>({})
 const summaryRawMode = reactive<Record<string, boolean>>({})
 const summaryExpanded = reactive<Record<string, boolean>>({})
 const assistantTypingTimers = new Map<string, number>()
-const assistantTypingDelayMS = 18
+const assistantMarkdownCache = new Map<string, { content: string; html: string }>()
+const assistantTypingDelayMS = 24
+const assistantTypingMaxBatch = 16
 const markdown = new MarkdownIt({
   html: false,
   linkify: true,
@@ -288,6 +386,9 @@ const providerForm = reactive({
   isDefault: true,
   enabled: true,
   contextWindowTokens: 8192,
+  timeoutSeconds: 30,
+  streamIdleTimeoutSeconds: 60,
+  maxRetries: 2,
 })
 
 const workspaceForm = reactive({
@@ -311,13 +412,18 @@ const authPinForm = reactive({
 
 const taskTitle = ref('')
 const userInput = ref('')
+const composerAttachments = ref<ComposerAttachment[]>([])
+const attachmentInputRef = ref<HTMLInputElement | null>(null)
+const composerDragging = ref(false)
+const maxComposerAttachments = 6
+const maxComposerAttachmentBytes = 8 * 1024 * 1024
+const maxComposerAttachmentsBytes = 20 * 1024 * 1024
 const chatBodyRef = ref<HTMLElement | null>(null)
+const customCursorRef = ref<HTMLElement | null>(null)
 const customCursorSupported = ref(false)
 const customCursorVisible = ref(false)
 const customCursorPressed = ref(false)
 const customCursorInteractive = ref(false)
-const customCursorX = ref(0)
-const customCursorY = ref(0)
 const waterPetPoked = ref(false)
 const waterPetMoodIndex = ref(0)
 const waterPetDragging = ref(false)
@@ -333,6 +439,9 @@ let customCursorMediaQuery: MediaQueryList | undefined
 let customCursorFrame: number | undefined
 let customCursorPendingX = 0
 let customCursorPendingY = 0
+let chatScrollFrame: number | undefined
+let chatScrollQueued = false
+let chatScrollBehavior: ScrollBehavior = 'auto'
 let waterPetTimer: number | undefined
 let waterPetMoveTimer: number | undefined
 let waterPetWalkTimer: number | undefined
@@ -351,6 +460,15 @@ let waterPetDrag:
 const selectedWorkspace = computed(() =>
   workspaces.value.find((item) => item.id === selectedWorkspaceId.value),
 )
+const authLockRemainingSeconds = computed(() => {
+  if (!authLockedUntil.value) return 0
+  return Math.max(0, Math.ceil((authLockedUntil.value - nowTick.value) / 1000))
+})
+const authLockRemainingText = computed(() => {
+  const seconds = authLockRemainingSeconds.value
+  if (seconds >= 60) return `${Math.ceil(seconds / 60)} 分钟`
+  return `${seconds} 秒`
+})
 const selectedTask = computed(() => tasks.value.find((item) => item.id === selectedTaskId.value))
 const defaultProvider = computed(() => providers.value.find((item) => item.isDefault))
 const activeProvider = computed(() => {
@@ -386,7 +504,11 @@ const composerPlaceholder = computed(() =>
     : `让${productName}修改、解释或规划你的项目`,
 )
 const canSubmitTurn = computed(() =>
-  Boolean(selectedTaskId.value && userInput.value.trim() && !selectedTaskIsLive.value),
+  Boolean(
+    selectedTaskId.value &&
+      (userInput.value.trim() || composerAttachments.value.length > 0) &&
+      !selectedTaskIsLive.value,
+  ),
 )
 const taskHeaderTone = computed(() => {
   if (statusText.value.includes('失败')) return 'error'
@@ -422,6 +544,10 @@ const workspaceFilePreviewLines = computed(() => {
   }))
 })
 const latestContextUsage = computed(() => latestExecutionGroup.value?.contextUsage)
+const latestTaskContract = computed(() => latestExecutionGroup.value?.contract)
+const latestHypothesisLedger = computed(() => latestExecutionGroup.value?.ledger)
+const latestTaskPlan = computed(() => latestExecutionGroup.value?.plan)
+const latestReplayAssessment = computed(() => latestExecutionGroup.value?.replay)
 const latestContextSnapshot = computed<ContextSnapshot>(() => ({
   usage: latestExecutionGroup.value?.contextUsage,
   summary: latestExecutionGroup.value?.contextSummary,
@@ -444,8 +570,8 @@ const contextHeaderText = computed(() => {
 })
 const contextHeaderTitle = computed(() =>
   latestExecutionGroup.value && latestContextUsage.value
-    ? `本轮 ${contextUsageText(latestExecutionGroup.value)}`
-    : '当前 Provider 的本轮上下文预算',
+    ? `本轮 ${contextUsageText(latestExecutionGroup.value)}\n按当前实际请求的消息和工具定义估算；不同模型 tokenizer 可能略有差异。`
+    : '当前 Provider 的本轮上下文预算；发送请求后按消息和工具定义估算',
 )
 const contextHeaderPercent = computed(() => {
   const usage = latestContextUsage.value
@@ -471,6 +597,7 @@ const chatBlocks = computed(() => {
         content: String(payload.userInput ?? `第 ${payload.sequence ?? item.sequence} 轮输入`),
         sequence: item.sequence,
         turnId: item.turnId,
+        attachments: parseChatAttachments(payload.attachments),
       })
       continue
     }
@@ -491,21 +618,32 @@ const chatBlocks = computed(() => {
       blocks[index].content += String(payload.delta ?? '')
       continue
     }
-    if (item.type === 'turn.failed' || item.type === 'turn.interrupted') {
+		if (item.type === 'turn.failed' || item.type === 'turn.interrupted' || item.type === 'turn.blocked' || item.type === 'turn.paused') {
       const continuationPrompt = String(payload.continuationPrompt ?? '').trim()
       const isContinuableInterrupted =
-        item.type === 'turn.interrupted' &&
+			(item.type === 'turn.paused' || item.type === 'turn.interrupted') &&
         (payload.canContinue === true || String(payload.message ?? '').includes('工具调用轮次达到上限'))
       blocks.push({
         key: item.eventId,
         role: 'system',
         title:
-          isContinuableInterrupted
-            ? '本轮已暂告一段落'
+			item.type === 'turn.blocked'
+				? '等待补充信息'
+				: item.type === 'turn.paused'
+					? String(payload.reason ?? '').startsWith('semantic_')
+						? '连续无进展，任务未完成'
+						: '本轮预算结束，任务未完成'
+            : isContinuableInterrupted
+            ? '本轮已停止，可继续'
             : item.type === 'turn.interrupted'
               ? '运行已中断'
               : '运行失败',
-        content: String(payload.message ?? (item.type === 'turn.interrupted' ? 'Agent 执行已中断' : 'Agent 执行失败')),
+        content:
+			item.type === 'turn.blocked'
+				? blockedMessage(payload)
+				: item.type === 'turn.paused'
+					? String(payload.message ?? '本轮预算结束，任务计划仍未完成。')
+            : String(payload.message ?? (item.type === 'turn.interrupted' ? 'Agent 执行已中断' : 'Agent 执行失败')),
         sequence: item.sequence,
         turnId: item.turnId,
         continuation:
@@ -607,6 +745,14 @@ const turnOutcomeByTurn = computed(() => {
       })
       continue
     }
+    if (item.type === 'turn.blocked') {
+      outcomes.set(item.turnId, {
+        status: 'blocked',
+        label: '等待你补充信息',
+        tone: 'warning',
+      })
+      continue
+    }
     if (item.type === 'turn.interrupted') {
       const payload = payloadRecord(item)
       outcomes.set(item.turnId, {
@@ -691,9 +837,6 @@ const shellStyle = computed(() => ({
   '--left-panel-width': `${leftPanelCollapsed.value ? 48 : leftPanelWidth.value}px`,
   '--right-panel-width': `${rightPanelCollapsed.value ? 48 : effectiveRightPanelWidth.value}px`,
 }))
-const customCursorStyle = computed(() => ({
-  transform: `translate3d(${customCursorX.value}px, ${customCursorY.value}px, 0) translate(-2px, -1px)`,
-}))
 const waterPetMessages = ['上善若水', '缓而不怠', '清流已就位', '稳住上下文']
 const waterPetMessage = computed(() => waterPetMessages[waterPetMoodIndex.value % waterPetMessages.length])
 const waterPetStyle = computed(() => ({
@@ -738,8 +881,9 @@ function canUseCustomCursor() {
 
 function flushCustomCursorFrame() {
   customCursorFrame = undefined
-  customCursorX.value = customCursorPendingX
-  customCursorY.value = customCursorPendingY
+  const cursor = customCursorRef.value
+  if (!cursor) return
+  cursor.style.transform = `translate3d(${customCursorPendingX}px, ${customCursorPendingY}px, 0) translate(-2px, -1px)`
 }
 
 function scheduleCustomCursorUpdate(x: number, y: number) {
@@ -758,7 +902,7 @@ function setCustomCursorState(event: PointerEvent) {
   }
   customCursorVisible.value = true
   scheduleCustomCursorUpdate(event.clientX, event.clientY)
-  const target = event.target as HTMLElement | null
+  const target = event.target instanceof Element ? event.target : null
   customCursorInteractive.value = Boolean(
     target?.closest(
       'button, a, input, textarea, select, [role="button"], [contenteditable="true"], .ant-btn, .ant-select, .ant-input, .ant-input-affix-wrapper, .ant-switch, .ant-checkbox, .sidebar-toggle, .resize-handle, .task-item, .provider-card, .workspace-row, .file-row, .approval-row, .water-pet',
@@ -1071,6 +1215,27 @@ function parseSummaryFiles(value: unknown): SummaryFile[] {
   }).filter((item) => item.path || item.displayPath)
 }
 
+function parseChatAttachments(value: unknown): ChatAttachment[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((raw) => {
+      const item = (raw ?? {}) as Record<string, unknown>
+      return {
+        id: String(item.id ?? ''),
+        name: String(item.name ?? '附件'),
+        mimeType: String(item.mimeType ?? 'application/octet-stream'),
+        kind: item.kind === 'image' ? 'image' as const : 'file' as const,
+        size: numberValue(item.size),
+      }
+    })
+    .filter((item) => item.id)
+}
+
+function chatAttachmentURL(block: ChatBlock, attachment: ChatAttachment) {
+  if (!block.turnId || !selectedTaskId.value) return ''
+  return taskAttachmentURL(selectedTaskId.value, attachment.id)
+}
+
 function parseSummaryCommands(value: unknown): SummaryCommand[] {
   if (!Array.isArray(value)) return []
   return value.map((raw) => {
@@ -1093,21 +1258,30 @@ function updateExecutionTiming(group: ExecutionGroup, item: TaskEvent) {
   if (item.type === 'turn.started') {
     group.startedAt = item.createdAt
   }
-  if (item.type === 'turn.completed' || item.type === 'turn.failed' || item.type === 'turn.interrupted') {
+	if (item.type === 'turn.completed' || item.type === 'turn.blocked' || item.type === 'turn.paused' || item.type === 'turn.failed' || item.type === 'turn.interrupted') {
     group.endedAt = item.createdAt
   }
 }
 
 function updateExecutionGroup(group: ExecutionGroup, item: TaskEvent) {
   const payload = payloadRecord(item)
-  if (item.type === 'context.pack.built') {
+  if (item.type === 'context.pack.built' || item.type === 'context.request.estimated') {
+    const previous = group.contextUsage
     group.contextUsage = {
       estimatedTokens: payloadNumber(payload, 'estimatedTokens'),
       tokenBudget: payloadNumber(payload, 'tokenBudget'),
       contextWindowTokens: payloadNumber(payload, 'contextWindowTokens'),
-      truncated: payload.truncated === true,
-      hasTaskSummary: payload.hasTaskSummary === true,
-      selectedFilePaths: payloadStringArray(payload, 'selectedFilePaths'),
+      messageCount: payloadNumber(payload, 'messageCount'),
+      toolCount: payloadNumber(payload, 'toolCount'),
+      round: payloadNumber(payload, 'round'),
+      phase: payloadNumber(payload, 'phase'),
+      source: String(payload.source ?? item.type),
+      truncated: payload.truncated === true || previous?.truncated === true,
+      hasTaskSummary: payload.hasTaskSummary === true || previous?.hasTaskSummary === true,
+      selectedFilePaths:
+        payloadStringArray(payload, 'selectedFilePaths').length > 0
+          ? payloadStringArray(payload, 'selectedFilePaths')
+          : previous?.selectedFilePaths ?? [],
     }
     return
   }
@@ -1119,6 +1293,28 @@ function updateExecutionGroup(group: ExecutionGroup, item: TaskEvent) {
     }
     return
   }
+  if (item.type === 'agent.contract.updated') {
+    group.contract = {
+      goal: String(payload.goal ?? ''),
+      taskType: String(payload.taskType ?? ''),
+      stage: String(payload.stage ?? ''),
+      doneWhen: payloadStringArray(payload, 'doneWhen'),
+      missingInputs: payloadStringArray(payload, 'missingInputs'),
+    }
+    return
+  }
+  if (item.type === 'agent.ledger.snapshot') {
+    group.ledger = parseHypothesisLedger(payload)
+    return
+  }
+  if (item.type === 'agent.plan.snapshot' || item.type === 'agent.plan.created') {
+    group.plan = parseTaskPlan(payload)
+    return
+  }
+  if (item.type === 'agent.replay.assessed') {
+    group.replay = parseReplayAssessment(payload)
+    return
+  }
   if (item.type === 'turn.started') {
     group.title = String(payload.userInput ?? '用户输入')
     group.subtitle = `第 ${payload.sequence ?? ''} 轮`
@@ -1126,6 +1322,23 @@ function updateExecutionGroup(group: ExecutionGroup, item: TaskEvent) {
     return
   }
   if (
+    item.type === 'context.turn.compacted' ||
+    item.type === 'agent.loop.guard.triggered' ||
+    item.type === 'tool.call.corrected' ||
+    item.type === 'tool.call.cached' ||
+    item.type === 'agent.hypothesis.updated' ||
+    item.type === 'agent.evidence.recorded' ||
+    item.type === 'agent.progress.assessed' ||
+		item.type === 'agent.replan.requested' ||
+		item.type === 'agent.execution.phase.continued' ||
+		item.type === 'agent.final_tool_calls.deferred' ||
+		item.type === 'agent.deferred_tool_calls.executing' ||
+    item.type === 'agent.ledger.snapshot' ||
+    item.type === 'agent.plan.created' ||
+		item.type === 'agent.plan.history.recovered' ||
+    item.type === 'agent.plan.snapshot' ||
+    item.type === 'agent.plan.step.completed' ||
+    item.type === 'agent.replay.assessed' ||
     item.type === 'agent.tool_calls.detected' ||
     item.type === 'approval.continuation.started' ||
     item.type === 'tool.call.started' ||
@@ -1146,6 +1359,14 @@ function updateExecutionGroup(group: ExecutionGroup, item: TaskEvent) {
     group.status = 'failed'
     return
   }
+	if (item.type === 'turn.blocked') {
+		group.status = 'blocked'
+		return
+	}
+	if (item.type === 'turn.paused') {
+		group.status = 'paused'
+		return
+	}
   if (item.type === 'turn.interrupted') {
     group.status = 'interrupted'
   }
@@ -1158,8 +1379,72 @@ function executionStepFromEvent(item: TaskEvent): ExecutionStep | undefined {
       return makeExecutionStep(item, '任务创建', String(payload.title ?? '任务已创建'), 'normal')
     case 'context.pack.built':
       return makeExecutionStep(item, '上下文已组装', summarizeContextPack(payload), 'normal')
+    case 'context.request.estimated':
+      return undefined
+    case 'context.turn.compacted':
+      return makeExecutionStep(item, '单轮上下文已压缩', summarizeTurnContextCompaction(payload), 'normal')
+    case 'agent.loop.guard.triggered':
+      return makeExecutionStep(item, '循环保护已触发，正在收敛', String(payload.message ?? '工具循环已停止，正在整理最终答复'), 'warning')
     case 'context.summary.updated':
       return makeExecutionStep(item, '上下文摘要已更新', summarizeContextSummary(payload), 'success')
+    case 'agent.contract.updated':
+      return makeExecutionStep(item, '任务契约已更新', summarizeContract(payload), 'normal')
+    case 'agent.ledger.snapshot':
+      return undefined
+    case 'agent.plan.created':
+      return makeExecutionStep(item, '执行计划已建立', summarizePlan(payload), 'normal')
+		case 'agent.plan.history.recovered':
+			return makeExecutionStep(item, '已恢复历史验收进度', String(payload.message ?? ''), 'success')
+    case 'agent.plan.snapshot':
+      return undefined
+    case 'agent.plan.step.completed':
+      return makeExecutionStep(item, '计划步骤已验收', summarizePlanProgress(payload), 'success')
+    case 'agent.replay.assessed':
+      return makeExecutionStep(item, '历史任务已回放', summarizeReplayAssessment(payload), replayTone(payload))
+    case 'agent.hypothesis.updated':
+      return makeExecutionStep(item, '假设状态已更新', summarizeHypothesis(payload), hypothesisTone(payload))
+    case 'agent.evidence.recorded':
+      return makeExecutionStep(item, '证据已记录', summarizeEvidenceRecord(payload), evidenceTone(payload))
+    case 'agent.progress.assessed':
+      if (payload.newInformation === true) return undefined
+      return makeExecutionStep(item, '信息增益检查', summarizeProgressAssessment(payload), 'warning')
+		case 'agent.replan.requested':
+			return makeExecutionStep(item, '已要求重新规划', String(payload.message ?? '当前路径没有新增证据'), 'warning')
+		case 'agent.execution.phase.continued':
+			return makeExecutionStep(
+				item,
+				'已自动继续执行',
+				`进入第 ${payloadNumber(payload, 'nextPhase')} 个执行阶段\n${String(payload.message ?? '')}`,
+				'normal',
+			)
+		case 'agent.final_tool_calls.deferred':
+			return makeExecutionStep(
+				item,
+				'已保留下一工具动作',
+				String(payload.message ?? '若水将在下一执行阶段优先执行该工具动作'),
+				'normal',
+			)
+		case 'agent.deferred_tool_calls.executing':
+			return makeExecutionStep(
+				item,
+				'正在承接上一阶段动作',
+				String(payload.message ?? '正在执行上一阶段保留的工具动作'),
+				'normal',
+			)
+    case 'tool.call.corrected':
+      return makeExecutionStep(
+        item,
+        '工具调用已纠正',
+        `${String(payload.from ?? 'tool')} -> ${String(payload.to ?? 'tool')}`,
+        'warning',
+      )
+    case 'tool.call.cached':
+      return makeExecutionStep(
+        item,
+        '复用已有工具结果',
+        String(payload.message ?? '资源没有已知变化，已复用本轮结果'),
+        'normal',
+      )
     case 'turn.started':
     case 'agent.message.delta':
     case 'agent.message.completed':
@@ -1181,6 +1466,15 @@ function executionStepFromEvent(item: TaskEvent): ExecutionStep | undefined {
       return makeExecutionStep(item, '审批处理', summarizeApproval(payload), 'normal')
     case 'turn.failed':
       return makeExecutionStep(item, '运行失败', String(payload.message ?? 'Agent 执行失败'), 'danger')
+		case 'turn.blocked':
+			return makeExecutionStep(item, '等待补充信息', blockedMessage(payload), 'warning')
+		case 'turn.paused':
+			return makeExecutionStep(
+				item,
+				String(payload.reason ?? '').startsWith('semantic_') ? '连续无进展，任务未完成' : '本轮预算结束，任务未完成',
+				String(payload.message ?? ''),
+				'warning',
+			)
     case 'turn.interrupted':
       return makeExecutionStep(item, '运行已中断', String(payload.message ?? 'Agent 执行已中断'), 'warning')
     default:
@@ -1222,11 +1516,15 @@ function summarizeContextPack(payload: Record<string, unknown>) {
   const estimated = payloadNumber(payload, 'estimatedTokens')
   const budget = payloadNumber(payload, 'tokenBudget')
   const files = payloadStringArray(payload, 'selectedFilePaths')
+  const index = (payload.indexStats ?? {}) as Record<string, unknown>
+  const indexed = payloadNumber(index, 'filesIndexed')
+  const changed = payloadNumber(index, 'filesChanged')
   const lines = [
     budget > 0 ? `预算 ${estimated} / ${budget} tokens` : `估算 ${estimated} tokens`,
     payload.hasTaskSummary === true ? '已带入任务滚动摘要' : '暂无任务滚动摘要',
     files.length > 0 ? `选中文件摘要 ${files.length} 个` : '未选中文件摘要',
   ]
+  if (indexed > 0) lines.push(`代码索引 ${indexed} 个文件${changed > 0 ? `，更新 ${changed} 个` : ''}`)
   if (payload.truncated === true) lines.push('已按预算截断低优先级上下文')
   return lines.join('\n')
 }
@@ -1235,6 +1533,17 @@ function summarizeContextSummary(payload: Record<string, unknown>) {
   const chars = payloadNumber(payload, 'chars')
   const summary = compactText(String(payload.summary ?? ''), 360)
   return [`任务滚动摘要 ${chars} 字`, summary].filter(Boolean).join('\n')
+}
+
+function summarizeTurnContextCompaction(payload: Record<string, unknown>) {
+  const original = payloadNumber(payload, 'originalEstimatedTokens')
+  const compacted = payloadNumber(payload, 'compactedEstimatedTokens')
+  const dropped = payloadNumber(payload, 'droppedMessages')
+  const round = payloadNumber(payload, 'round')
+  return [
+    `第 ${round} 回合，估算 ${formatTokenCount(original)} -> ${formatTokenCount(compacted)}`,
+    `已把 ${dropped} 条较早消息压缩为执行摘要，完整事件仍保留`,
+  ].join('\n')
 }
 
 function summarizeToolResult(payload: Record<string, unknown>) {
@@ -1276,6 +1585,184 @@ function compactText(value: string, limit = 900) {
   return `${text.slice(0, limit)}\n... 已省略 ${text.length - limit} 个字符`
 }
 
+function blockedMessage(payload: Record<string, unknown>) {
+  const missingInputs = payloadStringArray(payload, 'missingInputs')
+  if (missingInputs.length === 0) return String(payload.message ?? '继续任务需要补充关键信息。')
+  return `继续任务需要补充：\n${missingInputs.map((item) => `- ${item}`).join('\n')}`
+}
+
+function summarizeContract(payload: Record<string, unknown>) {
+  const stage = contractStageText(String(payload.stage ?? ''))
+  const goal = String(payload.goal ?? '')
+  return compactText([stage, goal].filter(Boolean).join('\n'))
+}
+
+function parseHypothesisLedger(payload: Record<string, unknown>): HypothesisLedger {
+  const hypotheses = (Array.isArray(payload.hypotheses) ? payload.hypotheses : []).map((raw) => {
+    const item = raw as Record<string, unknown>
+    return {
+      id: String(item.id ?? ''),
+      claim: String(item.claim ?? ''),
+      status: String(item.status ?? 'open'),
+      missingEvidence: payloadStringArray(item, 'missingEvidence'),
+    }
+  })
+  const evidence = (Array.isArray(payload.evidence) ? payload.evidence : []).map((raw) => {
+    const item = raw as Record<string, unknown>
+    return {
+      id: String(item.id ?? ''),
+      hypothesisId: String(item.hypothesisId ?? ''),
+      kind: String(item.kind ?? ''),
+      operation: String(item.operation ?? ''),
+      source: String(item.source ?? ''),
+      resource: String(item.resource ?? ''),
+      summary: String(item.summary ?? ''),
+      outcome: String(item.outcome ?? 'neutral'),
+    }
+  })
+  return { hypotheses, evidence }
+}
+
+function parseTaskPlan(payload: Record<string, unknown>): TaskPlan {
+  const steps = (Array.isArray(payload.steps) ? payload.steps : []).map((raw) => {
+    const item = raw as Record<string, unknown>
+    return {
+      id: String(item.id ?? ''),
+      position: payloadNumber(item, 'position'),
+      title: String(item.title ?? ''),
+      description: String(item.description ?? ''),
+      status: String(item.status ?? 'pending'),
+      gateType: String(item.gateType ?? ''),
+      acceptance: payloadStringArray(item, 'acceptance'),
+    }
+  })
+  return {
+    id: String(payload.id ?? ''),
+    status: String(payload.status ?? 'in_progress'),
+    version: payloadNumber(payload, 'version'),
+    steps,
+  }
+}
+
+function parseReplayAssessment(payload: Record<string, unknown>): ReplayAssessment {
+  return {
+    score: payloadNumber(payload, 'score'),
+    turns: payloadNumber(payload, 'turns'),
+    repeatedReads: payloadNumber(payload, 'repeatedReads'),
+    validations: payloadNumber(payload, 'validations'),
+    endToEndVerified: payload.endToEndVerified === true,
+    findings: payloadStringArray(payload, 'findings'),
+  }
+}
+
+function summarizePlan(payload: Record<string, unknown>) {
+  const plan = parseTaskPlan(payload)
+  const current = plan.steps.find((item) => item.status === 'in_progress')
+  return current ? `${plan.steps.length} 个步骤\n当前：${current.title}` : `${plan.steps.length} 个步骤`
+}
+
+function summarizePlanProgress(payload: Record<string, unknown>) {
+  const next = (payload.nextStep ?? {}) as Record<string, unknown>
+  if (payload.planComplete === true) return '所有计划步骤已通过验收'
+  return `下一步：${String(next.title ?? '继续执行计划')}`
+}
+
+function summarizeReplayAssessment(payload: Record<string, unknown>) {
+  const findings = payloadStringArray(payload, 'findings')
+  return [
+    `执行质量 ${payloadNumber(payload, 'score')} 分 · ${payloadNumber(payload, 'turns')} 轮`,
+    `重复读取 ${payloadNumber(payload, 'repeatedReads')} 次 · 验证 ${payloadNumber(payload, 'validations')} 次`,
+    ...findings,
+  ].join('\n')
+}
+
+function replayTone(payload: Record<string, unknown>): ExecutionStep['tone'] {
+  const score = payloadNumber(payload, 'score')
+  if (score >= 80) return 'success'
+  if (score >= 50) return 'warning'
+  return 'danger'
+}
+
+function planStepStatusText(status: string) {
+  const labels: Record<string, string> = {
+    pending: '待执行',
+    in_progress: '进行中',
+    completed: '已验收',
+    blocked: '已阻塞',
+  }
+  return labels[status] ?? status
+}
+
+function summarizeHypothesis(payload: Record<string, unknown>) {
+  return compactText(
+    [hypothesisStatusText(String(payload.status ?? 'open')), String(payload.claim ?? '')]
+      .filter(Boolean)
+      .join('\n'),
+  )
+}
+
+function hypothesisTone(payload: Record<string, unknown>): ExecutionStep['tone'] {
+  const status = String(payload.status ?? '')
+  if (status === 'resolved' || status === 'supported') return 'success'
+  if (status === 'blocked' || status === 'contradicted') return 'warning'
+  return 'normal'
+}
+
+function summarizeEvidenceRecord(payload: Record<string, unknown>) {
+  const purpose = String(payload.purpose ?? '')
+  const resource = String(payload.resource ?? '')
+  const summary = String(payload.summary ?? '')
+  return compactText([purpose, resource, summary].filter(Boolean).join('\n'))
+}
+
+function evidenceTone(payload: Record<string, unknown>): ExecutionStep['tone'] {
+  const outcome = String(payload.outcome ?? '')
+  if (outcome === 'supports') return 'success'
+  if (outcome === 'contradicts') return 'warning'
+  return 'normal'
+}
+
+function summarizeProgressAssessment(payload: Record<string, unknown>) {
+  const resource = String(payload.resource ?? '')
+  const repeatCount = payloadNumber(payload, 'repeatCount')
+  const action = String(payload.action ?? '')
+  const actionText = action === 'stop_no_progress' ? '停止重复路径' : '要求更换假设或验证方式'
+  return `${resource || '当前资源'} 已出现 ${repeatCount} 次相同证据，${actionText}`
+}
+
+function hypothesisStatusText(status: string) {
+  const labels: Record<string, string> = {
+    open: '待验证',
+    supported: '已有支持',
+    contradicted: '出现反证',
+    blocked: '等待输入',
+    resolved: '已解决',
+  }
+  return labels[status] ?? status
+}
+
+function evidenceOutcomeText(outcome: string) {
+  const labels: Record<string, string> = {
+    supports: '支持',
+    contradicts: '反证',
+    neutral: '记录',
+  }
+  return labels[outcome] ?? outcome
+}
+
+function contractStageText(stage: string) {
+  const labels: Record<string, string> = {
+    understanding: '理解目标',
+    collecting_evidence: '收集证据',
+    implementing: '执行修改',
+    verifying: '验证结果',
+    finalizing: '整理结果',
+    blocked: '等待输入',
+    completed: '已完成',
+  }
+  return labels[stage] ?? (stage || '准备中')
+}
+
 function latestTaskStatusText(items: TaskEvent[]) {
   const latestTurnEvent = [...items]
     .filter((item) => item.turnId)
@@ -1285,7 +1772,9 @@ function latestTaskStatusText(items: TaskEvent[]) {
   const latestTurnEvents = items
     .filter((item) => item.turnId === latestTurnEvent.turnId)
     .sort((a, b) => a.sequence - b.sequence)
-  if (latestTurnEvents.some((item) => item.type === 'turn.failed')) return '最近一轮失败'
+	if (latestTurnEvents.some((item) => item.type === 'turn.failed')) return '最近一轮失败'
+	if (latestTurnEvents.some((item) => item.type === 'turn.paused')) return '任务未完成，可从当前计划继续'
+  if (latestTurnEvents.some((item) => item.type === 'turn.blocked')) return '等待你补充信息'
   if (latestTurnEvents.some((item) => item.type === 'turn.interrupted')) return '最近一轮已中断'
   if (latestTurnEvents.some((item) => item.type === 'turn.completed')) return '已完成最近一轮'
   const hasPendingApproval =
@@ -1336,7 +1825,7 @@ function contextUsageText(group: ExecutionGroup) {
 
 function formatTokenCount(value: number) {
   if (value >= 10000) return `${Math.round(value / 1000)}k`
-  if (value >= 1000) return `${(value / 1000).toFixed(1)}k`
+  if (value >= 1000) return `${(value / 1000).toFixed(2)}k`
   return String(value)
 }
 
@@ -1486,7 +1975,9 @@ function executionSummaryText(group: ExecutionGroup) {
   if (group.status === 'waiting') {
     return durationText ? `等待你审批 · ${durationText}` : '等待你审批工具调用'
   }
-  if (group.status === 'failed') return '执行失败，展开查看原因'
+	if (group.status === 'failed') return '执行失败，展开查看原因'
+	if (group.status === 'blocked') return '需要补充信息后继续'
+	if (group.status === 'paused') return '本轮预算结束，任务尚未完成'
   if (group.status === 'interrupted') return '执行已中断'
   if (group.status === 'stopped') return '历史轮次未完成，已停止显示运行中'
   if (group.status === 'completed') {
@@ -1508,12 +1999,23 @@ function visibleChatContent(block: ChatBlock) {
 }
 
 function renderedMarkdown(block: ChatBlock) {
-  return markdown.render(visibleChatContent(block))
+  const content = visibleChatContent(block)
+  const cached = assistantMarkdownCache.get(block.key)
+  if (cached?.content === content) return cached.html
+  const html = markdown.render(content)
+  assistantMarkdownCache.set(block.key, { content, html })
+  return html
 }
 
 function isAssistantTyping(block: ChatBlock) {
   if (block.role !== 'assistant') return false
   return (assistantRenderedContent[block.key] ?? '').length < (assistantTargetContent[block.key] ?? block.content).length
+}
+
+function isAssistantStreaming(block: ChatBlock) {
+  if (block.role !== 'assistant') return false
+  const group = block.turnId ? executionGroupByTurn.value.get(block.turnId) : undefined
+  return group?.status === 'running' || group?.status === 'waiting' || isAssistantTyping(block)
 }
 
 function isAssistantRawMode(block: ChatBlock) {
@@ -1679,6 +2181,7 @@ function syncAssistantTyping(blocks: ChatBlock[]) {
     delete assistantRenderedContent[key]
     delete assistantTargetContent[key]
     delete assistantRawMode[key]
+    assistantMarkdownCache.delete(key)
     clearAssistantTypingTimer(key)
   }
 }
@@ -1697,9 +2200,14 @@ function revealNextAssistantChar(key: string) {
   const rendered = assistantRenderedContent[key] ?? ''
   if (rendered.length >= target.length) return
 
-  const targetChars = Array.from(target)
-  const renderedLength = Array.from(rendered).length
-  assistantRenderedContent[key] = targetChars.slice(0, renderedLength + 1).join('')
+  const remaining = target.length - rendered.length
+  const batchSize = Math.min(assistantTypingMaxBatch, Math.max(1, Math.ceil(remaining / 8)))
+  let nextLength = Math.min(target.length, rendered.length + batchSize)
+  const finalCodeUnit = target.charCodeAt(nextLength - 1)
+  if (nextLength < target.length && finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff) {
+    nextLength += 1
+  }
+  assistantRenderedContent[key] = target.slice(0, nextLength)
   scrollChatToBottom()
 
   if (assistantRenderedContent[key].length < target.length) {
@@ -1722,13 +2230,19 @@ function clearAssistantTypingTimers() {
 }
 
 function scrollChatToBottom(behavior: ScrollBehavior = 'auto') {
+  chatScrollBehavior = behavior
+  if (chatScrollQueued) return
+  chatScrollQueued = true
   void nextTick(() => {
-    window.requestAnimationFrame(() => {
+    if (!chatScrollQueued) return
+    chatScrollFrame = window.requestAnimationFrame(() => {
+      chatScrollFrame = undefined
+      chatScrollQueued = false
       const target = chatBodyRef.value
       if (!target) return
       target.scrollTo({
         top: target.scrollHeight,
-        behavior,
+        behavior: chatScrollBehavior,
       })
     })
   })
@@ -1742,6 +2256,10 @@ function executionStatusText(status: ExecutionGroup['status']) {
       return '已完成'
     case 'failed':
       return '失败'
+		case 'blocked':
+			return '待补充'
+		case 'paused':
+			return '未完成'
     case 'interrupted':
       return '已中断'
     case 'waiting':
@@ -1761,6 +2279,10 @@ function executionStatusColor(status: ExecutionGroup['status']) {
       return 'success'
     case 'failed':
       return 'error'
+		case 'blocked':
+			return 'warning'
+		case 'paused':
+			return 'warning'
     case 'interrupted':
       return 'warning'
     case 'waiting':
@@ -1794,6 +2316,9 @@ function resetProviderForm() {
   providerForm.isDefault = providers.value.length === 0
   providerForm.enabled = true
   providerForm.contextWindowTokens = 8192
+  providerForm.timeoutSeconds = 30
+  providerForm.streamIdleTimeoutSeconds = 60
+  providerForm.maxRetries = 2
 }
 
 function resetProviderModelOptions() {
@@ -1813,6 +2338,9 @@ function openProviderModal(item?: Provider) {
     providerForm.isDefault = item.isDefault
     providerForm.enabled = item.enabled
     providerForm.contextWindowTokens = item.contextWindowTokens || 8192
+    providerForm.timeoutSeconds = Math.max(1, Math.round((item.timeoutMs || 30000) / 1000))
+    providerForm.streamIdleTimeoutSeconds = Math.max(1, Math.round((item.streamIdleTimeoutMs || 60000) / 1000))
+    providerForm.maxRetries = item.maxRetries ?? 2
   } else {
     editingProviderId.value = ''
     resetProviderForm()
@@ -1860,7 +2388,22 @@ function authLockedStatus(): AuthStatus {
     locked: true,
     sessionExpiresAt: '',
     lastUnlockedAt: '',
+    pinLockedUntil: '',
+    pinRetryAfterSeconds: 0,
   }
+}
+
+function syncAuthLockout(status: AuthStatus) {
+  const lockedUntil = Date.parse(status.pinLockedUntil || '')
+  if (Number.isFinite(lockedUntil) && lockedUntil > Date.now()) {
+    authLockedUntil.value = lockedUntil
+    return
+  }
+  if (status.pinRetryAfterSeconds > 0) {
+    authLockedUntil.value = Date.now() + status.pinRetryAfterSeconds * 1000
+    return
+  }
+  authLockedUntil.value = 0
 }
 
 function clearWorkspaceState() {
@@ -1891,6 +2434,7 @@ async function refreshAuthStatus() {
   try {
     const status = await api.authStatus()
     authStatus.value = status
+    syncAuthLockout(status)
     authUnlocked.value = status.authenticated || status.configured === false || !status.locked
     if (!authUnlocked.value) {
       clearAccessToken()
@@ -1899,6 +2443,7 @@ async function refreshAuthStatus() {
   } catch (err) {
     clearAccessToken()
     authStatus.value = authLockedStatus()
+    authLockedUntil.value = 0
     authUnlocked.value = false
     authError.value = err instanceof Error ? err.message : '检查访问状态失败'
   } finally {
@@ -1908,7 +2453,7 @@ async function refreshAuthStatus() {
 
 async function unlockAccess() {
   const pin = authPIN.value.trim()
-  if (!pin) return
+  if (!pin || authLockRemainingSeconds.value > 0) return
   authSubmitting.value = true
   authError.value = ''
   try {
@@ -1921,7 +2466,15 @@ async function unlockAccess() {
       await refreshAll()
     }
   } catch (err) {
+    const retryAfterSeconds = errorDataNumber(err, 'retryAfterSeconds')
+    if (errorStatus(err) === 429 && retryAfterSeconds > 0) {
+      authLockedUntil.value = Date.now() + retryAfterSeconds * 1000
+      authPIN.value = ''
+      authError.value = ''
+      return
+    }
     if (errorStatus(err) === 401) {
+      authPIN.value = ''
       authError.value = 'PIN 不正确'
       return
     }
@@ -1963,12 +2516,14 @@ async function refreshAll() {
   if (!authUnlocked.value) return
   loading.value = true
   try {
-    const [providerData, workspaceData] = await Promise.all([
+    const [providerData, workspaceData, skillData] = await Promise.all([
       api.listProviders(),
       api.listWorkspaces(),
+      api.listSkills(),
     ])
     providers.value = providerData.items
     workspaces.value = workspaceData.items
+    skills.value = skillData.items
     const previousWorkspaceId = selectedWorkspaceId.value
     syncSelectedWorkspace()
     if (selectedWorkspaceId.value !== previousWorkspaceId) {
@@ -2106,6 +2661,9 @@ async function saveProvider() {
     isDefault: providerForm.isDefault,
     enabled: providerForm.enabled,
     contextWindowTokens: providerForm.contextWindowTokens || 8192,
+    timeoutMs: Math.max(1, providerForm.timeoutSeconds || 30) * 1000,
+    streamIdleTimeoutMs: Math.max(1, providerForm.streamIdleTimeoutSeconds || 60) * 1000,
+    maxRetries: Math.max(0, providerForm.maxRetries || 0),
   }
   if (!editingProviderId.value || providerForm.apiKey.trim()) {
     body.apiKey = providerForm.apiKey
@@ -2174,6 +2732,72 @@ async function deleteProvider(item: Provider) {
   } catch (err) {
     showError(err)
   }
+}
+
+async function refreshSkills() {
+  const data = await api.listSkills()
+  skills.value = data.items
+}
+
+async function installSkillArchive(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  if (!file.name.toLowerCase().endsWith('.zip')) {
+    message.warning('请选择 ZIP 格式的 Skill 包')
+    return
+  }
+  skillInstalling.value = true
+  try {
+    const installed = await api.installSkillArchive(file)
+    message.success(`${installed.name} 已安装，默认保持停用`)
+    await refreshSkills()
+  } catch (err) {
+    showError(err)
+  } finally {
+    skillInstalling.value = false
+  }
+}
+
+async function installSkillFromURL() {
+  const url = skillInstallURL.value.trim()
+  if (!url) return
+  skillInstalling.value = true
+  try {
+    const installed = await api.installSkillURL(url)
+    skillInstallURL.value = ''
+    message.success(`${installed.name} 已安装，默认保持停用`)
+    await refreshSkills()
+  } catch (err) {
+    showError(err)
+  } finally {
+    skillInstalling.value = false
+  }
+}
+
+async function toggleSkill(item: Skill) {
+  try {
+    await api.setSkillEnabled(item.id, !item.enabled)
+    await refreshSkills()
+    message.success(`${item.name} 已${item.enabled ? '停用' : '启用'}`)
+  } catch (err) {
+    showError(err)
+  }
+}
+
+async function deleteSkill(item: Skill) {
+  try {
+    await api.deleteSkill(item.id)
+    await refreshSkills()
+    message.success('Skill 已删除')
+  } catch (err) {
+    showError(err)
+  }
+}
+
+function skillSourceLabel(item: Skill) {
+  return item.source === 'url' ? 'URL' : item.source === 'upload' ? '上传' : item.source
 }
 
 async function saveWorkspace() {
@@ -2328,31 +2952,170 @@ async function deleteTask(item: Task) {
 async function sendTurn() {
   if (!canSubmitTurn.value) return
   const input = userInput.value
+  const attachments = [...composerAttachments.value]
   userInput.value = ''
-  await submitTurn(input, () => {
+  composerAttachments.value = []
+  await submitTurn(input, attachments, () => {
     userInput.value = input
+    composerAttachments.value = attachments
   })
 }
 
 async function continueTurn(block: ChatBlock) {
   const input = block.continuation?.prompt.trim()
   if (!selectedTaskId.value || !input) return
-  await submitTurn(input, () => {
+  await submitTurn(input, [], () => {
     userInput.value = input
   })
 }
 
-async function submitTurn(input: string, restoreInput: () => void) {
+async function submitTurn(
+  input: string,
+  attachments: ComposerAttachment[],
+  restoreInput: () => void,
+) {
   if (selectedTaskIsLive.value) return
   scrollChatToBottom('smooth')
   try {
-    await api.createTurn(selectedTaskId.value, input)
+    await api.createTurn(
+      selectedTaskId.value,
+      input,
+      attachments.map(({ name, mimeType, dataUrl }) => ({ name, mimeType, dataUrl })),
+    )
     await refreshEvents()
     scrollChatToBottom('smooth')
   } catch (err) {
     restoreInput()
     showError(err)
   }
+}
+
+function openAttachmentPicker() {
+  if (!selectedTaskId.value) {
+    message.info('请先选择或创建任务')
+    return
+  }
+  attachmentInputRef.value?.click()
+}
+
+function handleAttachmentInput(event: Event) {
+  const input = event.target as HTMLInputElement
+  void addComposerFiles(Array.from(input.files ?? []))
+  input.value = ''
+}
+
+async function addComposerFiles(files: File[]) {
+  if (files.length === 0) return
+  const existing = composerAttachments.value
+  const additions: ComposerAttachment[] = []
+  let totalBytes = existing.reduce((sum, item) => sum + item.size, 0)
+  for (const file of files) {
+    if (existing.length + additions.length >= maxComposerAttachments) {
+      message.warning(`一次最多添加 ${maxComposerAttachments} 个附件`)
+      break
+    }
+    if (file.size > maxComposerAttachmentBytes) {
+      message.warning(`${file.name} 超过 8 MiB`)
+      continue
+    }
+    if (totalBytes + file.size > maxComposerAttachmentsBytes) {
+      message.warning('附件总大小不能超过 20 MiB')
+      break
+    }
+    const duplicate = [...existing, ...additions].some(
+      (item) => item.name === file.name && item.size === file.size,
+    )
+    if (duplicate) continue
+    try {
+      const dataUrl = await readFileAsDataURL(file)
+      additions.push({
+        id: composerAttachmentID(),
+        name: file.name,
+        mimeType: file.type || attachmentMimeFromName(file.name),
+        dataUrl,
+        size: file.size,
+        kind: file.type.startsWith('image/') ? 'image' : 'file',
+      })
+      totalBytes += file.size
+    } catch {
+      message.error(`${file.name} 读取失败`)
+    }
+  }
+  composerAttachments.value = [...existing, ...additions]
+}
+
+function readFileAsDataURL(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
+}
+
+function composerAttachmentID() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID()
+  return `attachment-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function attachmentMimeFromName(name: string) {
+  const extension = name.split('.').pop()?.toLowerCase() ?? ''
+  const types: Record<string, string> = {
+    css: 'text/css',
+    csv: 'text/csv',
+    doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    go: 'text/plain',
+    html: 'text/html',
+    java: 'text/plain',
+    js: 'text/javascript',
+    json: 'application/json',
+    md: 'text/markdown',
+    pdf: 'application/pdf',
+    ppt: 'application/vnd.ms-powerpoint',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    py: 'text/x-python',
+    ts: 'text/typescript',
+    tsx: 'text/typescript',
+    txt: 'text/plain',
+    vue: 'text/plain',
+    xls: 'application/vnd.ms-excel',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    xml: 'application/xml',
+    yaml: 'application/yaml',
+    yml: 'application/yaml',
+  }
+  return types[extension] ?? 'application/octet-stream'
+}
+
+function attachmentFormatLabel(name: string) {
+  const extension = name.split('.').pop()?.toLowerCase() ?? ''
+  return ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'].includes(extension)
+    ? extension.toUpperCase()
+    : ''
+}
+
+function removeComposerAttachment(id: string) {
+  composerAttachments.value = composerAttachments.value.filter((item) => item.id !== id)
+}
+
+function handleComposerDrop(event: DragEvent) {
+  composerDragging.value = false
+  const files = Array.from(event.dataTransfer?.files ?? [])
+  if (files.length > 0) void addComposerFiles(files)
+}
+
+function handleComposerPaste(event: ClipboardEvent) {
+  const files = Array.from(event.clipboardData?.files ?? [])
+  if (files.length === 0) return
+  event.preventDefault()
+  void addComposerFiles(files)
+}
+
+function formatAttachmentSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KiB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`
 }
 
 function handleComposerKeydown(event: KeyboardEvent) {
@@ -2383,7 +3146,56 @@ async function resolveApproval(item: Approval, status: 'approved' | 'rejected') 
 }
 
 function latestTaskEventSequence() {
-  return events.value.reduce((max, item) => Math.max(max, item.sequence ?? 0), 0)
+  let latest = events.value.reduce((max, item) => Math.max(max, item.sequence ?? 0), 0)
+  for (const item of pendingTaskEvents.values()) {
+    latest = Math.max(latest, item.sequence ?? 0)
+  }
+  return latest
+}
+
+function flushTaskEvents() {
+  if (taskEventFrame !== undefined) {
+    window.cancelAnimationFrame(taskEventFrame)
+    taskEventFrame = undefined
+  }
+  if (pendingTaskEvents.size === 0) return
+
+  const incoming = Array.from(pendingTaskEvents.values())
+  pendingTaskEvents.clear()
+  const nextEvents = events.value.slice()
+  const indexByID = new Map(nextEvents.map((item, index) => [item.eventId, index]))
+  let approvalsChanged = false
+
+  for (const item of incoming) {
+    const index = indexByID.get(item.eventId)
+    if (index !== undefined) {
+      nextEvents[index] = item
+    } else {
+      indexByID.set(item.eventId, nextEvents.length)
+      nextEvents.push(item)
+      approvalsChanged ||= item.type.startsWith('approval.')
+    }
+  }
+
+  nextEvents.sort((a, b) => a.sequence - b.sequence)
+  events.value = nextEvents
+  if (approvalsChanged) void refreshApprovals()
+}
+
+function queueTaskEvent(item: TaskEvent) {
+  pendingTaskEvents.set(item.eventId, item)
+  if (taskEventFrame !== undefined) return
+  taskEventFrame = window.requestAnimationFrame(() => {
+    taskEventFrame = undefined
+    flushTaskEvents()
+  })
+}
+
+function discardPendingTaskEvents() {
+  pendingTaskEvents.clear()
+  if (taskEventFrame === undefined) return
+  window.cancelAnimationFrame(taskEventFrame)
+  taskEventFrame = undefined
 }
 
 function clearTaskSocketReconnectTimer() {
@@ -2394,6 +3206,7 @@ function clearTaskSocketReconnectTimer() {
 
 function closeTaskSocket() {
   clearTaskSocketReconnectTimer()
+  discardPendingTaskEvents()
   if (taskSocket) {
     taskSocket.onopen = null
     taskSocket.onclose = null
@@ -2423,6 +3236,9 @@ function connectTaskSocket(options: { reconnect?: boolean } = {}) {
   if (!options.reconnect) {
     clearTaskSocketReconnectTimer()
     taskSocketReconnectAttempts = 0
+    discardPendingTaskEvents()
+  } else {
+    flushTaskEvents()
   }
   if (taskSocket) {
     taskSocket.onopen = null
@@ -2452,17 +3268,7 @@ function connectTaskSocket(options: { reconnect?: boolean } = {}) {
   socket.onmessage = (raw) => {
     if (taskSocket !== socket) return
     const item = normalizeEvent(JSON.parse(raw.data) as TaskEvent)
-    const index = events.value.findIndex((event) => event.eventId === item.eventId)
-    const isNewEvent = index < 0
-    if (index >= 0) {
-      events.value[index] = item
-    } else {
-      events.value.push(item)
-      events.value.sort((a, b) => a.sequence - b.sequence)
-    }
-    if (isNewEvent && item.type.startsWith('approval.')) {
-      void refreshApprovals()
-    }
+    queueTaskEvent(item)
   }
 }
 
@@ -2479,6 +3285,13 @@ function normalizeEvent(item: TaskEvent): TaskEvent {
 function errorStatus(err: unknown) {
   if (!err || typeof err !== 'object') return 0
   return Number((err as { status?: number }).status ?? 0)
+}
+
+function errorDataNumber(err: unknown, key: string) {
+  if (!err || typeof err !== 'object') return 0
+  const data = (err as { data?: unknown }).data
+  if (!data || typeof data !== 'object') return 0
+  return Number((data as Record<string, unknown>)[key] ?? 0)
 }
 
 function showError(err: unknown) {
@@ -2501,6 +3314,8 @@ watch(selectedWorkspaceId, () => {
 })
 
 watch(selectedTaskId, () => {
+  composerAttachments.value = []
+  composerDragging.value = false
   void refreshEvents()
 })
 
@@ -2594,7 +3409,14 @@ const nowTickTimer = window.setInterval(() => {
 }, 1000)
 onBeforeUnmount(() => {
   stopPanelResize()
+  discardPendingTaskEvents()
   clearAssistantTypingTimers()
+  assistantMarkdownCache.clear()
+  chatScrollQueued = false
+  if (chatScrollFrame !== undefined) {
+    window.cancelAnimationFrame(chatScrollFrame)
+    chatScrollFrame = undefined
+  }
   if (customCursorFrame !== undefined) {
     window.cancelAnimationFrame(customCursorFrame)
     customCursorFrame = undefined
@@ -2629,7 +3451,9 @@ onBeforeUnmount(() => {
       <WaterAuthScene :theme="selectedThemeName" />
       <section class="auth-card">
         <div class="auth-brand">
-          <img :src="brandMarkSrc" alt="" aria-hidden="true" />
+          <span class="auth-brand-mark" aria-hidden="true">
+            <img :src="brandMarkSrc" alt="" />
+          </span>
           <div>
             <h1>{{ productName }}</h1>
             <p>{{ productTagline }}</p>
@@ -2643,7 +3467,9 @@ onBeforeUnmount(() => {
       <WaterAuthScene :theme="selectedThemeName" />
       <section class="auth-card">
         <div class="auth-brand">
-          <img :src="brandMarkSrc" alt="" aria-hidden="true" />
+          <span class="auth-brand-mark" aria-hidden="true">
+            <img :src="brandMarkSrc" alt="" />
+          </span>
           <div>
             <h1>{{ productName }}</h1>
             <p>{{ productTagline }}</p>
@@ -2669,14 +3495,19 @@ onBeforeUnmount(() => {
             size="large"
             placeholder="输入访问 PIN"
             autocomplete="one-time-code"
+            :disabled="authLockRemainingSeconds > 0"
           />
-          <p v-if="authError" class="auth-error">{{ authError }}</p>
+          <p v-if="authLockRemainingSeconds > 0" class="auth-error auth-lockout">
+            尝试次数过多，请 {{ authLockRemainingText }} 后再试
+          </p>
+          <p v-else-if="authError" class="auth-error">{{ authError }}</p>
           <a-button
             html-type="submit"
             type="primary"
             size="large"
             block
             :loading="authSubmitting"
+            :disabled="authLockRemainingSeconds > 0"
           >
             <template #icon><KeyRound :size="16" /></template>
             解锁
@@ -2693,10 +3524,10 @@ onBeforeUnmount(() => {
       :style="shellStyle"
     >
       <div
+        ref="customCursorRef"
         v-show="customCursorSupported && customCursorVisible"
         class="water-cursor"
         :class="{ 'is-interactive': customCursorInteractive, 'is-pressed': customCursorPressed }"
-        :style="customCursorStyle"
         aria-hidden="true"
       >
         <svg viewBox="0 0 24 32" class="water-cursor-pointer" aria-hidden="true">
@@ -2972,6 +3803,80 @@ onBeforeUnmount(() => {
           </div>
         </header>
 
+        <details v-if="latestTaskContract" class="task-contract-strip" :open="latestTaskContract.missingInputs.length > 0">
+          <summary>
+            <span class="contract-stage">{{ contractStageText(latestTaskContract.stage) }}</span>
+            <strong>{{ latestTaskContract.goal }}</strong>
+            <span class="contract-count">{{ latestTaskContract.doneWhen.length }} 项完成条件</span>
+          </summary>
+          <div class="task-contract-detail">
+            <section v-if="latestTaskPlan" class="contract-plan">
+              <span>执行计划</span>
+              <ol class="plan-step-list">
+                <li v-for="item in latestTaskPlan.steps" :key="item.id" :data-status="item.status">
+                  <span class="plan-step-index">{{ item.position }}</span>
+                  <span class="plan-step-copy">
+                    <strong>{{ item.title }}</strong>
+                    <small>{{ planStepStatusText(item.status) }}</small>
+                  </span>
+                </li>
+              </ol>
+            </section>
+            <section v-if="latestReplayAssessment" class="contract-replay">
+              <span>历史执行质量</span>
+              <div class="replay-score-line">
+                <strong>{{ latestReplayAssessment.score }}</strong>
+                <span>
+                  {{ latestReplayAssessment.turns }} 轮 · 重复读取 {{ latestReplayAssessment.repeatedReads }} 次 ·
+                  验证 {{ latestReplayAssessment.validations }} 次
+                </span>
+              </div>
+              <ul v-if="latestReplayAssessment.findings.length">
+                <li v-for="item in latestReplayAssessment.findings" :key="item">{{ item }}</li>
+              </ul>
+            </section>
+            <section>
+              <span>完成条件</span>
+              <ul>
+                <li v-for="item in latestTaskContract.doneWhen" :key="item">{{ item }}</li>
+              </ul>
+            </section>
+            <section v-if="latestTaskContract.missingInputs.length" class="contract-missing">
+              <span>需要你补充</span>
+              <ul>
+                <li v-for="item in latestTaskContract.missingInputs" :key="item">{{ item }}</li>
+              </ul>
+            </section>
+            <section
+              v-if="latestHypothesisLedger && latestHypothesisLedger.hypotheses.length"
+              class="contract-ledger"
+            >
+              <span>当前判断</span>
+              <ul class="hypothesis-list">
+                <li v-for="item in latestHypothesisLedger.hypotheses" :key="item.id">
+                  <span class="ledger-state" :data-status="item.status">{{ hypothesisStatusText(item.status) }}</span>
+                  <span>{{ item.claim }}</span>
+                </li>
+              </ul>
+            </section>
+            <section
+              v-if="latestHypothesisLedger && latestHypothesisLedger.evidence.length"
+              class="contract-ledger"
+            >
+              <span>最近证据</span>
+              <ul class="evidence-list">
+                <li v-for="item in latestHypothesisLedger.evidence.slice(0, 5)" :key="item.id">
+                  <span class="ledger-state" :data-outcome="item.outcome">{{ evidenceOutcomeText(item.outcome) }}</span>
+                  <span class="evidence-copy">
+                    <code>{{ item.resource }}</code>
+                    <small>{{ item.summary }}</small>
+                  </span>
+                </li>
+              </ul>
+            </section>
+          </div>
+        </details>
+
         <div ref="chatBodyRef" class="chat-body">
           <div v-if="chatBlocks.length === 0" class="empty-state">
             <h3>把任务交给{{ productName }}</h3>
@@ -3022,14 +3927,52 @@ onBeforeUnmount(() => {
                 </div>
                 <pre v-if="item.block.role === 'assistant' && isAssistantRawMode(item.block)" class="markdown-source">{{ visibleChatContent(item.block) }}</pre>
                 <div
-                  v-else-if="item.block.role === 'assistant'"
+                  v-else-if="item.block.role === 'assistant' && isAssistantStreaming(item.block)"
                   class="markdown-body"
                   :class="{ typing: isAssistantTyping(item.block) }"
                 >
-                  <div v-html="renderedMarkdown(item.block)" />
+                  <div class="assistant-stream-text">{{ visibleChatContent(item.block) }}</div>
                   <span v-if="isAssistantTyping(item.block)" class="answer-cursor" aria-hidden="true" />
                 </div>
-                <p v-else :class="{ typing: isAssistantTyping(item.block) }">
+                <div
+                  v-else-if="item.block.role === 'assistant'"
+                  class="markdown-body"
+                >
+                  <div v-html="renderedMarkdown(item.block)" />
+                </div>
+                <div
+                  v-if="item.block.role === 'user' && item.block.attachments?.length"
+                  class="message-attachments"
+                >
+                  <a
+                    v-for="attachment in item.block.attachments"
+                    :key="attachment.id"
+                    class="message-attachment"
+                    :class="{ image: attachment.kind === 'image' }"
+                    :href="chatAttachmentURL(item.block, attachment)"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    :title="attachment.name"
+                  >
+                    <img
+                      v-if="attachment.kind === 'image'"
+                      :src="chatAttachmentURL(item.block, attachment)"
+                      :alt="attachment.name"
+                      loading="lazy"
+                    />
+                    <span v-else class="message-attachment-icon"><FileText :size="18" /></span>
+                    <span class="message-attachment-meta">
+                      <strong>{{ attachment.name }}</strong>
+                      <small>
+                        <template v-if="attachmentFormatLabel(attachment.name)">
+                          {{ attachmentFormatLabel(attachment.name) }} ·
+                        </template>
+                        {{ formatAttachmentSize(attachment.size) }}
+                      </small>
+                    </span>
+                  </a>
+                </div>
+                <p v-if="item.block.role !== 'assistant'" :class="{ typing: isAssistantTyping(item.block) }">
                   <span>{{ visibleChatContent(item.block) }}</span>
                   <span v-if="isAssistantTyping(item.block)" class="answer-cursor" aria-hidden="true" />
                 </p>
@@ -3241,25 +4184,100 @@ onBeforeUnmount(() => {
         </div>
 
         <footer class="composer">
-          <div class="composer-box">
+          <div
+            class="composer-box"
+            :class="{
+              'has-attachments': composerAttachments.length > 0,
+              'is-dragging': composerDragging,
+            }"
+            @dragenter.prevent="composerDragging = true"
+            @dragover.prevent="composerDragging = true"
+            @dragleave.self.prevent="composerDragging = false"
+            @drop.prevent="handleComposerDrop"
+          >
+            <input
+              ref="attachmentInputRef"
+              class="composer-file-input"
+              type="file"
+              multiple
+              accept="image/*,.txt,.md,.json,.yaml,.yml,.xml,.csv,.log,.go,.py,.js,.jsx,.ts,.tsx,.vue,.java,.kt,.rs,.c,.h,.cpp,.hpp,.css,.scss,.html,.sql,.sh,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
+              @change="handleAttachmentInput"
+            />
+            <div v-if="composerAttachments.length > 0" class="composer-attachments">
+              <article
+                v-for="attachment in composerAttachments"
+                :key="attachment.id"
+                class="composer-attachment"
+                :class="{ image: attachment.kind === 'image' }"
+              >
+                <div class="composer-attachment-preview">
+                  <img
+                    v-if="attachment.kind === 'image'"
+                    :src="attachment.dataUrl"
+                    :alt="attachment.name"
+                  />
+                  <FileText v-else :size="20" aria-hidden="true" />
+                </div>
+                <div class="composer-attachment-meta">
+                  <strong :title="attachment.name">{{ attachment.name }}</strong>
+                  <span>
+                    <template v-if="attachmentFormatLabel(attachment.name)">
+                      {{ attachmentFormatLabel(attachment.name) }} ·
+                    </template>
+                    {{ formatAttachmentSize(attachment.size) }}
+                  </span>
+                </div>
+                <button
+                  class="composer-attachment-remove"
+                  type="button"
+                  :title="`移除 ${attachment.name}`"
+                  :aria-label="`移除 ${attachment.name}`"
+                  @click="removeComposerAttachment(attachment.id)"
+                >
+                  <X :size="13" />
+                </button>
+              </article>
+            </div>
             <a-textarea
               v-model:value="userInput"
               class="composer-input"
-              :auto-size="{ minRows: 2, maxRows: 8 }"
+              :auto-size="{ minRows: 3, maxRows: 9 }"
               :placeholder="composerPlaceholder"
               @keydown="handleComposerKeydown"
+              @paste="handleComposerPaste"
             />
-            <a-button
-              class="composer-send"
-              :class="{ ready: canSubmitTurn }"
-              type="primary"
-              :disabled="!canSubmitTurn"
-              :title="selectedTaskIsLive ? '当前任务执行中，请先等待或打断' : '发送'"
-              :aria-label="selectedTaskIsLive ? '当前任务执行中，请先等待或打断' : '发送'"
-              @click="sendTurn"
-            >
-              <template #icon><Send :size="15" /></template>
-            </a-button>
+            <div class="composer-toolbar">
+              <div class="composer-tools">
+                <button
+                  class="composer-tool-button"
+                  type="button"
+                  title="添加文件或图片"
+                  aria-label="添加文件或图片"
+                  :disabled="!selectedTaskId"
+                  @click="openAttachmentPicker"
+                >
+                  <Paperclip :size="17" />
+                </button>
+                <span v-if="composerAttachments.length > 0" class="composer-attachment-count">
+                  {{ composerAttachments.length }} 个附件
+                </span>
+              </div>
+              <a-button
+                class="composer-send"
+                :class="{ ready: canSubmitTurn }"
+                type="primary"
+                shape="circle"
+                :disabled="!canSubmitTurn"
+                :title="selectedTaskIsLive ? '当前任务执行中，请先等待或打断' : '发送'"
+                :aria-label="selectedTaskIsLive ? '当前任务执行中，请先等待或打断' : '发送'"
+                @click="sendTurn"
+              >
+                <template #icon><Send :size="16" /></template>
+              </a-button>
+            </div>
+            <div v-if="composerDragging" class="composer-drop-target" aria-hidden="true">
+              <UploadCloud :size="30" />
+            </div>
           </div>
         </footer>
       </section>
@@ -3575,6 +4593,86 @@ onBeforeUnmount(() => {
                 </section>
               </a-collapse-panel>
 
+              <a-collapse-panel key="skills">
+                <template #header>
+                  <div class="settings-panel-header">
+                    <span>Skills</span>
+                    <a-space>
+                      <a-tag>{{ skills.filter((item) => item.enabled).length }} / {{ skills.length }}</a-tag>
+                      <PackageOpen :size="15" />
+                    </a-space>
+                  </div>
+                </template>
+                <section class="settings-panel-body">
+                  <div class="skill-install-bar">
+                    <a-input
+                      v-model:value="skillInstallURL"
+                      placeholder="https://.../skill.zip"
+                      :disabled="skillInstalling"
+                      @press-enter="installSkillFromURL"
+                    >
+                      <template #prefix><Link2 :size="14" /></template>
+                    </a-input>
+                    <a-button
+                      type="primary"
+                      :loading="skillInstalling"
+                      :disabled="!skillInstallURL.trim()"
+                      @click="installSkillFromURL"
+                    >
+                      安装
+                    </a-button>
+                  </div>
+                  <input
+                    ref="skillUploadInput"
+                    class="visually-hidden"
+                    type="file"
+                    accept=".zip,application/zip"
+                    @change="installSkillArchive"
+                  />
+                  <a-button block :loading="skillInstalling" @click="skillUploadInput?.click()">
+                    <template #icon><UploadCloud :size="14" /></template>
+                    上传 Skill ZIP
+                  </a-button>
+                  <div v-if="skills.length" class="skill-list">
+                    <div v-for="item in skills" :key="item.id" class="skill-row" :class="{ enabled: item.enabled }">
+                      <div class="skill-main">
+                        <div class="skill-title">
+                          <strong>{{ item.name }}</strong>
+                        </div>
+                        <p>{{ item.description || item.id }}</p>
+                        <div class="skill-meta">
+                          <a-tag>{{ item.version }}</a-tag>
+                          <a-tag :color="item.enabled ? 'green' : 'default'">
+                            {{ item.enabled ? '启用' : '停用' }}
+                          </a-tag>
+                          <span>{{ skillSourceLabel(item) }}</span>
+                          <code>{{ item.sha256.slice(0, 12) }}</code>
+                        </div>
+                        <div v-if="item.keywords.length" class="skill-keywords">
+                          <a-tag v-for="keyword in item.keywords.slice(0, 5)" :key="keyword">
+                            {{ keyword }}
+                          </a-tag>
+                        </div>
+                      </div>
+                      <div class="skill-actions">
+                        <a-switch
+                          :checked="item.enabled"
+                          size="small"
+                          :aria-label="item.enabled ? `停用 ${item.name}` : `启用 ${item.name}`"
+                          @change="toggleSkill(item)"
+                        />
+                        <a-popconfirm title="确认删除这个 Skill？" ok-text="删除" cancel-text="取消" @confirm="deleteSkill(item)">
+                          <a-button size="small" danger title="删除 Skill" :aria-label="`删除 ${item.name}`">
+                            <template #icon><Trash2 :size="13" /></template>
+                          </a-button>
+                        </a-popconfirm>
+                      </div>
+                    </div>
+                  </div>
+                  <a-empty v-else description="暂无 Skill" />
+                </section>
+              </a-collapse-panel>
+
               <a-collapse-panel key="providers">
                 <template #header>
                   <div class="settings-panel-header">
@@ -3872,6 +4970,34 @@ onBeforeUnmount(() => {
             v-model:value="providerForm.apiKey"
             :placeholder="editingProviderId ? 'API Key（留空不修改）' : 'API Key'"
           />
+          <a-collapse ghost class="provider-advanced">
+            <a-collapse-panel key="advanced" header="高级参数">
+              <div class="provider-advanced-grid">
+                <label>
+                  <span>连接与响应头超时</span>
+                  <a-input-number
+                    v-model:value="providerForm.timeoutSeconds"
+                    class="full"
+                    :min="1"
+                    :max="600"
+                    :step="5"
+                    addon-after="秒"
+                  />
+                </label>
+                <label>
+                  <span>流空闲超时</span>
+                  <a-input-number
+                    v-model:value="providerForm.streamIdleTimeoutSeconds"
+                    class="full"
+                    :min="5"
+                    :max="1800"
+                    :step="30"
+                    addon-after="秒"
+                  />
+                </label>
+              </div>
+            </a-collapse-panel>
+          </a-collapse>
         </a-space>
       </a-modal>
     </main>

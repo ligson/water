@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ligson/water/water-be/internal/auth"
 )
@@ -70,7 +72,22 @@ func (r *Router) unlockAuth(w http.ResponseWriter, req *http.Request) {
 			WriteError(req.Context(), w, http.StatusServiceUnavailable, "auth not configured")
 			return
 		}
-		WriteError(req.Context(), w, http.StatusUnauthorized, "pin incorrect")
+		var lockedErr *auth.PINLockedError
+		if errors.As(err, &lockedErr) {
+			retryAfter := lockedErr.RetryAfterSeconds(time.Now())
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			WriteJSON(req.Context(), w, http.StatusTooManyRequests, false, "pin temporarily locked", map[string]interface{}{
+				"retryAfterSeconds": retryAfter,
+				"lockedUntil":       lockedErr.Until.Format(timeRFC3339),
+			})
+			return
+		}
+		if errors.Is(err, auth.ErrPINIncorrect) {
+			WriteError(req.Context(), w, http.StatusUnauthorized, "pin incorrect")
+			return
+		}
+		r.logger.ErrorContext(req.Context(), "unlock auth", "error", err)
+		WriteError(req.Context(), w, http.StatusInternalServerError, "unlock auth failed")
 		return
 	}
 	WriteOK(req.Context(), w, "auth unlocked", map[string]interface{}{
@@ -108,7 +125,22 @@ func (r *Router) changePIN(w http.ResponseWriter, req *http.Request) {
 			WriteError(req.Context(), w, http.StatusServiceUnavailable, "auth not configured")
 			return
 		}
-		WriteError(req.Context(), w, http.StatusUnauthorized, "pin incorrect")
+		var lockedErr *auth.PINLockedError
+		if errors.As(err, &lockedErr) {
+			retryAfter := lockedErr.RetryAfterSeconds(time.Now())
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			WriteJSON(req.Context(), w, http.StatusTooManyRequests, false, "pin temporarily locked", map[string]interface{}{
+				"retryAfterSeconds": retryAfter,
+				"lockedUntil":       lockedErr.Until.Format(timeRFC3339),
+			})
+			return
+		}
+		if errors.Is(err, auth.ErrPINIncorrect) {
+			WriteError(req.Context(), w, http.StatusUnauthorized, "pin incorrect")
+			return
+		}
+		r.logger.ErrorContext(req.Context(), "change auth pin", "error", err)
+		WriteError(req.Context(), w, http.StatusInternalServerError, "change pin failed")
 		return
 	}
 	WriteOK(req.Context(), w, "pin changed", map[string]interface{}{
@@ -122,23 +154,35 @@ func (r *Router) authStatus(req *http.Request) (map[string]interface{}, error) {
 	status, err := r.authStore().Status(req.Context(), token)
 	if errors.Is(err, auth.ErrNotConfigured) {
 		return map[string]interface{}{
-			"configured":       false,
-			"authenticated":    true,
-			"locked":           false,
-			"sessionExpiresAt": "",
-			"lastUnlockedAt":   "",
+			"configured":           false,
+			"authenticated":        true,
+			"locked":               false,
+			"sessionExpiresAt":     "",
+			"lastUnlockedAt":       "",
+			"pinLockedUntil":       "",
+			"pinRetryAfterSeconds": 0,
 		}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	return map[string]interface{}{
-		"configured":       status.Configured,
-		"authenticated":    status.Authenticated,
-		"locked":           !status.Authenticated,
-		"sessionExpiresAt": nullableTime(status.SessionExpiresAt),
-		"lastUnlockedAt":   nullableTime(status.LastUnlockedAt),
+		"configured":           status.Configured,
+		"authenticated":        status.Authenticated,
+		"locked":               !status.Authenticated,
+		"sessionExpiresAt":     nullableTime(status.SessionExpiresAt),
+		"lastUnlockedAt":       nullableTime(status.LastUnlockedAt),
+		"pinLockedUntil":       nullableTime(status.PINLockedUntil),
+		"pinRetryAfterSeconds": retryAfterSeconds(status.PINLockedUntil),
 	}, nil
+}
+
+func retryAfterSeconds(until time.Time) int {
+	now := time.Now()
+	if until.IsZero() || !until.After(now) {
+		return 0
+	}
+	return int((until.Sub(now) + time.Second - 1) / time.Second)
 }
 
 func decodeAuthUnlockRequest(w http.ResponseWriter, req *http.Request) (authUnlockRequest, bool) {

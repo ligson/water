@@ -16,6 +16,7 @@ type Builder struct {
 
 type BuildInput struct {
 	WorkspaceID     string
+	RootPath        string
 	TaskID          string
 	UserInput       string
 	ContextTokens   int
@@ -31,6 +32,7 @@ type Pack struct {
 	FileSummaries     []FileSummary `json:"fileSummaries"`
 	UserInput         string        `json:"userInput"`
 	Truncated         bool          `json:"truncated"`
+	IndexStats        IndexStats    `json:"indexStats"`
 }
 
 func NewBuilder(store *Store) *Builder {
@@ -51,6 +53,13 @@ func (b *Builder) Build(ctx context.Context, input BuildInput) (Pack, error) {
 		TokenBudget:       tokenBudget,
 		SystemInstruction: "按 Context Pack 回答。优先使用当前用户输入、任务滚动摘要、已钉住文件和相关文件摘要；信息不足时先请求工具读取文件或向用户确认，禁止凭空补全。修改后优先验证。",
 		UserInput:         input.UserInput,
+	}
+	if strings.TrimSpace(input.RootPath) != "" {
+		stats, err := NewIndexer(b.store).Sync(ctx, input.WorkspaceID, input.RootPath)
+		if err != nil {
+			return Pack{}, err
+		}
+		pack.IndexStats = stats
 	}
 	pack.EstimatedTokens = estimateTokens(pack.SystemInstruction) + estimateTokens(pack.UserInput)
 
@@ -73,7 +82,7 @@ func (b *Builder) Build(ctx context.Context, input BuildInput) (Pack, error) {
 	}
 	fileSummaries = prioritizeRelevant(fileSummaries, input.PinnedFilePaths, input.UserInput+"\n"+pack.TaskSummary)
 	for _, item := range fileSummaries {
-		cost := estimateTokens(item.Path) + estimateTokens(item.Summary)
+		cost := estimateTokens(item.Path) + estimateTokens(item.Summary) + estimateTokens(item.MatchReason)
 		if pack.EstimatedTokens+cost > tokenBudget {
 			pack.Truncated = true
 			break
@@ -118,9 +127,10 @@ func prioritizeRelevant(items []FileSummary, pinned []string, query string) []Fi
 	}
 
 	type rankedFile struct {
-		item  FileSummary
-		score int
-		index int
+		item   FileSummary
+		score  int
+		reason string
+		index  int
 	}
 	ranked := make([]rankedFile, 0, len(items))
 	for index, item := range items {
@@ -128,7 +138,7 @@ func prioritizeRelevant(items []FileSummary, pinned []string, query string) []Fi
 		if rank, ok := pinnedRank[normalizePath(item.Path)]; ok {
 			score += 100000 - rank
 		}
-		ranked = append(ranked, rankedFile{item: item, score: score, index: index})
+		ranked = append(ranked, rankedFile{item: item, score: score, reason: relevanceReason(item, terms, pinnedRank), index: index})
 	}
 	sort.SliceStable(ranked, func(i int, j int) bool {
 		if ranked[i].score != ranked[j].score {
@@ -139,9 +149,52 @@ func prioritizeRelevant(items []FileSummary, pinned []string, query string) []Fi
 
 	out := make([]FileSummary, 0, len(ranked))
 	for _, item := range ranked {
+		item.item.MatchReason = item.reason
 		out = append(out, item.item)
 	}
 	return out
+}
+
+func relevanceReason(item FileSummary, terms map[string]struct{}, pinned map[string]int) string {
+	if _, ok := pinned[normalizePath(item.Path)]; ok {
+		return "用户钉住"
+	}
+	path := strings.ToLower(item.Path)
+	base := strings.ToLower(filepath.Base(item.Path))
+	summary := strings.ToLower(item.Summary)
+	symbols := strings.ToLower(item.SymbolsJSON)
+	imports := strings.ToLower(item.ImportsJSON)
+	reasons := make([]string, 0, 2)
+	for term := range terms {
+		switch {
+		case strings.Contains(base, term):
+			reasons = appendUniqueReason(reasons, "文件名命中 "+term)
+		case strings.Contains(path, term):
+			reasons = appendUniqueReason(reasons, "路径命中 "+term)
+		case strings.Contains(symbols, term):
+			reasons = appendUniqueReason(reasons, "符号命中 "+term)
+		case strings.Contains(imports, term):
+			reasons = appendUniqueReason(reasons, "依赖命中 "+term)
+		case strings.Contains(summary, term):
+			reasons = appendUniqueReason(reasons, "摘要命中 "+term)
+		}
+		if len(reasons) >= 2 {
+			break
+		}
+	}
+	if len(reasons) == 0 {
+		return "工作区索引"
+	}
+	return strings.Join(reasons, "；")
+}
+
+func appendUniqueReason(reasons []string, reason string) []string {
+	for _, existing := range reasons {
+		if existing == reason {
+			return reasons
+		}
+	}
+	return append(reasons, reason)
 }
 
 func relevanceScore(item FileSummary, terms map[string]struct{}) int {

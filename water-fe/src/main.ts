@@ -15,6 +15,7 @@ import {
   Segmented,
   Skeleton,
   Space,
+  Switch,
   Tabs,
   Tag,
   Timeline,
@@ -41,6 +42,7 @@ app.use(Select)
 app.use(Segmented)
 app.use(Skeleton)
 app.use(Space)
+app.use(Switch)
 app.use(Tabs)
 app.use(Tag)
 app.use(Timeline)

@@ -9,28 +9,197 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ligson/water/water-be/internal/approval"
+	"github.com/ligson/water/water-be/internal/document"
 	"github.com/ligson/water/water-be/internal/llm"
 	"github.com/ligson/water/water-be/internal/sandbox"
+	"github.com/ligson/water/water-be/internal/skill"
 	"github.com/ligson/water/water-be/internal/task"
 	"github.com/ligson/water/water-be/internal/workspace"
 )
 
 const (
-	NameListDir    = "list_dir"
-	NameReadFile   = "read_file"
-	NameWriteFile  = "write_file"
-	NameRunCommand = "run_command"
+	NameListDir      = "list_dir"
+	NameReadFile     = "read_file"
+	NameReadDocument = "read_document"
+	NameReadSkill    = "read_skill"
+	NameWriteFile    = "write_file"
+	NameRunCommand   = "run_command"
+
+	maxDocumentBytes     = 50 * 1024 * 1024
+	defaultDocumentChars = 24 * 1024
+	maxDocumentChars     = 64 * 1024
 )
 
 var ErrApprovalRequired = errors.New("approval required")
 
+type ExecutionError struct {
+	Code          string
+	Message       string
+	SuggestedTool string
+	Retryable     bool
+	Hint          string
+}
+
+func (e *ExecutionError) Error() string { return e.Message }
+
+func ErrorDetails(err error) (code string, suggestedTool string, ok bool) {
+	code, suggestedTool, _, _, ok = ErrorMetadata(err)
+	return code, suggestedTool, ok
+}
+
+// ErrorMetadata exposes a stable recovery contract to the Agent loop and UI.
+func ErrorMetadata(err error) (code string, suggestedTool string, retryable bool, hint string, ok bool) {
+	var executionErr *ExecutionError
+	if !errors.As(err, &executionErr) {
+		return "", "", false, "", false
+	}
+	return executionErr.Code, executionErr.SuggestedTool, executionErr.Retryable, executionErr.Hint, true
+}
+
+type Normalization struct {
+	OriginalName    string
+	CanonicalName   string
+	ArgumentAliases map[string]string
+	Defaults        []string
+}
+
+func (n Normalization) Corrected() bool {
+	return n.OriginalName != n.CanonicalName || len(n.ArgumentAliases) > 0 || len(n.Defaults) > 0
+}
+
+// NormalizeRequest makes common local-model tool spelling drift recoverable at the harness boundary.
+func NormalizeRequest(req Request, defaultPath string) (Request, Normalization) {
+	normalized := req
+	originalName := strings.TrimSpace(req.Name)
+	canonicalName := canonicalToolName(originalName)
+	correction := Normalization{
+		OriginalName:    originalName,
+		CanonicalName:   canonicalName,
+		ArgumentAliases: make(map[string]string),
+	}
+
+	values, ok := decodeObject(req.Arguments)
+	if !ok {
+		normalized.Name = canonicalName
+		return normalized, correction
+	}
+	copyAlias := func(target string, aliases ...string) {
+		if _, exists := values[target]; exists {
+			return
+		}
+		for _, alias := range aliases {
+			if value, exists := values[alias]; exists {
+				values[target] = value
+				delete(values, alias)
+				correction.ArgumentAliases[alias] = target
+				return
+			}
+		}
+	}
+	switch canonicalName {
+	case NameListDir, NameReadFile, NameReadDocument, NameWriteFile:
+		copyAlias("path", "file", "directory", "cwd")
+		if canonicalName == NameReadDocument {
+			copyAlias("maxChars", "max_chars", "limit")
+		}
+	case NameRunCommand:
+		copyAlias("command", "cmd", "script")
+		copyAlias("workingDir", "working_dir", "cwd")
+		copyAlias("timeoutMs", "timeout_ms")
+	case NameReadSkill:
+		copyAlias("id", "skillId", "skill_id", "name")
+	case "":
+		// Keep malformed names intact for a structured unsupported-tool error.
+	}
+	if canonicalName == NameWriteFile {
+		copyAlias("content", "body", "text")
+	}
+	if (canonicalName == NameListDir || canonicalName == NameReadFile || canonicalName == NameReadDocument) && emptyStringValue(values["path"]) && strings.TrimSpace(defaultPath) != "" {
+		values["path"] = json.RawMessage(strconv.Quote(filepath.Clean(defaultPath)))
+		correction.Defaults = append(correction.Defaults, "path")
+		if canonicalName == NameReadFile || canonicalName == NameReadDocument {
+			canonicalName = NameListDir
+			correction.CanonicalName = canonicalName
+		}
+	}
+	if raw, err := json.Marshal(values); err == nil {
+		normalized.Arguments = raw
+	}
+	normalized.Name = canonicalName
+	return normalized, correction
+}
+
+func canonicalToolName(name string) string {
+	compact := strings.ToLower(strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.TrimSpace(name)))
+	switch compact {
+	case "listdir", "ls", "listdirectory":
+		return NameListDir
+	case "readfile", "catfile":
+		return NameReadFile
+	case "readdocument", "inspectdocument", "readoffice", "readpdf":
+		return NameReadDocument
+	case "readskill", "loadskill", "useskill":
+		return NameReadSkill
+	case "writefile":
+		return NameWriteFile
+	case "runcommand", "exec", "shell":
+		return NameRunCommand
+	default:
+		return strings.TrimSpace(name)
+	}
+}
+
+func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	if len(raw) == 0 {
+		return map[string]json.RawMessage{}, true
+	}
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil || values == nil {
+		return nil, false
+	}
+	return values, true
+}
+
+func emptyStringValue(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	var value string
+	return json.Unmarshal(raw, &value) != nil || strings.TrimSpace(value) == ""
+}
+
 type Executor struct {
-	permissions   *sandbox.PermissionEngine
-	approvalStore *approval.Store
+	permissions    *sandbox.PermissionEngine
+	approvalStore  *approval.Store
+	documentReader DocumentReader
+	skillReader    SkillReader
+}
+
+type DocumentReader interface {
+	Extract(ctx context.Context, path string) (document.Result, error)
+}
+
+type SkillReader interface {
+	GetEnabled(ctx context.Context, id string) (skill.Skill, error)
+}
+
+type ExecutorOption func(*Executor)
+
+func WithDocumentReader(reader DocumentReader) ExecutorOption {
+	return func(executor *Executor) {
+		executor.documentReader = reader
+	}
+}
+
+func WithSkillReader(reader SkillReader) ExecutorOption {
+	return func(executor *Executor) {
+		executor.skillReader = reader
+	}
 }
 
 type Request struct {
@@ -54,8 +223,16 @@ type Result struct {
 	Approval *approval.Approval `json:"approval,omitempty"`
 }
 
-func NewExecutor(permissions *sandbox.PermissionEngine, approvalStore *approval.Store) *Executor {
-	return &Executor{permissions: permissions, approvalStore: approvalStore}
+func NewExecutor(permissions *sandbox.PermissionEngine, approvalStore *approval.Store, options ...ExecutorOption) *Executor {
+	executor := &Executor{
+		permissions:    permissions,
+		approvalStore:  approvalStore,
+		documentReader: document.NewExtractor(""),
+	}
+	for _, option := range options {
+		option(executor)
+	}
+	return executor
 }
 
 func Definitions() []llm.Tool {
@@ -65,15 +242,34 @@ func Definitions() []llm.Tool {
 			Function: llm.ToolFunction{
 				Name:        NameListDir,
 				Description: "列出指定目录中的文件和子目录。",
-				Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"要列出的绝对路径"}},"required":["path"],"additionalProperties":false}`),
+				Parameters:  toolParameters(`"path":{"type":"string","description":"要列出的绝对路径"}`, `"path"`),
 			},
 		},
 		{
 			Type: "function",
 			Function: llm.ToolFunction{
 				Name:        NameReadFile,
-				Description: "读取指定文件内容。",
-				Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"要读取的绝对路径"}},"required":["path"],"additionalProperties":false}`),
+				Description: "读取文本或代码文件内容。PDF、Word、Excel、PowerPoint 必须改用 read_document。",
+				Parameters:  toolParameters(`"path":{"type":"string","description":"要读取的绝对路径"}`, `"path"`),
+			},
+		},
+		{
+			Type: "function",
+			Function: llm.ToolFunction{
+				Name:        NameReadDocument,
+				Description: "将 PDF、DOCX、XLS/XLSX 或 PPTX 提取为结构化 Markdown。内容过长时根据 nextOffset 分段继续读取。",
+				Parameters: toolParameters(
+					`"path":{"type":"string","description":"文档的绝对路径"},"offset":{"type":"integer","minimum":0,"description":"从第几个字符开始，默认为 0"},"maxChars":{"type":"integer","minimum":1,"maximum":65536,"description":"本次最多返回字符数，默认 24576"}`,
+					`"path"`,
+				),
+			},
+		},
+		{
+			Type: "function",
+			Function: llm.ToolFunction{
+				Name:        NameReadSkill,
+				Description: "按 ID 读取已启用 Skill 的完整工作流说明。根据系统提示中的 Skill 目录选择；不要猜测不存在或未启用的 Skill。",
+				Parameters:  toolParameters(`"id":{"type":"string","description":"Skill 目录中列出的 id"}`, `"id"`),
 			},
 		},
 		{
@@ -81,7 +277,7 @@ func Definitions() []llm.Tool {
 			Function: llm.ToolFunction{
 				Name:        NameWriteFile,
 				Description: "写入或覆盖指定文件内容。",
-				Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"要写入的绝对路径"},"content":{"type":"string","description":"要写入的文件内容"}},"required":["path","content"],"additionalProperties":false}`),
+				Parameters:  toolParameters(`"path":{"type":"string","description":"要写入的绝对路径"},"content":{"type":"string","description":"要写入的文件内容"}`, `"path","content"`),
 			},
 		},
 		{
@@ -89,25 +285,42 @@ func Definitions() []llm.Tool {
 			Function: llm.ToolFunction{
 				Name:        NameRunCommand,
 				Description: "在工作区目录执行有明确结束条件的命令。用于查看系统信息、运行测试或构建；不要用它启动长驻开发服务，例如 npm run dev、vite、mvn spring-boot:run。高风险命令会进入审批流程。常见只读系统信息示例：磁盘 df -h /，macOS 内存 vm_stat 与 sysctl hw.memsize，Linux 内存 free -h，Windows 内存 wmic OS get FreePhysicalMemory,TotalVisibleMemorySize /Value，CPU 使用率 macOS top -l 1 -s 0 -n 0，Linux top -bn1，Windows wmic cpu get loadpercentage /Value。",
-				Parameters:  json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"要执行的 shell 命令"},"workingDir":{"type":"string","description":"执行目录，默认为工作区根目录"},"timeoutMs":{"type":"integer","description":"超时时间，单位毫秒"}},"required":["command"],"additionalProperties":false}`),
+				Parameters:  toolParameters(`"command":{"type":"string","description":"要执行的 shell 命令"},"workingDir":{"type":"string","description":"执行目录，默认为工作区根目录"},"timeoutMs":{"type":"integer","description":"超时时间，单位毫秒"}`, `"command"`),
 			},
 		},
 	}
 }
 
+func toolParameters(properties string, required string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(
+		`{"type":"object","properties":{%s,"purpose":{"type":"string","description":"本次调用要验证或推进的具体目的"},"hypothesisId":{"type":"string","description":"要验证的假设 ID；不确定时可省略"}},"required":[%s],"additionalProperties":false}`,
+		properties,
+		required,
+	))
+}
+
 func (e *Executor) Execute(ctx context.Context, toolCtx Context, req Request) (Result, error) {
+	req, _ = NormalizeRequest(req, toolCtx.Workspace.RootPath)
 	name := strings.TrimSpace(req.Name)
 	switch name {
 	case NameListDir:
 		return e.listDir(ctx, toolCtx, req)
 	case NameReadFile:
 		return e.readFile(ctx, toolCtx, req)
+	case NameReadDocument:
+		return e.readDocument(ctx, toolCtx, req)
+	case NameReadSkill:
+		return e.readSkill(ctx, req)
 	case NameWriteFile:
 		return e.writeFile(ctx, toolCtx, req)
 	case NameRunCommand:
 		return e.runCommand(ctx, toolCtx, req)
 	default:
-		return Result{}, fmt.Errorf("unsupported tool %q", name)
+		return Result{}, &ExecutionError{
+			Code:      "unsupported_tool",
+			Message:   fmt.Sprintf("unsupported tool %q; available tools: %s", name, strings.Join([]string{NameListDir, NameReadFile, NameReadDocument, NameReadSkill, NameWriteFile, NameRunCommand}, ", ")),
+			Retryable: false,
+		}
 	}
 }
 
@@ -115,6 +328,9 @@ func (e *Executor) listDir(ctx context.Context, toolCtx Context, req Request) (R
 	var args pathArgs
 	if err := decodeArgs(req.Arguments, &args); err != nil {
 		return Result{}, err
+	}
+	if strings.TrimSpace(args.Path) == "" {
+		return Result{}, &ExecutionError{Code: "missing_path", Message: "list_dir requires path; use the injected workspace root when listing the current project", SuggestedTool: NameListDir, Retryable: true}
 	}
 	path, err := e.permissions.CheckPath(ctx, toolCtx.Workspace, args.Path, sandbox.AccessRead)
 	if err != nil {
@@ -146,9 +362,23 @@ func (e *Executor) readFile(ctx context.Context, toolCtx Context, req Request) (
 	if err := decodeArgs(req.Arguments, &args); err != nil {
 		return Result{}, err
 	}
+	if strings.TrimSpace(args.Path) == "" {
+		return Result{}, &ExecutionError{Code: "missing_path", Message: "read_file requires a file path", SuggestedTool: NameListDir, Retryable: true, Hint: "先使用 list_dir 查看工作区，再读取具体文件。"}
+	}
 	path, err := e.permissions.CheckPath(ctx, toolCtx.Workspace, args.Path, sandbox.AccessRead)
 	if err != nil {
 		return Result{}, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return Result{}, fmt.Errorf("inspect file: %w", err)
+	}
+	if info.IsDir() {
+		return Result{}, &ExecutionError{
+			Code:          "target_is_directory",
+			Message:       "read_file target is a directory",
+			SuggestedTool: NameListDir,
+		}
 	}
 
 	content, err := os.ReadFile(path)
@@ -158,10 +388,127 @@ func (e *Executor) readFile(ctx context.Context, toolCtx Context, req Request) (
 	return Result{Name: NameReadFile, Approved: true, Output: map[string]interface{}{"path": path, "content": string(content)}}, nil
 }
 
+func (e *Executor) readDocument(ctx context.Context, toolCtx Context, req Request) (Result, error) {
+	var args documentArgs
+	if err := decodeArgs(req.Arguments, &args); err != nil {
+		return Result{}, err
+	}
+	if strings.TrimSpace(args.Path) == "" {
+		return Result{}, &ExecutionError{Code: "missing_path", Message: "read_document requires a document path", SuggestedTool: NameListDir, Retryable: true}
+	}
+	path, err := e.permissions.CheckPath(ctx, toolCtx.Workspace, args.Path, sandbox.AccessRead)
+	if err != nil {
+		return Result{}, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return Result{}, fmt.Errorf("inspect document: %w", err)
+	}
+	if info.IsDir() {
+		return Result{}, &ExecutionError{Code: "target_is_directory", Message: "read_document target is a directory", SuggestedTool: NameListDir, Retryable: true}
+	}
+	if info.Size() > maxDocumentBytes {
+		return Result{}, &ExecutionError{
+			Code:      "document_too_large",
+			Message:   "文档超过 50 MiB 的安全解析上限",
+			Retryable: false,
+			Hint:      "先拆分文档，再分别上传或读取。",
+		}
+	}
+	if !document.SupportsPath(path) {
+		return Result{}, &ExecutionError{
+			Code:      "unsupported_document_type",
+			Message:   "read_document 当前不支持 " + strings.ToUpper(filepath.Ext(path)) + " 格式",
+			Retryable: false,
+			Hint:      "当前支持 PDF、DOCX、XLS/XLSX 和 PPTX；文本或代码请使用 read_file。",
+		}
+	}
+	if args.Offset < 0 {
+		return Result{}, &ExecutionError{Code: "invalid_offset", Message: "offset 不能小于 0", Retryable: true}
+	}
+	maxChars := args.MaxChars
+	if maxChars <= 0 {
+		maxChars = defaultDocumentChars
+	}
+	if maxChars > maxDocumentChars {
+		maxChars = maxDocumentChars
+	}
+
+	extracted, err := e.documentReader.Extract(ctx, path)
+	if err != nil {
+		var documentErr *document.Error
+		if errors.As(err, &documentErr) {
+			return Result{}, &ExecutionError{
+				Code:      documentErr.Code,
+				Message:   documentErr.Message,
+				Retryable: documentErr.Code == "document_extract_timeout",
+				Hint:      documentErr.Hint,
+			}
+		}
+		return Result{}, err
+	}
+	runes := []rune(extracted.Content)
+	if args.Offset > len(runes) {
+		return Result{}, &ExecutionError{Code: "invalid_offset", Message: fmt.Sprintf("offset %d 超过文档总字符数 %d", args.Offset, len(runes)), Retryable: true}
+	}
+	end := args.Offset + maxChars
+	if end > len(runes) {
+		end = len(runes)
+	}
+	nextOffset := 0
+	truncated := end < len(runes)
+	if truncated {
+		nextOffset = end
+	}
+	return Result{Name: NameReadDocument, Approved: true, Output: map[string]interface{}{
+		"path":       path,
+		"format":     extracted.Format,
+		"engine":     extracted.Engine,
+		"content":    string(runes[args.Offset:end]),
+		"offset":     args.Offset,
+		"nextOffset": nextOffset,
+		"totalChars": len(runes),
+		"truncated":  truncated,
+	}}, nil
+}
+
+func (e *Executor) readSkill(ctx context.Context, req Request) (Result, error) {
+	var args skillArgs
+	if err := decodeArgs(req.Arguments, &args); err != nil {
+		return Result{}, err
+	}
+	id := strings.TrimSpace(args.ID)
+	if id == "" {
+		return Result{}, &ExecutionError{Code: "missing_skill_id", Message: "read_skill requires an id from the enabled Skill catalog", SuggestedTool: NameReadSkill, Retryable: true}
+	}
+	if e.skillReader == nil {
+		return Result{}, &ExecutionError{Code: "skill_reader_unavailable", Message: "Skill reader is unavailable", Retryable: false}
+	}
+	item, err := e.skillReader.GetEnabled(ctx, id)
+	if errors.Is(err, skill.ErrNotFound) {
+		return Result{}, &ExecutionError{Code: "skill_not_found", Message: fmt.Sprintf("Skill %q is not installed", id), Retryable: false, Hint: "仅使用系统提示中列出的已启用 Skill ID。"}
+	}
+	if errors.Is(err, skill.ErrDisabled) {
+		return Result{}, &ExecutionError{Code: "skill_disabled", Message: fmt.Sprintf("Skill %q is disabled", id), Retryable: false, Hint: "需要用户先在设置的 Skills 分类中启用。"}
+	}
+	if err != nil {
+		return Result{}, fmt.Errorf("read skill: %w", err)
+	}
+	return Result{Name: NameReadSkill, Approved: true, Output: map[string]interface{}{
+		"id":           item.ID,
+		"name":         item.Name,
+		"version":      item.Version,
+		"instructions": item.Instructions,
+	}}, nil
+}
+
 func (e *Executor) writeFile(ctx context.Context, toolCtx Context, req Request) (Result, error) {
 	var args writeFileArgs
 	if err := decodeArgs(req.Arguments, &args); err != nil {
 		return Result{}, err
+	}
+	if strings.TrimSpace(args.Path) == "" {
+		return Result{}, &ExecutionError{Code: "missing_path", Message: "write_file requires a target file path", Retryable: true, Hint: "先确定工作区内的目标文件路径，再写入文件。"}
 	}
 	path, err := e.permissions.CheckPath(ctx, toolCtx.Workspace, args.Path, sandbox.AccessWrite)
 	if err != nil {
@@ -263,7 +610,7 @@ func (e *Executor) runCommand(ctx context.Context, toolCtx Context, req Request)
 	}
 	args.Command = strings.TrimSpace(args.Command)
 	if args.Command == "" {
-		return Result{}, errors.New("command is required")
+		return Result{}, &ExecutionError{Code: "missing_command", Message: "run_command requires command", Retryable: true}
 	}
 
 	if hasBackgroundOperator(args.Command) {
@@ -328,14 +675,61 @@ func (e *Executor) runCommand(ctx context.Context, toolCtx Context, req Request)
 		"arch":       runtime.GOARCH,
 		"output":     string(output),
 		"truncated":  truncated,
+		"exitCode":   0,
+		"success":    err == nil,
+	}
+	if kind := verificationKind(args.Command); kind != "" {
+		result["verificationKind"] = kind
 	}
 	if err != nil {
+		exitCode := 1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+		timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded)
+		result["exitCode"] = exitCode
+		result["success"] = false
+		result["timedOut"] = timedOut
 		result["error"] = err.Error()
+		if timedOut {
+			result["errorKind"] = "timeout"
+		} else if errors.Is(runCtx.Err(), context.Canceled) {
+			result["errorKind"] = "canceled"
+		} else {
+			result["errorKind"] = "process_exit"
+		}
 		if isCommandNotFound(output) {
 			result["hint"] = commandNotFoundHint(args.Command)
 		}
 	}
 	return Result{Name: NameRunCommand, Approved: true, Output: result}, nil
+}
+
+func verificationKind(command string) string {
+	lower := strings.ToLower(command)
+	if containsCommandToken(lower, []string{"verify:e2e", "verify-e2e", "water_e2e_ok", "acceptance"}) {
+		return "end_to_end"
+	}
+	if containsCommandToken(lower, []string{"test", "pytest", "go vet", "cargo check"}) {
+		return "test"
+	}
+	if containsCommandToken(lower, []string{"build", "compile", "package"}) {
+		return "build"
+	}
+	if containsCommandToken(lower, []string{"lint", "format", "fmt"}) {
+		return "lint"
+	}
+	return ""
+}
+
+func containsCommandToken(command string, values []string) bool {
+	for _, value := range values {
+		if strings.Contains(command, value) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasBackgroundOperator(command string) bool {
@@ -520,15 +914,24 @@ func (e *Executor) validateCommandPaths(ctx context.Context, toolCtx Context, co
 		return nil
 	}
 	for _, field := range fields[1:] {
-		if !filepath.IsAbs(strings.Trim(field, `"'`)) {
+		cleaned := strings.Trim(field, `"'`)
+		if !filepath.IsAbs(cleaned) || isShellDevicePath(cleaned) {
 			continue
 		}
-		cleaned := strings.Trim(field, `"'`)
 		if _, err := e.permissions.CheckPath(ctx, toolCtx.Workspace, cleaned, sandbox.AccessRead); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func isShellDevicePath(path string) bool {
+	switch filepath.Clean(path) {
+	case "/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr":
+		return true
+	default:
+		return false
+	}
 }
 
 func shellCommand(goos string, command string) (string, []string) {
@@ -795,18 +1198,38 @@ func approvalFromErr(err error) *approval.Approval {
 }
 
 type pathArgs struct {
-	Path string `json:"path"`
+	Path         string `json:"path"`
+	Purpose      string `json:"purpose"`
+	HypothesisID string `json:"hypothesisId"`
+}
+
+type documentArgs struct {
+	Path         string `json:"path"`
+	Offset       int    `json:"offset"`
+	MaxChars     int    `json:"maxChars"`
+	Purpose      string `json:"purpose"`
+	HypothesisID string `json:"hypothesisId"`
+}
+
+type skillArgs struct {
+	ID           string `json:"id"`
+	Purpose      string `json:"purpose"`
+	HypothesisID string `json:"hypothesisId"`
 }
 
 type writeFileArgs struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
+	Path         string `json:"path"`
+	Content      string `json:"content"`
+	Purpose      string `json:"purpose"`
+	HypothesisID string `json:"hypothesisId"`
 }
 
 type commandArgs struct {
-	Command    string `json:"command"`
-	WorkingDir string `json:"workingDir"`
-	TimeoutMS  int    `json:"timeoutMs"`
+	Command      string `json:"command"`
+	WorkingDir   string `json:"workingDir"`
+	TimeoutMS    int    `json:"timeoutMs"`
+	Purpose      string `json:"purpose"`
+	HypothesisID string `json:"hypothesisId"`
 }
 
 type dirEntry struct {
@@ -821,7 +1244,7 @@ func decodeArgs(raw json.RawMessage, target interface{}) error {
 		raw = json.RawMessage(`{}`)
 	}
 	if err := json.Unmarshal(raw, target); err != nil {
-		return fmt.Errorf("invalid tool arguments: %w", err)
+		return &ExecutionError{Code: "invalid_arguments", Message: fmt.Sprintf("invalid tool arguments: %v", err), Retryable: true, Hint: "工具参数必须是 JSON 对象，并使用 path、command、content 等标准字段。"}
 	}
 	return nil
 }

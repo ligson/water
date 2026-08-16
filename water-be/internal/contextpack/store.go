@@ -22,6 +22,7 @@ type FileSummary struct {
 	Summary     string    `json:"summary"`
 	SymbolsJSON string    `json:"symbolsJson"`
 	ImportsJSON string    `json:"importsJson"`
+	MatchReason string    `json:"matchReason,omitempty"`
 	CreatedAt   time.Time `json:"createdAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
 }

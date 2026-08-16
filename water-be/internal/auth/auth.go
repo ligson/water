@@ -11,12 +11,30 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ligson/water/water-be/internal/dbutil"
 )
 
 var ErrNotConfigured = errors.New("auth not configured")
+var ErrPINIncorrect = errors.New("pin incorrect")
+
+type PINLockedError struct {
+	Until time.Time
+}
+
+func (e *PINLockedError) Error() string {
+	return "pin temporarily locked"
+}
+
+func (e *PINLockedError) RetryAfterSeconds(now time.Time) int {
+	remaining := e.Until.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	return int((remaining + time.Second - 1) / time.Second)
+}
 
 const (
 	defaultSessionTTL = 30 * 24 * time.Hour
@@ -24,7 +42,9 @@ const (
 )
 
 type Store struct {
-	db *sql.DB
+	db  *sql.DB
+	mu  sync.Mutex
+	now func() time.Time
 }
 
 type Status struct {
@@ -32,6 +52,7 @@ type Status struct {
 	Authenticated    bool
 	SessionExpiresAt time.Time
 	LastUnlockedAt   time.Time
+	PINLockedUntil   time.Time
 }
 
 type Session struct {
@@ -41,7 +62,7 @@ type Session struct {
 }
 
 func NewStore(db *sql.DB) *Store {
-	return &Store{db: db}
+	return &Store{db: db, now: time.Now}
 }
 
 func (s *Store) Ensure(ctx context.Context, bootstrapPin string) (string, error) {
@@ -69,7 +90,10 @@ func (s *Store) Status(ctx context.Context, token string) (Status, error) {
 		return Status{}, err
 	}
 
-	status := Status{Configured: true}
+	status := Status{
+		Configured:     true,
+		PINLockedUntil: dbutil.ParseTime(state.PINLockedUntilRaw),
+	}
 	if token == "" {
 		return status, nil
 	}
@@ -84,6 +108,9 @@ func (s *Store) Status(ctx context.Context, token string) (Status, error) {
 }
 
 func (s *Store) Unlock(ctx context.Context, pin string) (Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	state, err := s.loadState(ctx)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -91,9 +118,22 @@ func (s *Store) Unlock(ctx context.Context, pin string) (Session, error) {
 		}
 		return Session{}, err
 	}
-	if !comparePIN(state.PinHash, state.PinSalt, pin) {
-		return Session{}, errors.New("pin incorrect")
+	now := s.currentTime()
+	if lockedUntil := dbutil.ParseTime(state.PINLockedUntilRaw); lockedUntil.After(now) {
+		return Session{}, &PINLockedError{Until: lockedUntil}
 	}
+	if !comparePIN(state.PinHash, state.PinSalt, pin) {
+		lockedUntil, err := s.registerPINFailure(ctx, state, now)
+		if err != nil {
+			return Session{}, err
+		}
+		if !lockedUntil.IsZero() {
+			return Session{}, &PINLockedError{Until: lockedUntil}
+		}
+		return Session{}, ErrPINIncorrect
+	}
+	state.PINFailedAttempts = 0
+	state.PINLockedUntilRaw = ""
 	return s.issueSession(ctx, state)
 }
 
@@ -110,6 +150,9 @@ func (s *Store) Lock(ctx context.Context, token string) error {
 }
 
 func (s *Store) ChangePIN(ctx context.Context, currentPIN, newPIN string) (Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	state, err := s.loadState(ctx)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -117,11 +160,24 @@ func (s *Store) ChangePIN(ctx context.Context, currentPIN, newPIN string) (Sessi
 		}
 		return Session{}, err
 	}
+	now := s.currentTime()
+	if lockedUntil := dbutil.ParseTime(state.PINLockedUntilRaw); lockedUntil.After(now) {
+		return Session{}, &PINLockedError{Until: lockedUntil}
+	}
 	if !comparePIN(state.PinHash, state.PinSalt, currentPIN) {
-		return Session{}, errors.New("pin incorrect")
+		lockedUntil, err := s.registerPINFailure(ctx, state, now)
+		if err != nil {
+			return Session{}, err
+		}
+		if !lockedUntil.IsZero() {
+			return Session{}, &PINLockedError{Until: lockedUntil}
+		}
+		return Session{}, ErrPINIncorrect
 	}
 	state.PinSalt = randomSalt()
 	state.PinHash = hashPIN(state.PinSalt, newPIN)
+	state.PINFailedAttempts = 0
+	state.PINLockedUntilRaw = ""
 	if _, err := s.persistState(ctx, state); err != nil {
 		return Session{}, err
 	}
@@ -143,7 +199,7 @@ func (s *Store) ValidateToken(ctx context.Context, token string) (bool, error) {
 func (s *Store) loadState(ctx context.Context) (stateRecord, error) {
 	var state stateRecord
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, pin_hash, pin_salt, COALESCE(session_token_hash, ''), COALESCE(session_expires_at, ''), COALESCE(session_issued_at, ''), COALESCE(last_unlocked_at, ''), created_at, updated_at
+SELECT id, pin_hash, pin_salt, COALESCE(session_token_hash, ''), COALESCE(session_expires_at, ''), COALESCE(session_issued_at, ''), COALESCE(last_unlocked_at, ''), COALESCE(pin_failed_attempts, 0), COALESCE(pin_locked_until, ''), created_at, updated_at
 FROM auth_state
 WHERE id = ?`, stateRowID)
 	if err := row.Scan(
@@ -154,6 +210,8 @@ WHERE id = ?`, stateRowID)
 		&state.SessionExpiresAtRaw,
 		&state.SessionIssuedAtRaw,
 		&state.LastUnlockedAtRaw,
+		&state.PINFailedAttempts,
+		&state.PINLockedUntilRaw,
 		&state.CreatedAtRaw,
 		&state.UpdatedAtRaw,
 	); err != nil {
@@ -167,7 +225,7 @@ func (s *Store) createState(ctx context.Context, bootstrapPin string) (string, e
 	if bootstrapPin == "" {
 		bootstrapPin = generatePIN()
 	}
-	now := time.Now()
+	now := s.currentTime()
 	state := stateRecord{
 		ID:           stateRowID,
 		PinSalt:      randomSalt(),
@@ -176,8 +234,8 @@ func (s *Store) createState(ctx context.Context, bootstrapPin string) (string, e
 	}
 	state.PinHash = hashPIN(state.PinSalt, bootstrapPin)
 	if _, err := s.db.ExecContext(ctx, `
-INSERT INTO auth_state (id, pin_hash, pin_salt, session_token_hash, session_expires_at, session_issued_at, last_unlocked_at, created_at, updated_at)
-VALUES (?, ?, ?, '', '', '', '', ?, ?)`,
+	INSERT INTO auth_state (id, pin_hash, pin_salt, session_token_hash, session_expires_at, session_issued_at, last_unlocked_at, pin_failed_attempts, pin_locked_until, created_at, updated_at)
+VALUES (?, ?, ?, '', '', '', '', 0, '', ?, ?)`,
 		state.ID, state.PinHash, state.PinSalt, state.CreatedAtRaw, state.UpdatedAtRaw); err != nil {
 		return "", fmt.Errorf("insert auth state: %w", err)
 	}
@@ -194,12 +252,14 @@ func (s *Store) updatePIN(ctx context.Context, state stateRecord, newPIN string)
 	state.SessionExpiresAtRaw = ""
 	state.SessionIssuedAtRaw = ""
 	state.LastUnlockedAtRaw = ""
+	state.PINFailedAttempts = 0
+	state.PINLockedUntilRaw = ""
 	_, err := s.persistState(ctx, state)
 	return err
 }
 
 func (s *Store) issueSession(ctx context.Context, state stateRecord) (Session, error) {
-	now := time.Now()
+	now := s.currentTime()
 	token := generateToken()
 	tokenHash := hashToken(token)
 	expiresAt := now.Add(defaultSessionTTL)
@@ -233,17 +293,17 @@ func (s *Store) validateToken(ctx context.Context, state stateRecord, token stri
 		return false, time.Time{}, time.Time{}, nil
 	}
 	expiresAt := dbutil.ParseTime(state.SessionExpiresAtRaw)
-	if !expiresAt.IsZero() && time.Now().After(expiresAt) {
+	if !expiresAt.IsZero() && s.currentTime().After(expiresAt) {
 		return false, time.Time{}, time.Time{}, nil
 	}
 	return true, expiresAt, dbutil.ParseTime(state.LastUnlockedAtRaw), nil
 }
 
 func (s *Store) persistState(ctx context.Context, state stateRecord) (stateRecord, error) {
-	now := dbutil.FormatTime(time.Now())
+	now := dbutil.FormatTime(s.currentTime())
 	_, err := s.db.ExecContext(ctx, `
 UPDATE auth_state
-SET pin_hash = ?, pin_salt = ?, session_token_hash = ?, session_expires_at = ?, session_issued_at = ?, last_unlocked_at = ?, updated_at = ?
+SET pin_hash = ?, pin_salt = ?, session_token_hash = ?, session_expires_at = ?, session_issued_at = ?, last_unlocked_at = ?, pin_failed_attempts = ?, pin_locked_until = ?, updated_at = ?
 WHERE id = ?`,
 		state.PinHash,
 		state.PinSalt,
@@ -251,6 +311,8 @@ WHERE id = ?`,
 		state.SessionExpiresAtRaw,
 		state.SessionIssuedAtRaw,
 		state.LastUnlockedAtRaw,
+		state.PINFailedAttempts,
+		state.PINLockedUntilRaw,
 		now,
 		state.ID,
 	)
@@ -268,8 +330,46 @@ type stateRecord struct {
 	SessionExpiresAtRaw string
 	SessionIssuedAtRaw  string
 	LastUnlockedAtRaw   string
+	PINFailedAttempts   int
+	PINLockedUntilRaw   string
 	CreatedAtRaw        string
 	UpdatedAtRaw        string
+}
+
+func (s *Store) registerPINFailure(ctx context.Context, state stateRecord, now time.Time) (time.Time, error) {
+	state.PINFailedAttempts++
+	var lockedUntil time.Time
+	if lockout := pinLockoutDuration(state.PINFailedAttempts); lockout > 0 {
+		lockedUntil = now.Add(lockout)
+		state.PINLockedUntilRaw = dbutil.FormatTime(lockedUntil)
+	} else {
+		state.PINLockedUntilRaw = ""
+	}
+	_, err := s.persistState(ctx, state)
+	return lockedUntil, err
+}
+
+func pinLockoutDuration(failedAttempts int) time.Duration {
+	switch failedAttempts {
+	case 3:
+		return time.Minute
+	case 4:
+		return 5 * time.Minute
+	case 5:
+		return 15 * time.Minute
+	default:
+		if failedAttempts >= 6 {
+			return 30 * time.Minute
+		}
+		return 0
+	}
+}
+
+func (s *Store) currentTime() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 func randomSalt() string {
