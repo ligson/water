@@ -4,16 +4,13 @@
 
 ## 安装
 
-需要 root 权限，并且目标系统需要 systemd：
+需要 root 权限，并且目标系统需要 systemd。直接在 Release 包解压目录执行时，安装器默认把二进制、配置和数据放在当前目录，不需要重复传目录参数：
 
 ```bash
-sudo ./install.sh \
-  --user water \
-  --group water \
-  --workspace-dir /srv/water/workspace \
-  --data-dir /var/lib/water \
-  --http-addr :8080
+sudo ./install.sh
 ```
+
+默认目录结构为：`water`、`water.env`、`runtime/` 和 `data/`。新安装默认监听 `:8080`；如果目录中已有 `water.env`，升级时会保留其中的监听地址和 PIN。
 
 若目标系统已经有运行用户，可以直接指定现有用户和组。安装器不会自动修改工作区所有权：
 
@@ -22,14 +19,13 @@ sudo ./install.sh \
   --user nas-user \
   --group users \
   --workspace-dir /volume1/homes/nas-user/workspace \
-  --data-dir /volume1/apps/water/data \
   --http-addr :13013 \
   --env-file /path/to/existing/water.env
 ```
 
-`--env-file` 只在安装时复制到 `/etc/water/water.env`，权限为服务用户可读的私有文件。升级时默认保留已有配置和数据库。
+使用 `sudo ./install.sh` 时，若 `SUDO_USER` 已存在，安装器默认使用该用户及其主组；也可以显式指定 `--user` 和 `--group`。`--env-file` 只在安装时复制到当前配置目录的 `water.env`，权限为服务用户可读的私有文件。升级时默认保留已有配置和数据库。
 
-如果希望二进制、配置和数据都放在同一个 NAS 部署目录，可以指定相同的 `--install-dir` 和 `--config-dir`：
+如果需要把 Release 包安装到另一个目录，才需要指定目录参数：
 
 ```bash
 sudo ./install.sh \
@@ -43,7 +39,7 @@ sudo ./install.sh \
   --env-file /path/to/existing/water.env
 ```
 
-升级时继续使用相同的目录参数；安装器会保留已有 `water.env` 和 SQLite 数据。
+升级时继续在同一个 Release 包目录执行即可；安装器会保留已有 `water.env` 和 SQLite 数据。
 
 安装完成后：
 

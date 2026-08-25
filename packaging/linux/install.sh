@@ -4,14 +4,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_NAME="water"
-INSTALL_DIR="/opt/water"
-CONFIG_DIR="/etc/water"
+INSTALL_DIR="$SCRIPT_DIR"
+CONFIG_DIR="$SCRIPT_DIR"
 ENV_FILE="$CONFIG_DIR/water.env"
-DATA_DIR="/var/lib/water"
-WORKSPACE_DIR="/workspace"
-SERVICE_USER="water"
-SERVICE_GROUP="water"
-HTTP_ADDR=":8080"
+DATA_DIR="$SCRIPT_DIR/data"
+WORKSPACE_DIR="$SCRIPT_DIR"
+SERVICE_USER="${SUDO_USER:-water}"
+SERVICE_GROUP=""
+HTTP_ADDR=""
 ENV_SOURCE=""
 START_SERVICE=1
 
@@ -22,11 +22,11 @@ usage() {
 选项：
   --user NAME             systemd 服务用户，默认 water
   --group NAME            systemd 服务组，默认 water
-  --install-dir PATH      二进制和运行时目录，默认 /opt/water
-  --config-dir PATH       环境文件目录，默认 /etc/water
-  --data-dir PATH         SQLite/运行数据目录，默认 /var/lib/water
-  --workspace-dir PATH    服务工作目录，默认 /workspace
-  --http-addr ADDR        监听地址，默认 :8080
+  --install-dir PATH      二进制和运行时目录，默认当前安装包目录
+  --config-dir PATH       环境文件目录，默认当前安装包目录
+  --data-dir PATH         SQLite/运行数据目录，默认当前目录/data
+  --workspace-dir PATH    服务工作目录，默认当前安装包目录
+  --http-addr ADDR        监听地址；新安装默认 :8080，升级保留已有配置
   --env-file PATH         复制已有环境文件，安装时保留其中的 PIN 等配置
   --no-start              安装并 enable，但不立即启动
   -h, --help              显示帮助
@@ -95,6 +95,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$SERVICE_GROUP" ]]; then
+  if id "$SERVICE_USER" >/dev/null 2>&1; then
+    SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
+  else
+    SERVICE_GROUP="$SERVICE_USER"
+  fi
+fi
+
 [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 或 sudo 运行。"
 command -v systemctl >/dev/null 2>&1 || die "目标系统没有 systemctl。"
 command -v install >/dev/null 2>&1 || die "目标系统缺少 install 命令。"
@@ -143,7 +151,7 @@ elif [[ ! -f "$ENV_FILE" ]]; then
   umask 077
   cat > "$ENV_FILE" <<EOF
 WATER_ACCESS_PIN=change-me
-WATER_HTTP_ADDR=$HTTP_ADDR
+WATER_HTTP_ADDR=${HTTP_ADDR:-:8080}
 WATER_DATA_DIR=$DATA_DIR
 WATER_DATABASE_PATH=$DATA_DIR/water.db
 WATER_DOCUMENT_ENGINE=native
@@ -170,7 +178,9 @@ set_env_value() {
   rm -f "$temp_file"
 }
 
-set_env_value WATER_HTTP_ADDR "$HTTP_ADDR"
+if [[ -n "$HTTP_ADDR" ]]; then
+  set_env_value WATER_HTTP_ADDR "$HTTP_ADDR"
+fi
 set_env_value WATER_DATA_DIR "$DATA_DIR"
 set_env_value WATER_DATABASE_PATH "$DATA_DIR/water.db"
 set_env_value HOME "$DATA_DIR/home"
