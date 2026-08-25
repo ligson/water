@@ -47,19 +47,35 @@ sudo ./install.sh \
   --http-addr :8080
 ```
 
+安装器支持 `--install-dir` 和 `--config-dir`。如果希望二进制、运行时工具、配置和数据全部归档到一个部署目录，可将两者设为同一路径：
+
+```bash
+sudo ./install.sh \
+  --user ligson \
+  --group users \
+  --install-dir /srv/water \
+  --config-dir /srv/water \
+  --workspace-dir /srv/water/workspace \
+  --data-dir /srv/water/data \
+  --http-addr :8080 \
+  --env-file /path/to/water.env
+```
+
+升级时继续使用相同的目录参数；安装器会保留已有 `water.env` 和 SQLite 数据。
+
 安装器会：
 
 1. 备份旧二进制和环境文件到 `/var/backups/water/<timestamp>/`。
-2. 原子替换 `/opt/water/water`。
-3. 创建或保留 `/etc/water/water.env`。
+2. 原子替换 `--install-dir/water`。
+3. 创建或保留 `--config-dir/water.env`。
 4. 写入 `/etc/systemd/system/water.service` 并 enable。
 5. 默认启动服务。
 
-升级时再次执行同一命令即可。已有 `/etc/water/water.env` 不会被默认覆盖，SQLite 数据也不会被删除。
+升级时再次执行同一命令即可。已有 `water.env` 不会被默认覆盖，SQLite 数据也不会被删除。
 
 ## 配置与检查
 
-配置文件：`/etc/water/water.env`。至少应设置一个稳定的 `WATER_ACCESS_PIN`，并确认：
+配置文件：`--config-dir/water.env`。至少应设置一个稳定的 `WATER_ACCESS_PIN`，并确认：
 
 ```ini
 WATER_HTTP_ADDR=:8080

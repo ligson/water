@@ -22,6 +22,8 @@ usage() {
 选项：
   --user NAME             systemd 服务用户，默认 water
   --group NAME            systemd 服务组，默认 water
+  --install-dir PATH      二进制和运行时目录，默认 /opt/water
+  --config-dir PATH       环境文件目录，默认 /etc/water
   --data-dir PATH         SQLite/运行数据目录，默认 /var/lib/water
   --workspace-dir PATH    服务工作目录，默认 /workspace
   --http-addr ADDR        监听地址，默认 :8080
@@ -46,6 +48,17 @@ while [[ $# -gt 0 ]]; do
     --group)
       [[ $# -ge 2 ]] || die "缺少 --group 参数"
       SERVICE_GROUP="$2"
+      shift 2
+      ;;
+    --install-dir)
+      [[ $# -ge 2 ]] || die "缺少 --install-dir 参数"
+      INSTALL_DIR="$2"
+      shift 2
+      ;;
+    --config-dir)
+      [[ $# -ge 2 ]] || die "缺少 --config-dir 参数"
+      CONFIG_DIR="$2"
+      ENV_FILE="$CONFIG_DIR/water.env"
       shift 2
       ;;
     --data-dir)
@@ -87,9 +100,11 @@ command -v systemctl >/dev/null 2>&1 || die "目标系统没有 systemctl。"
 command -v install >/dev/null 2>&1 || die "目标系统缺少 install 命令。"
 [[ -x "$SCRIPT_DIR/water" ]] || die "安装包中缺少可执行文件 water。"
 [[ -f "$SCRIPT_DIR/water.service" ]] || die "安装包中缺少 water.service。"
-[[ "$DATA_DIR" == /* && "$WORKSPACE_DIR" == /* ]] || die "数据目录和工作区必须使用绝对路径。"
-[[ "$DATA_DIR$WORKSPACE_DIR" != *['|@']* && "$DATA_DIR$WORKSPACE_DIR" != *[[:space:]]* ]] \
-  || die "数据目录和工作区暂不支持空白、| 或 @ 字符。"
+[[ "$INSTALL_DIR" == /* && "$CONFIG_DIR" == /* && "$DATA_DIR" == /* && "$WORKSPACE_DIR" == /* ]] \
+  || die "安装目录、配置目录、数据目录和工作区必须使用绝对路径。"
+[[ "$INSTALL_DIR$CONFIG_DIR$DATA_DIR$WORKSPACE_DIR" != *['|@']* && \
+  "$INSTALL_DIR$CONFIG_DIR$DATA_DIR$WORKSPACE_DIR" != *[[:space:]]* ]] \
+  || die "目录路径暂不支持空白、| 或 @ 字符。"
 [[ -d "$WORKSPACE_DIR" ]] || die "工作区不存在：$WORKSPACE_DIR；请先创建或传入正确路径。"
 
 if ! awk -F: -v group="$SERVICE_GROUP" '$1 == group { found = 1 } END { exit(found ? 0 : 1) }' /etc/group; then
@@ -133,7 +148,7 @@ WATER_DATA_DIR=$DATA_DIR
 WATER_DATABASE_PATH=$DATA_DIR/water.db
 WATER_DOCUMENT_ENGINE=native
 HOME=$DATA_DIR/home
-PATH=/opt/water/runtime/go/bin:/opt/water/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=$INSTALL_DIR/runtime/go/bin:$INSTALL_DIR/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
 fi
 
@@ -159,7 +174,7 @@ set_env_value WATER_HTTP_ADDR "$HTTP_ADDR"
 set_env_value WATER_DATA_DIR "$DATA_DIR"
 set_env_value WATER_DATABASE_PATH "$DATA_DIR/water.db"
 set_env_value HOME "$DATA_DIR/home"
-set_env_value PATH "/opt/water/runtime/go/bin:/opt/water/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+set_env_value PATH "$INSTALL_DIR/runtime/go/bin:$INSTALL_DIR/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 sed \
   -e "s|@SERVICE_USER@|$SERVICE_USER|g" \

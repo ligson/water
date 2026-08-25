@@ -9,7 +9,7 @@ DATA_DIR="/var/lib/water"
 PURGE=0
 
 usage() {
-  printf '用法：sudo ./uninstall.sh [--purge]\n'
+  printf '用法：sudo ./uninstall.sh [--install-dir PATH] [--config-dir PATH] [--purge]\n'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -17,6 +17,16 @@ while [[ $# -gt 0 ]]; do
     --purge)
       PURGE=1
       shift
+      ;;
+    --install-dir)
+      [[ $# -ge 2 ]] || { printf '缺少 --install-dir 参数。\n' >&2; exit 1; }
+      INSTALL_DIR="$2"
+      shift 2
+      ;;
+    --config-dir)
+      [[ $# -ge 2 ]] || { printf '缺少 --config-dir 参数。\n' >&2; exit 1; }
+      CONFIG_DIR="$2"
+      shift 2
       ;;
     -h|--help)
       usage
