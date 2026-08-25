@@ -27,6 +27,7 @@ RUN go mod download
 COPY water-be/ ./
 COPY --from=frontend-build /src/water-fe/dist ./internal/web/dist
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -tags='netgo osusergo' \
     -trimpath \
     -ldflags="-s -w -X main.buildVersion=${VERSION}" \
     -o /out/water \

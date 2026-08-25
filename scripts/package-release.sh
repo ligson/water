@@ -58,6 +58,7 @@ for target in "${targets[@]}"; do
   (
     cd "$PROJECT_ROOT/water-be"
     CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" go build \
+      -tags='netgo osusergo' \
       -trimpath \
       -ldflags="-s -w -X main.buildVersion=$VERSION" \
       -o "$package_stage/water" \

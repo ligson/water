@@ -39,6 +39,7 @@ printf '编译单体二进制：%s\n' "$OUTPUT_PATH"
 (
   cd "$PROJECT_ROOT/water-be"
   CGO_ENABLED=0 go build \
+    -tags='netgo osusergo' \
     -trimpath \
     -ldflags="-s -w -X main.buildVersion=$VERSION" \
     -o "$OUTPUT_PATH" \

@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- 明确单体二进制使用 `CGO_ENABLED=0`、`netgo` 和 `osusergo` 构建，Linux 发布包不依赖目标机器的 glibc 版本。
+
 ## [0.1.2] - 2026-08-25
 
 - 将前端生产构建通过 Go `embed` 内嵌到单个 Water 二进制；新增单体构建脚本，统一提供 Vue 页面、HTTP API 和两个 WebSocket 通道。

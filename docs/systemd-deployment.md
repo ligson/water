@@ -4,6 +4,19 @@ Linux Release 包中的 `water` 已经包含 Vue 前端、HTTP API、任务 WebS
 
 这里的“不需要”仅指若水服务本身。Agent 执行工作区的构建和测试时，宿主机仍需提供对应项目使用的 Go、Node.js、Python、Java、Git、ripgrep 等工具。
 
+## Linux 兼容性
+
+Linux 发布包中的 `water` 使用 `CGO_ENABLED=0`、`netgo` 和 `osusergo` 编译，并使用纯 Go SQLite 驱动。因此二进制本身是静态链接的，不依赖目标系统安装的 glibc，也不会因为 Synology 等老系统的 glibc 版本不同而无法启动。可以在目标机上检查：
+
+```bash
+file /opt/water/water
+ldd /opt/water/water
+```
+
+`file` 应显示 `statically linked`，`ldd` 应显示 `not a dynamic executable` 或等价结果。
+
+这只保证若水服务二进制本身的兼容性。Agent 执行用户项目时调用的 Go、Node.js、Python、Git、ripgrep 等外部工具仍然可能依赖宿主机的系统库，需要按目标机器准备兼容版本。不要直接把另一台容器里的动态链接工具复制到老系统上；例如 `jq` 可能依赖更高版本的 glibc。
+
 ## 安装包内容
 
 - `water`：单体可执行文件。
