@@ -42,7 +42,7 @@ cd water_v0.1.2_linux_amd64
 sudo ./install.sh
 ```
 
-默认数据目录为当前目录下的 `data/`，新安装默认监听 `:8080`。升级时若当前目录已有 `water.env`，会保留其中的 PIN、监听地址和其他配置。
+默认数据目录为当前目录下的 `data/`，新安装默认监听 `:8080`。升级时若当前目录已有 `water.env`，会保留其中的 PIN、监听地址和工作区配置；旧 Docker 配置中的 `WATER_WORKSPACE_HOST_PATH` 也会被识别。
 
 如果 Agent 工作区不是当前 Release 包目录，只需额外指定 `--workspace-dir`。使用 `sudo ./install.sh` 时，若 `SUDO_USER` 已存在，安装器默认使用该用户及其主组；普通 Linux 没有现成用户时，才会回退到 `water` 用户，并在 `useradd/groupadd` 可用时自动创建低权限账户。
 

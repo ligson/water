@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-08-25
+
+- 简化升级时的工作区配置：无参数执行安装器时自动读取已有 `WATER_WORKSPACE_DIR` 或旧 Docker 的 `WATER_WORKSPACE_HOST_PATH`，避免把 Release 目录误当成 Agent 工作区。
+
 ## [0.1.6] - 2026-08-25
 
 - 简化 Linux 安装命令：在 Release 包解压目录直接执行 `sudo ./install.sh` 即可，默认使用当前目录、`data/` 和当前用户，不再要求重复传目录参数。

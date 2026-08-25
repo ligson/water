@@ -10,7 +10,7 @@
 sudo ./install.sh
 ```
 
-默认目录结构为：`water`、`water.env`、`runtime/` 和 `data/`。新安装默认监听 `:8080`；如果目录中已有 `water.env`，升级时会保留其中的监听地址和 PIN。
+默认目录结构为：`water`、`water.env`、`runtime/` 和 `data/`。新安装默认监听 `:8080`；如果目录中已有 `water.env`，升级时会保留其中的监听地址、PIN 和 `WATER_WORKSPACE_DIR`（也兼容旧 Docker 配置中的 `WATER_WORKSPACE_HOST_PATH`）。
 
 若目标系统已经有运行用户，可以直接指定现有用户和组。安装器不会自动修改工作区所有权：
 

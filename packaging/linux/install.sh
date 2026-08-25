@@ -9,6 +9,7 @@ CONFIG_DIR="$SCRIPT_DIR"
 ENV_FILE="$CONFIG_DIR/water.env"
 DATA_DIR="$SCRIPT_DIR/data"
 WORKSPACE_DIR="$SCRIPT_DIR"
+WORKSPACE_SET=0
 SERVICE_USER="${SUDO_USER:-water}"
 SERVICE_GROUP=""
 HTTP_ADDR=""
@@ -69,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --workspace-dir)
       [[ $# -ge 2 ]] || die "缺少 --workspace-dir 参数"
       WORKSPACE_DIR="$2"
+      WORKSPACE_SET=1
       shift 2
       ;;
     --http-addr)
@@ -94,6 +96,19 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$WORKSPACE_SET" -eq 0 && -f "$ENV_FILE" ]]; then
+  configured_workspace="$(awk -F= '
+    $1 == "WATER_WORKSPACE_DIR" || $1 == "WATER_WORKSPACE_HOST_PATH" {
+      sub(/^[^=]*=/, "")
+      print
+      exit
+    }
+  ' "$ENV_FILE")"
+  if [[ "$configured_workspace" == /* ]]; then
+    WORKSPACE_DIR="$configured_workspace"
+  fi
+fi
 
 if [[ -z "$SERVICE_GROUP" ]]; then
   if id "$SERVICE_USER" >/dev/null 2>&1; then
