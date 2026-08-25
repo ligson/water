@@ -35,10 +35,10 @@ sudo ./install.sh \
 sudo ./install.sh \
   --user ligson \
   --group users \
-  --install-dir /var/services/homes/ligson/wk/docker-services/water \
-  --config-dir /var/services/homes/ligson/wk/docker-services/water \
-  --workspace-dir /var/services/homes/ligson/workspace \
-  --data-dir /var/services/homes/ligson/wk/docker-services/water/data \
+  --install-dir /srv/water \
+  --config-dir /srv/water \
+  --workspace-dir /srv/water/workspace \
+  --data-dir /srv/water/data \
   --http-addr :13013 \
   --env-file /path/to/existing/water.env
 ```
