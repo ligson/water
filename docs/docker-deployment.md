@@ -18,7 +18,7 @@
 docker build --platform linux/amd64 --build-arg VERSION=dev -f water-be/docker/Dockerfile -t ligson/water:latest .
 ```
 
-镜像构建阶段会先执行前端 `npm run build`，再把 `dist/` 嵌入 Go 二进制。运行镜像预置 Go、Node.js、npm、Python 3、Git、SSH client、curl、ripgrep、jq 和常用编译工具。项目额外依赖仍应由对应工作区自行声明和安装。
+镜像构建阶段会先执行前端 `npm run build`，再把 `dist/` 嵌入 Go 二进制。运行镜像预置 Go、Node.js、npm、Python 3、Git、SSH client、curl、ripgrep 和常用编译工具。项目额外依赖仍应由对应工作区自行声明和安装。
 
 ## 部署目录
 

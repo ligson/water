@@ -44,7 +44,6 @@ RUN apt-get update \
         ca-certificates \
         curl \
         git \
-        jq \
         openssh-client \
         procps \
         python3 \
