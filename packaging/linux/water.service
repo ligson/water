@@ -9,7 +9,9 @@ User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@WORKING_DIR@
 EnvironmentFile=-@ENV_FILE@
-ExecStart=@INSTALL_DIR@/water
+Environment="HOME=@DATA_DIR@/home"
+Environment="PATH=@INSTALL_DIR@/runtime/go/bin:@INSTALL_DIR@/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=@INSTALL_DIR@/water --config @CONFIG_FILE@
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

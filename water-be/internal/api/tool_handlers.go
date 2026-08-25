@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/ligson/water/water-be/internal/approval"
+	"github.com/ligson/water/water-be/internal/document"
 	"github.com/ligson/water/water-be/internal/event"
 	"github.com/ligson/water/water-be/internal/requestid"
 	"github.com/ligson/water/water-be/internal/sandbox"
@@ -56,6 +57,7 @@ func (r *Router) executeTaskTool(w http.ResponseWriter, req *http.Request, taskI
 	executor := tools.NewExecutor(
 		sandbox.NewPermissionEngine(workspace.NewStore(r.db)),
 		approval.NewStore(r.db),
+		tools.WithDocumentReader(document.NewExtractorWithConfig(r.cfg.DocumentEngine, r.cfg.DocumentPython)),
 		tools.WithSkillReader(skill.NewStore(r.db, "")),
 	)
 	result, err := executor.Execute(req.Context(), tools.Context{

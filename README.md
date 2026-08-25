@@ -139,7 +139,7 @@ DOCX、XLSX、PPTX 和带文本层 PDF 已由后端内置解析，不需要额�
 ./scripts/setup-document-runtime.sh
 ```
 
-可选运行时安装在 `water-be/.venv-document/`，不会进入 Git；启用时需设置 `WATER_DOCUMENT_ENGINE=markitdown`。安装过程需要联网下载依赖，基础文档识别和正常启动不经过这一步。
+可选运行时安装在 `water-be/.venv-document/`，不会进入 Git；启用时在 `config.yaml` 设置 `document.engine: markitdown`。旧环境变量仍兼容。安装过程需要联网下载依赖，基础文档识别和正常启动不经过这一步。
 
 默认地址：
 
@@ -147,7 +147,7 @@ DOCX、XLSX、PPTX 和带文本层 PDF 已由后端内置解析，不需要额�
 - 后端：`http://127.0.0.1:8080`
 - 健康检查：`http://127.0.0.1:8080/api/health`
 
-首次启动后端时，若水会初始化访问 PIN。未设置 `WATER_ACCESS_PIN` 时，后端会生成一个一次性初始 PIN 并写入 `scripts/logs/water-be.log`；后续可以在设置页修改。建议本机固定使用环境变量启动：
+首次启动后端时，若水会初始化访问 PIN。未设置 `WATER_ACCESS_PIN` 时，后端会生成一个一次性初始 PIN 并写入 `scripts/logs/water-be.log`；后续可以在设置页修改。非敏感运行参数建议写入 `config.yaml`，访问 PIN 继续使用环境变量：
 
 ```bash
 WATER_ACCESS_PIN=123456 ./scripts/start-all.sh
@@ -171,7 +171,7 @@ WATER_ACCESS_PIN=123456 ./scripts/start-all.sh
 
 ```bash
 ./scripts/build-single-binary.sh dev water-be/bin/water
-WATER_ACCESS_PIN=123456 ./water-be/bin/water
+WATER_ACCESS_PIN=123456 ./water-be/bin/water --config ./config.yaml
 ```
 
 打开 `http://127.0.0.1:8080` 即可同时访问前端、HTTP API 和 WebSocket。`go run ./cmd/water` 适合后端开发调试；如果尚未准备 embed 资源，根路径会提示先执行单体构建脚本。
@@ -217,12 +217,12 @@ docker build --platform linux/amd64 --build-arg VERSION=dev -f water-be/docker/D
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `WATER_HTTP_ADDR` | `:8080` | 后端监听地址 |
-| `WATER_DATA_DIR` | `data` | 数据目录 |
-| `WATER_DATABASE_PATH` | `data/water.db` | SQLite 数据库路径 |
+| `config.yaml: server.http_addr` | `:8080` | 后端监听地址 |
+| `config.yaml: storage.data_dir` | `data` | 数据目录 |
+| `config.yaml: storage.database_path` | `data/water.db` | SQLite 数据库路径 |
 | `WATER_ACCESS_PIN` | 首次启动自动生成 | 单用户访问 PIN；设置后会重置本地 PIN 并使旧会话失效 |
-| `WATER_DOCUMENT_ENGINE` | `native` | 文档解析引擎；仅显式设为 `markitdown` 时使用可选增强运行时 |
-| `WATER_DOCUMENT_PYTHON` | 自动发现 `.venv-document` | 可选 MarkItDown 运行时的 Python 路径 |
+| `config.yaml: document.engine` | `native` | 文档解析引擎；仅设为 `markitdown` 时使用可选增强运行时 |
+| `config.yaml: document.python` | 自动发现 `.venv-document` | 可选 MarkItDown 运行时的 Python 路径 |
 
 前端常用环境变量：
 

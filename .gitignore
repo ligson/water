@@ -10,6 +10,8 @@
 .env
 .env.*
 !.env.example
+config.yaml
+water-be/config.yaml
 *.local
 *.pem
 *.key

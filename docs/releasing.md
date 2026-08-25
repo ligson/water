@@ -16,7 +16,7 @@
 
 产物同时保留为 GitHub Actions Artifact，并发布到对应标签的 GitHub Release。Release 说明严格取自根目录 `CHANGELOG.md` 的对应版本章节。脚本先构建 Vue `dist/`，再使用 Go `embed` 编译进每个平台的 `water` 二进制；SQLite migration 同样嵌入二进制，运行时不需要单独的前端目录或 Nginx。
 
-Linux 包额外包含 `install.sh`、`uninstall.sh`、`water.service`、`water.env.example`、安装版 `README.md` 和项目总览 `PROJECT_README.md`。`install.sh` 会安装到 `/opt/water`，配置写入 `/etc/water/water.env`，数据默认写入 `/var/lib/water`，升级时保留配置和数据库。普通 Linux 可自动创建默认低权限账户；Synology 等缺少 `useradd` 的系统需传入已有用户和组。安装器不会自动修改工作区所有权。
+Linux 包额外包含 `install.sh`、`uninstall.sh`、`water.service`、`water.env.example`、`config.yaml.example`、安装版 `README.md` 和项目总览 `PROJECT_README.md`。`install.sh` 默认在当前解压目录生成 `config.yaml`、`water.env` 和 `data/`，升级时保留配置和数据库。普通 Linux 可自动创建默认低权限账户；Synology 等缺少 `useradd` 的系统需传入已有用户和组。安装器不会自动修改工作区所有权。
 
 ## CHANGELOG 格式
 

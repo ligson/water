@@ -50,6 +50,7 @@ type Runner struct {
 	appendEvent    EventAppender
 	clientFactory  ClientFactory
 	toolExecutor   *tools.Executor
+	documentReader tools.DocumentReader
 	contextBuilder *contextpack.Builder
 	skillStore     *skill.Store
 	systemPrompt   string
@@ -96,6 +97,14 @@ type toolLoopInterrupt struct {
 
 type ClientFactory func(provider.Provider) (llm.Client, error)
 
+type RunnerOption func(*Runner)
+
+func WithDocumentConfig(engine string, pythonPath string) RunnerOption {
+	return func(r *Runner) {
+		r.documentReader = document.NewExtractorWithConfig(engine, pythonPath)
+	}
+}
+
 type RunTurnInput struct {
 	RequestID    string
 	TaskID       string
@@ -106,23 +115,29 @@ type RunTurnInput struct {
 	Attachments  []task.Attachment
 }
 
-func NewRunner(db *sql.DB, appendEvent EventAppender) *Runner {
-	return &Runner{
+func NewRunner(db *sql.DB, appendEvent EventAppender, options ...RunnerOption) *Runner {
+	runner := &Runner{
 		db:          db,
 		appendEvent: appendEvent,
 		clientFactory: func(p provider.Provider) (llm.Client, error) {
 			return llm.NewOpenAIClient(p)
 		},
-		toolExecutor: tools.NewExecutor(
-			sandbox.NewPermissionEngine(workspace.NewStore(db)),
-			approval.NewStore(db),
-			tools.WithSkillReader(skill.NewStore(db, "")),
-		),
+		documentReader: document.NewExtractor(""),
 		contextBuilder: contextpack.NewBuilder(contextpack.NewStore(db)),
 		skillStore:     skill.NewStore(db, ""),
 		systemPrompt:   DefaultSystemPrompt,
 		requestTimeout: 10 * time.Minute,
 	}
+	for _, option := range options {
+		option(runner)
+	}
+	runner.toolExecutor = tools.NewExecutor(
+		sandbox.NewPermissionEngine(workspace.NewStore(db)),
+		approval.NewStore(db),
+		tools.WithDocumentReader(runner.documentReader),
+		tools.WithSkillReader(skill.NewStore(db, "")),
+	)
+	return runner
 }
 
 func (r *Runner) RunTurn(ctx context.Context, input RunTurnInput) {

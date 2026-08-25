@@ -1,0 +1,11 @@
+# Non-sensitive runtime settings. The installer creates config.yaml from this shape.
+server:
+  http_addr: ":8080"
+
+storage:
+  data_dir: "./data"
+  database_path: "./data/water.db"
+
+document:
+  engine: native
+  python: ""

@@ -12,7 +12,7 @@ go run ./cmd/water
 
 ```bash
 ./scripts/build-single-binary.sh dev water-be/bin/water
-WATER_ACCESS_PIN=123456 ./water-be/bin/water
+WATER_ACCESS_PIN=123456 ./water-be/bin/water --config ./config.yaml
 ```
 
 该脚本先构建 `water-fe/dist`，再通过 Go `embed` 编译进 `water`；运行时不需要前端目录、Node.js 或 Nginx。访问 `http://127.0.0.1:8080` 即可打开若水工作台。
@@ -23,11 +23,9 @@ WATER_ACCESS_PIN=123456 ./water-be/bin/water
 - 数据目录：`data`
 - SQLite 数据库：`data/water.db`
 
-可通过环境变量覆盖：
+非敏感运行参数写入 `config.yaml`，访问 PIN 保留在环境变量中：
 
-- `WATER_HTTP_ADDR`
-- `WATER_DATA_DIR`
-- `WATER_DATABASE_PATH`
+- `config.yaml` 中的 `server.http_addr`、`storage.data_dir` 和 `storage.database_path`
 - `WATER_ACCESS_PIN`
 
 ## 访问 PIN
@@ -37,7 +35,7 @@ WATER_ACCESS_PIN=123456 ./water-be/bin/water
 固定 PIN 启动：
 
 ```bash
-WATER_ACCESS_PIN=123456 go run ./cmd/water
+WATER_ACCESS_PIN=123456 go run ./cmd/water --config ./config.yaml
 ```
 
 通过 `WATER_ACCESS_PIN` 重新启动会重置本地 PIN，并清理旧 session。前端设置页也可以在已解锁状态下修改 PIN。
@@ -186,7 +184,7 @@ Skill 包必须包含同一目录下的 `skill.json` 和 `SKILL.md`。Agent 上�
 ./scripts/setup-document-runtime.sh
 ```
 
-安装后设置 `WATER_DOCUMENT_ENGINE=markitdown` 才会启用该引擎，也可以用 `WATER_DOCUMENT_PYTHON` 指定解释器。扫描 PDF OCR 和旧 DOC/PPT 暂未内置，建议先离线转换为 PDF 或新版 Office 格式。
+安装后在 `config.yaml` 中设置 `document.engine: markitdown` 才会启用该引擎，也可以用 `document.python` 指定解释器。旧环境变量仍作为兼容回退。命令行可通过 `--config /path/to/config.yaml` 指定配置文件。扫描 PDF OCR 和旧 DOC/PPT 暂未内置，建议先离线转换为 PDF 或新版 Office 格式。
 
 `read_document` 默认返回 24576 个字符，最多 65536 个字符；结果截断时返回 `nextOffset`，Agent 会按需继续读取。单个文档安全上限为 50 MiB。解析器只接受 Harness 校验后的本地工作区或已授权路径；MarkItDown 模式关闭插件和网络 URI。
 

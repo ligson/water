@@ -3,9 +3,10 @@
 set -euo pipefail
 
 SERVICE_NAME="water"
-INSTALL_DIR="/opt/water"
-CONFIG_DIR="/etc/water"
-DATA_DIR="/var/lib/water"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="$SCRIPT_DIR"
+CONFIG_DIR="$SCRIPT_DIR"
+DATA_DIR="$SCRIPT_DIR/data"
 PURGE=0
 
 usage() {
@@ -45,6 +46,24 @@ if [[ -f "$CONFIG_DIR/water.env" ]]; then
   configured_data_dir="$(awk -F= '$1 == "WATER_DATA_DIR" { sub(/^[^=]*=/, ""); print; exit }' "$CONFIG_DIR/water.env")"
   if [[ "$configured_data_dir" == /* ]]; then
     DATA_DIR="$configured_data_dir"
+  fi
+fi
+
+if [[ -f "$CONFIG_DIR/config.yaml" ]]; then
+  configured_data_dir="$(awk '
+    /^storage:[[:space:]]*$/ { in_storage = 1; next }
+    in_storage && /^[^[:space:]]/ { in_storage = 0 }
+    in_storage && /^[[:space:]]+data_dir:/ {
+      sub(/^[^:]*:[[:space:]]*/, "")
+      gsub(/^"|"$/, "")
+      print
+      exit
+    }
+  ' "$CONFIG_DIR/config.yaml")"
+  if [[ "$configured_data_dir" == /* ]]; then
+    DATA_DIR="$configured_data_dir"
+  elif [[ -n "$configured_data_dir" ]]; then
+    DATA_DIR="$CONFIG_DIR/$configured_data_dir"
   fi
 fi
 

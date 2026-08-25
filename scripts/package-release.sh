@@ -75,6 +75,7 @@ for target in "${targets[@]}"; do
     cp "$PROJECT_ROOT/packaging/linux/uninstall.sh" "$package_stage/uninstall.sh"
     cp "$PROJECT_ROOT/packaging/linux/water.service" "$package_stage/water.service"
     cp "$PROJECT_ROOT/packaging/linux/water.env.example" "$package_stage/water.env.example"
+    cp "$PROJECT_ROOT/packaging/linux/config.yaml.example" "$package_stage/config.yaml.example"
     chmod 0755 "$package_stage/install.sh" "$package_stage/uninstall.sh"
   else
     cp "$PROJECT_ROOT/README.md" "$package_stage/README.md"

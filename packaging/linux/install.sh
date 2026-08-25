@@ -7,7 +7,9 @@ SERVICE_NAME="water"
 INSTALL_DIR="$SCRIPT_DIR"
 CONFIG_DIR="$SCRIPT_DIR"
 ENV_FILE="$CONFIG_DIR/water.env"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
 DATA_DIR="$SCRIPT_DIR/data"
+DATA_SET=0
 WORKSPACE_DIR="$SCRIPT_DIR"
 WORKSPACE_SET=0
 SERVICE_USER="${SUDO_USER:-water}"
@@ -60,11 +62,13 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "缺少 --config-dir 参数"
       CONFIG_DIR="$2"
       ENV_FILE="$CONFIG_DIR/water.env"
+      CONFIG_FILE="$CONFIG_DIR/config.yaml"
       shift 2
       ;;
     --data-dir)
       [[ $# -ge 2 ]] || die "缺少 --data-dir 参数"
       DATA_DIR="$2"
+      DATA_SET=1
       shift 2
       ;;
     --workspace-dir)
@@ -110,11 +114,25 @@ if [[ "$WORKSPACE_SET" -eq 0 && -f "$ENV_FILE" ]]; then
   fi
 fi
 
+if [[ "$WORKSPACE_SET" -eq 0 && -f "/etc/systemd/system/$SERVICE_NAME.service" ]]; then
+  configured_workspace="$(awk -F= '$1 == "WorkingDirectory" { print $2; exit }' "/etc/systemd/system/$SERVICE_NAME.service")"
+  if [[ "$configured_workspace" == /* ]]; then
+    WORKSPACE_DIR="$configured_workspace"
+  fi
+fi
+
 if [[ -z "$SERVICE_GROUP" ]]; then
   if id "$SERVICE_USER" >/dev/null 2>&1; then
     SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
   else
     SERVICE_GROUP="$SERVICE_USER"
+  fi
+fi
+
+if [[ "$DATA_SET" -eq 0 && -f "$ENV_FILE" ]]; then
+  configured_data_dir="$(awk -F= '$1 == "WATER_DATA_DIR" { sub(/^[^=]*=/, ""); print; exit }' "$ENV_FILE")"
+  if [[ "$configured_data_dir" == /* ]]; then
+    DATA_DIR="$configured_data_dir"
   fi
 fi
 
@@ -164,42 +182,53 @@ if [[ -n "$ENV_SOURCE" ]]; then
   install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$ENV_SOURCE" "$ENV_FILE"
 elif [[ ! -f "$ENV_FILE" ]]; then
   umask 077
-  cat > "$ENV_FILE" <<EOF
-WATER_ACCESS_PIN=change-me
-WATER_HTTP_ADDR=${HTTP_ADDR:-:8080}
-WATER_DATA_DIR=$DATA_DIR
-WATER_DATABASE_PATH=$DATA_DIR/water.db
-WATER_DOCUMENT_ENGINE=native
-HOME=$DATA_DIR/home
-PATH=$INSTALL_DIR/runtime/go/bin:$INSTALL_DIR/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EOF
+  printf '%s\n' 'WATER_ACCESS_PIN=change-me' > "$ENV_FILE"
 fi
 
-set_env_value() {
+env_value() {
   local key="$1"
-  local value="$2"
-  local temp_file
-  temp_file="$(mktemp "$CONFIG_DIR/.water.env.XXXXXX")"
-  awk -v key="$key" -v value="$value" '
-    index($0, key "=") == 1 {
-      if (!done) print key "=" value
-      done = 1
-      next
-    }
-    { print }
-    END { if (!done) print key "=" value }
-  ' "$ENV_FILE" > "$temp_file"
-  install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$temp_file" "$ENV_FILE"
-  rm -f "$temp_file"
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$ENV_FILE"
 }
 
-if [[ -n "$HTTP_ADDR" ]]; then
-  set_env_value WATER_HTTP_ADDR "$HTTP_ADDR"
+legacy_http_addr="$(env_value WATER_HTTP_ADDR)"
+legacy_data_dir="$(env_value WATER_DATA_DIR)"
+legacy_database_path="$(env_value WATER_DATABASE_PATH)"
+legacy_document_engine="$(env_value WATER_DOCUMENT_ENGINE)"
+legacy_document_python="$(env_value WATER_DOCUMENT_PYTHON)"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  config_http_addr="${HTTP_ADDR:-${legacy_http_addr:-:8080}}"
+  config_data_dir="${legacy_data_dir:-$DATA_DIR}"
+  config_database_path="${legacy_database_path:-$DATA_DIR/water.db}"
+  config_document_engine="${legacy_document_engine:-native}"
+  config_document_python="${legacy_document_python:-}"
+  umask 077
+  printf '%s\n' \
+    'server:' \
+    "  http_addr: \"$config_http_addr\"" \
+    '' \
+    'storage:' \
+    "  data_dir: \"$config_data_dir\"" \
+    "  database_path: \"$config_database_path\"" \
+    '' \
+    'document:' \
+    "  engine: $config_document_engine" \
+    "  python: \"$config_document_python\"" > "$CONFIG_FILE"
 fi
-set_env_value WATER_DATA_DIR "$DATA_DIR"
-set_env_value WATER_DATABASE_PATH "$DATA_DIR/water.db"
-set_env_value HOME "$DATA_DIR/home"
-set_env_value PATH "$INSTALL_DIR/runtime/go/bin:$INSTALL_DIR/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+if grep -qE '^(WATER_HTTP_ADDR|WATER_DATA_DIR|WATER_DATABASE_PATH|WATER_DOCUMENT_ENGINE|WATER_DOCUMENT_PYTHON)=' "$ENV_FILE"; then
+  env_temp="$(mktemp "$CONFIG_DIR/.water.env.XXXXXX")"
+  awk '!/^(WATER_HTTP_ADDR|WATER_DATA_DIR|WATER_DATABASE_PATH|WATER_DOCUMENT_ENGINE|WATER_DOCUMENT_PYTHON)=/' "$ENV_FILE" > "$env_temp"
+  install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$env_temp" "$ENV_FILE"
+  rm -f "$env_temp"
+fi
+
+if [[ ! -s "$ENV_FILE" ]]; then
+  printf '%s\n' 'WATER_ACCESS_PIN=change-me' > "$ENV_FILE"
+fi
+
+chown "$SERVICE_USER:$SERVICE_GROUP" "$CONFIG_FILE"
+chmod 0640 "$CONFIG_FILE"
 
 service_temp="$(mktemp "$CONFIG_DIR/.water.service.XXXXXX")"
 sed \
@@ -208,6 +237,8 @@ sed \
   -e "s|@WORKING_DIR@|$WORKSPACE_DIR|g" \
   -e "s|@ENV_FILE@|$ENV_FILE|g" \
   -e "s|@INSTALL_DIR@|$INSTALL_DIR|g" \
+  -e "s|@CONFIG_FILE@|$CONFIG_FILE|g" \
+  -e "s|@DATA_DIR@|$DATA_DIR|g" \
   "$SCRIPT_DIR/water.service" > "$service_temp"
 install -m 0644 "$service_temp" "$CONFIG_DIR/$SERVICE_NAME.service"
 rm -f "$service_temp"

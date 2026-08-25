@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -24,7 +25,14 @@ func main() {
 	}))
 	logger.Info("若水 starting", "version", buildVersion)
 
-	cfg := config.Load()
+	configPath := flag.String("config", "", "path to config.yaml")
+	flag.Parse()
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		logger.Error("load config", "error", err)
+		os.Exit(1)
+	}
 
 	db, err := store.Open(cfg.DatabasePath)
 	if err != nil {

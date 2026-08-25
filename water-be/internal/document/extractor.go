@@ -57,6 +57,7 @@ type cacheEntry struct {
 // Extractor converts supported local documents to Markdown. The portable Go
 // engine is the default; MarkItDown is an optional enhancement.
 type Extractor struct {
+	engine     string
 	pythonPath string
 	timeout    time.Duration
 
@@ -65,7 +66,12 @@ type Extractor struct {
 }
 
 func NewExtractor(pythonPath string) *Extractor {
+	return NewExtractorWithConfig("", pythonPath)
+}
+
+func NewExtractorWithConfig(engine string, pythonPath string) *Extractor {
 	return &Extractor{
+		engine:     strings.TrimSpace(engine),
 		pythonPath: strings.TrimSpace(pythonPath),
 		timeout:    defaultExtractTimeout,
 		cache:      make(map[string]cacheEntry),
@@ -89,7 +95,7 @@ func (e *Extractor) Extract(ctx context.Context, path string) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("inspect document: %w", err)
 	}
-	engine := selectedEngine()
+	engine := e.selectedEngine()
 	cacheKey := engine + "|" + path
 	if cached, ok := e.cached(cacheKey, info); ok {
 		return cached, nil
@@ -153,8 +159,12 @@ func (e *Extractor) extractMarkItDown(ctx context.Context, path string, format s
 	return result, nil
 }
 
-func selectedEngine() string {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("WATER_DOCUMENT_ENGINE")), "markitdown") {
+func (e *Extractor) selectedEngine() string {
+	configured := e.engine
+	if configured == "" {
+		configured = os.Getenv("WATER_DOCUMENT_ENGINE")
+	}
+	if strings.EqualFold(strings.TrimSpace(configured), "markitdown") {
 		return "markitdown"
 	}
 	return "native"

@@ -51,7 +51,7 @@ func NewRouter(db *sql.DB, cfg config.Config, logger *slog.Logger) http.Handler 
 		frontend: web.Handler(),
 		cancel:   make(map[string]taskRun),
 	}
-	r.agent = agent.NewRunner(db, r.appendTaskEvent)
+	r.agent = agent.NewRunner(db, r.appendTaskEvent, agent.WithDocumentConfig(cfg.DocumentEngine, cfg.DocumentPython))
 	r.recoverInterruptedRunningTurns(context.Background())
 
 	return requestid.Middleware(corsMiddleware(r))

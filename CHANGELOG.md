@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-08-25
+
+- 将非敏感运行参数从 `water.env` 迁移到部署目录的 `config.yaml`；保留旧环境变量兼容，并在升级安装时自动迁移。
+- 支持安装后直接编辑 `config.yaml` 调整监听、存储和文档解析配置，`water.env` 仅保留访问 PIN。
+- 同步卸载脚本、项目文档和运行时文档，使数据目录与文档解析配置统一从 `config.yaml` 读取。
+- 更新本地开发和后端使用文档，明确 `--config` 配置入口与环境变量兼容回退规则。
+- 将本地 `config.yaml` 加入忽略规则，避免开发机路径配置误提交。
+
 ## [0.1.7] - 2026-08-25
 
 - 简化升级时的工作区配置：无参数执行安装器时自动读取已有 `WATER_WORKSPACE_DIR` 或旧 Docker 的 `WATER_WORKSPACE_HOST_PATH`，避免把 Release 目录误当成 Agent 工作区。
