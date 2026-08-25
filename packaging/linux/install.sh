@@ -176,13 +176,16 @@ set_env_value WATER_DATABASE_PATH "$DATA_DIR/water.db"
 set_env_value HOME "$DATA_DIR/home"
 set_env_value PATH "$INSTALL_DIR/runtime/go/bin:$INSTALL_DIR/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+service_temp="$(mktemp "$CONFIG_DIR/.water.service.XXXXXX")"
 sed \
   -e "s|@SERVICE_USER@|$SERVICE_USER|g" \
   -e "s|@SERVICE_GROUP@|$SERVICE_GROUP|g" \
   -e "s|@WORKING_DIR@|$WORKSPACE_DIR|g" \
   -e "s|@ENV_FILE@|$ENV_FILE|g" \
   -e "s|@INSTALL_DIR@|$INSTALL_DIR|g" \
-  "$SCRIPT_DIR/water.service" > "$CONFIG_DIR/$SERVICE_NAME.service"
+  "$SCRIPT_DIR/water.service" > "$service_temp"
+install -m 0644 "$service_temp" "$CONFIG_DIR/$SERVICE_NAME.service"
+rm -f "$service_temp"
 install -m 0644 "$CONFIG_DIR/$SERVICE_NAME.service" "/etc/systemd/system/$SERVICE_NAME.service"
 
 systemctl daemon-reload

@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-08-25
+
+- 修复 `--install-dir` 与 `--config-dir` 使用同一目录时覆盖 systemd 模板的问题，确保单目录 NAS 部署不会截断 `water.service`。
+
 ## [0.1.3] - 2026-08-25
 
 - 明确单体二进制使用 `CGO_ENABLED=0`、`netgo` 和 `osusergo` 构建，Linux 发布包不依赖目标机器的 glibc 版本。
