@@ -11,6 +11,8 @@ WorkingDirectory=@WORKING_DIR@
 EnvironmentFile=-@ENV_FILE@
 Environment="HOME=@DATA_DIR@/home"
 Environment="PATH=@INSTALL_DIR@/runtime/go/bin:@INSTALL_DIR@/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="LD_LIBRARY_PATH=@INSTALL_DIR@/runtime/lib"
+Environment="TZ=@TIMEZONE@"
 ExecStart=@INSTALL_DIR@/water --config @CONFIG_FILE@
 Restart=on-failure
 RestartSec=5s

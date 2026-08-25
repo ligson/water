@@ -17,6 +17,7 @@ SERVICE_GROUP=""
 HTTP_ADDR=""
 ENV_SOURCE=""
 START_SERVICE=1
+TIMEZONE=""
 
 usage() {
   cat <<'EOF'
@@ -195,6 +196,8 @@ legacy_data_dir="$(env_value WATER_DATA_DIR)"
 legacy_database_path="$(env_value WATER_DATABASE_PATH)"
 legacy_document_engine="$(env_value WATER_DOCUMENT_ENGINE)"
 legacy_document_python="$(env_value WATER_DOCUMENT_PYTHON)"
+legacy_timezone="$(env_value TZ)"
+TIMEZONE="${legacy_timezone:-Asia/Shanghai}"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   config_http_addr="${HTTP_ADDR:-${legacy_http_addr:-:8080}}"
@@ -216,9 +219,9 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     "  python: \"$config_document_python\"" > "$CONFIG_FILE"
 fi
 
-if grep -qE '^(WATER_HTTP_ADDR|WATER_DATA_DIR|WATER_DATABASE_PATH|WATER_DOCUMENT_ENGINE|WATER_DOCUMENT_PYTHON)=' "$ENV_FILE"; then
+if grep -qE '^(HOME|PATH|LD_LIBRARY_PATH|TZ|WATER_HTTP_ADDR|WATER_DATA_DIR|WATER_DATABASE_PATH|WATER_DOCUMENT_ENGINE|WATER_DOCUMENT_PYTHON|WATER_WORKSPACE_DIR|WATER_WORKSPACE_HOST_PATH|WATER_UID|WATER_GID|WATER_WEB_BIND_ADDRESS|WATER_WEB_PORT|WATER_IMAGE_TAG|WATER_BE_IMAGE_TAG|WATER_FE_IMAGE_TAG)=' "$ENV_FILE"; then
   env_temp="$(mktemp "$CONFIG_DIR/.water.env.XXXXXX")"
-  awk '!/^(WATER_HTTP_ADDR|WATER_DATA_DIR|WATER_DATABASE_PATH|WATER_DOCUMENT_ENGINE|WATER_DOCUMENT_PYTHON)=/' "$ENV_FILE" > "$env_temp"
+  awk '!/^(HOME|PATH|LD_LIBRARY_PATH|TZ|WATER_HTTP_ADDR|WATER_DATA_DIR|WATER_DATABASE_PATH|WATER_DOCUMENT_ENGINE|WATER_DOCUMENT_PYTHON|WATER_WORKSPACE_DIR|WATER_WORKSPACE_HOST_PATH|WATER_UID|WATER_GID|WATER_WEB_BIND_ADDRESS|WATER_WEB_PORT|WATER_IMAGE_TAG|WATER_BE_IMAGE_TAG|WATER_FE_IMAGE_TAG)=/' "$ENV_FILE" > "$env_temp"
   install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$env_temp" "$ENV_FILE"
   rm -f "$env_temp"
 fi
@@ -239,6 +242,7 @@ sed \
   -e "s|@INSTALL_DIR@|$INSTALL_DIR|g" \
   -e "s|@CONFIG_FILE@|$CONFIG_FILE|g" \
   -e "s|@DATA_DIR@|$DATA_DIR|g" \
+  -e "s|@TIMEZONE@|$TIMEZONE|g" \
   "$SCRIPT_DIR/water.service" > "$service_temp"
 install -m 0644 "$service_temp" "$CONFIG_DIR/$SERVICE_NAME.service"
 rm -f "$service_temp"
