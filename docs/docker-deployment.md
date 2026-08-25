@@ -1,6 +1,6 @@
 # Docker 部署
 
-若水由两个容器组成：`water-be` 运行 Go 后端与 Agent 工具，`water-fe` 使用 Nginx 提供静态页面并同源代理 HTTP API 和 WebSocket。SQLite、Skills、会话和 Provider 配置保存在宿主机数据目录中，不写入镜像。
+若水现在由一个容器组成：Go 二进制同时提供 API、任务/终端 WebSocket 和内嵌的 Vue 静态页面。SQLite、Skills、会话和 Provider 配置保存在宿主机数据目录中，不写入镜像。
 
 ## 安全边界
 
@@ -15,11 +15,10 @@
 在仓库根目录执行：
 
 ```bash
-docker build --platform linux/amd64 -f water-be/docker/Dockerfile -t ligson/water-be:latest .
-docker build --platform linux/amd64 -f water-fe/Dockerfile -t ligson/water-fe:latest .
+docker build --platform linux/amd64 --build-arg VERSION=dev -f water-be/docker/Dockerfile -t ligson/water:latest .
 ```
 
-后端运行镜像预置 Go、Node.js、npm、Python 3、Git、SSH client、curl、ripgrep、jq 和常用编译工具。项目额外依赖仍应由对应工作区自行声明和安装。
+镜像构建阶段会先执行前端 `npm run build`，再把 `dist/` 嵌入 Go 二进制。运行镜像预置 Go、Node.js、npm、Python 3、Git、SSH client、curl、ripgrep、jq 和常用编译工具。项目额外依赖仍应由对应工作区自行声明和安装。
 
 ## 部署目录
 
@@ -46,7 +45,7 @@ docker compose --env-file .env -f docker-compose.yml ps
 curl -fsS http://127.0.0.1:13013/api/health
 ```
 
-默认只允许部署主机通过 `http://127.0.0.1:13013` 访问。可信内网可显式设置 `WATER_WEB_BIND_ADDRESS=0.0.0.0` 后访问 `http://<部署主机>:13013`；跨主机或公网使用时，应保持本机绑定并通过 HTTPS 反向代理访问。Nginx 已对 `/ws/` 配置 Upgrade、长连接超时和关闭缓冲，可保持任务与终端 WebSocket 流。
+默认只允许部署主机通过 `http://127.0.0.1:13013` 访问。可信内网可显式设置 `WATER_WEB_BIND_ADDRESS=0.0.0.0` 后访问 `http://<部署主机>:13013`；跨主机或公网使用时，应保持本机绑定并通过 HTTPS 反向代理访问。单体 Go 服务直接处理 `/ws/` WebSocket 长连接；若前面还有反向代理，需透传 Upgrade、关闭代理缓冲并放宽长连接超时。
 
 模型服务位于 NAS 宿主机时，Provider 地址可使用 `http://host.docker.internal:<端口>/v1`；模型服务位于同一个 Docker 网络时，使用对应容器服务名。不要在容器中使用 `127.0.0.1` 指向宿主机模型。
 

@@ -3,10 +3,21 @@
 ARG GO_BASE=golang:1.26-bookworm
 ARG RUNTIME_BASE=node:22-bookworm-slim
 
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS frontend-build
+
+WORKDIR /src/water-fe
+
+COPY water-fe/package.json water-fe/package-lock.json ./
+RUN npm ci
+
+COPY water-fe/ ./
+RUN npm run build
+
 FROM --platform=$BUILDPLATFORM ${GO_BASE} AS build
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION=dev
 
 WORKDIR /src
 
@@ -14,9 +25,10 @@ COPY water-be/go.mod water-be/go.sum ./
 RUN go mod download
 
 COPY water-be/ ./
+COPY --from=frontend-build /src/water-fe/dist ./internal/web/dist
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -trimpath \
-    -ldflags="-s -w" \
+    -ldflags="-s -w -X main.buildVersion=${VERSION}" \
     -o /out/water \
     ./cmd/water
 

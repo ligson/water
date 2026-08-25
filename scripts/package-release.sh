@@ -7,6 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERSION="${1:-}"
 OUTPUT_DIR="$PROJECT_ROOT/output/release"
 STAGING_ROOT="$PROJECT_ROOT/output/release-staging"
+EMBED_DIR="$PROJECT_ROOT/water-be/internal/web/dist"
 
 if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
   printf '版本必须使用 SemVer 标签，例如 v0.1.0 或 v0.1.0-rc.1。\n' >&2
@@ -22,7 +23,12 @@ done
 
 rm -rf "$OUTPUT_DIR" "$STAGING_ROOT"
 mkdir -p "$OUTPUT_DIR" "$STAGING_ROOT"
-trap 'rm -rf "$STAGING_ROOT"' EXIT
+restore_embed_dir() {
+  rm -rf "$EMBED_DIR"
+  mkdir -p "$EMBED_DIR"
+  printf '%s\n' 'The production frontend is generated here before building the single Water binary.' > "$EMBED_DIR/placeholder.txt"
+}
+trap 'restore_embed_dir; rm -rf "$STAGING_ROOT"' EXIT
 
 printf '构建前端生产包...\n'
 (
@@ -31,15 +37,9 @@ printf '构建前端生产包...\n'
   npm run build
 )
 
-frontend_name="water-fe_${VERSION}"
-frontend_stage="$STAGING_ROOT/$frontend_name"
-mkdir -p "$frontend_stage"
-cp -R "$PROJECT_ROOT/water-fe/dist" "$frontend_stage/dist"
-cp "$PROJECT_ROOT/water-fe/README.md" "$frontend_stage/README.md"
-cp "$PROJECT_ROOT/water-fe/docker/nginx.conf" "$frontend_stage/nginx.conf"
-cp "$PROJECT_ROOT/LICENSE" "$frontend_stage/LICENSE"
-printf '%s\n' "$VERSION" > "$frontend_stage/VERSION"
-tar -C "$STAGING_ROOT" -czf "$OUTPUT_DIR/${frontend_name}.tar.gz" "$frontend_name"
+rm -rf "$EMBED_DIR"
+mkdir -p "$EMBED_DIR"
+cp -R "$PROJECT_ROOT/water-fe/dist/." "$EMBED_DIR/"
 
 targets=(
   "linux amd64"
@@ -50,24 +50,36 @@ targets=(
 
 for target in "${targets[@]}"; do
   read -r target_os target_arch <<< "$target"
-  package_name="water-be_${VERSION}_${target_os}_${target_arch}"
+  package_name="water_${VERSION}_${target_os}_${target_arch}"
   package_stage="$STAGING_ROOT/$package_name"
   mkdir -p "$package_stage"
 
-  printf '构建后端：%s/%s...\n' "$target_os" "$target_arch"
+  printf '构建单体二进制：%s/%s...\n' "$target_os" "$target_arch"
   (
     cd "$PROJECT_ROOT/water-be"
     CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" go build \
       -trimpath \
-      -ldflags="-s -w" \
+      -ldflags="-s -w -X main.buildVersion=$VERSION" \
       -o "$package_stage/water" \
       ./cmd/water
   )
 
-  cp "$PROJECT_ROOT/water-be/README.md" "$package_stage/README.md"
   cp "$PROJECT_ROOT/LICENSE" "$package_stage/LICENSE"
   printf '%s\n' "$VERSION" > "$package_stage/VERSION"
-  tar -C "$STAGING_ROOT" -czf "$OUTPUT_DIR/${package_name}.tar.gz" "$package_name"
+
+  if [[ "$target_os" == "linux" ]]; then
+    cp "$PROJECT_ROOT/packaging/linux/README.md" "$package_stage/README.md"
+    cp "$PROJECT_ROOT/README.md" "$package_stage/PROJECT_README.md"
+    cp "$PROJECT_ROOT/packaging/linux/install.sh" "$package_stage/install.sh"
+    cp "$PROJECT_ROOT/packaging/linux/uninstall.sh" "$package_stage/uninstall.sh"
+    cp "$PROJECT_ROOT/packaging/linux/water.service" "$package_stage/water.service"
+    cp "$PROJECT_ROOT/packaging/linux/water.env.example" "$package_stage/water.env.example"
+    chmod 0755 "$package_stage/install.sh" "$package_stage/uninstall.sh"
+  else
+    cp "$PROJECT_ROOT/README.md" "$package_stage/README.md"
+  fi
+
+  COPYFILE_DISABLE=1 tar -C "$STAGING_ROOT" -czf "$OUTPUT_DIR/${package_name}.tar.gz" "$package_name"
 done
 
 (

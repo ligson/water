@@ -21,6 +21,8 @@
 /water-be/water
 /water-fe/dist/
 /water-fe/node_modules/
+/water-be/internal/web/dist/*
+!/water-be/internal/web/dist/placeholder.txt
 
 # OS/editor noise
 .DS_Store

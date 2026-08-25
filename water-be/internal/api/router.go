@@ -19,18 +19,20 @@ import (
 	"github.com/ligson/water/water-be/internal/requestid"
 	"github.com/ligson/water/water-be/internal/skill"
 	"github.com/ligson/water/water-be/internal/task"
+	"github.com/ligson/water/water-be/internal/web"
 )
 
 type Router struct {
-	db     *sql.DB
-	cfg    config.Config
-	logger *slog.Logger
-	hub    *realtime.Hub
-	agent  *agent.Runner
-	auth   *auth.Store
-	skills *skill.Store
-	mu     sync.Mutex
-	cancel map[string]taskRun
+	db       *sql.DB
+	cfg      config.Config
+	logger   *slog.Logger
+	hub      *realtime.Hub
+	agent    *agent.Runner
+	auth     *auth.Store
+	skills   *skill.Store
+	frontend http.Handler
+	mu       sync.Mutex
+	cancel   map[string]taskRun
 }
 
 type taskRun struct {
@@ -40,13 +42,14 @@ type taskRun struct {
 
 func NewRouter(db *sql.DB, cfg config.Config, logger *slog.Logger) http.Handler {
 	r := &Router{
-		db:     db,
-		cfg:    cfg,
-		logger: logger,
-		hub:    realtime.NewHub(),
-		auth:   auth.NewStore(db),
-		skills: skill.NewStore(db, cfg.DataDir),
-		cancel: make(map[string]taskRun),
+		db:       db,
+		cfg:      cfg,
+		logger:   logger,
+		hub:      realtime.NewHub(),
+		auth:     auth.NewStore(db),
+		skills:   skill.NewStore(db, cfg.DataDir),
+		frontend: web.Handler(),
+		cancel:   make(map[string]taskRun),
 	}
 	r.agent = agent.NewRunner(db, r.appendTaskEvent)
 	r.recoverInterruptedRunningTurns(context.Background())
@@ -123,6 +126,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			r.handleWorkspaceByID(w, req, strings.TrimPrefix(req.URL.Path, "/api/workspaces/"))
 			return
 		}
+		if !strings.HasPrefix(req.URL.Path, "/api/") && !strings.HasPrefix(req.URL.Path, "/ws/") {
+			r.frontend.ServeHTTP(w, req)
+			return
+		}
 		WriteError(req.Context(), w, http.StatusNotFound, "not found")
 	}
 }
@@ -135,7 +142,7 @@ func (r *Router) isPublicRoute(path string) bool {
 	if path == "/api/health" || path == "/api/auth/status" || path == "/api/auth/unlock" {
 		return true
 	}
-	return false
+	return !strings.HasPrefix(path, "/api/") && !strings.HasPrefix(path, "/ws/")
 }
 
 func (r *Router) requireAuth(w http.ResponseWriter, req *http.Request) bool {

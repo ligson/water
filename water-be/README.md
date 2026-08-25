@@ -8,6 +8,15 @@ Water 后端使用 Go 构建，第一阶段目标是提供最小 HTTP 服务、S
 go run ./cmd/water
 ```
 
+`go run` 适合后端开发调试。生产运行或想使用同一个端口同时提供前端和后端时，在仓库根目录执行：
+
+```bash
+./scripts/build-single-binary.sh dev water-be/bin/water
+WATER_ACCESS_PIN=123456 ./water-be/bin/water
+```
+
+该脚本先构建 `water-fe/dist`，再通过 Go `embed` 编译进 `water`；运行时不需要前端目录、Node.js 或 Nginx。访问 `http://127.0.0.1:8080` 即可打开若水工作台。
+
 默认配置：
 
 - HTTP 地址：`:8080`

@@ -8,14 +8,15 @@
 
 | 产物 | 目标平台 |
 | --- | --- |
-| `water-be_<version>_linux_amd64.tar.gz` | Linux x86-64 |
-| `water-be_<version>_linux_arm64.tar.gz` | Linux ARM64 |
-| `water-be_<version>_darwin_amd64.tar.gz` | macOS Intel |
-| `water-be_<version>_darwin_arm64.tar.gz` | macOS Apple Silicon |
-| `water-fe_<version>.tar.gz` | 架构无关的前端静态资源 |
+| `water_<version>_linux_amd64.tar.gz` | Linux x86-64，前后端单体二进制 + systemd 安装文件 |
+| `water_<version>_linux_arm64.tar.gz` | Linux ARM64，前后端单体二进制 + systemd 安装文件 |
+| `water_<version>_darwin_amd64.tar.gz` | macOS Intel，前后端单体二进制 |
+| `water_<version>_darwin_arm64.tar.gz` | macOS Apple Silicon，前后端单体二进制 |
 | `checksums.txt` | 所有压缩包的 SHA-256 |
 
-产物同时保留为 GitHub Actions Artifact，并发布到对应标签的 GitHub Release。Release 说明严格取自根目录 `CHANGELOG.md` 的对应版本章节。后端使用 `CGO_ENABLED=0` 交叉编译，SQLite migration 已嵌入二进制；前端包包含 Vite 构建后的 `dist/` 和可复用的 `nginx.conf`，需要由 Nginx 等静态服务器托管并代理 `/api/` 与 `/ws/`。
+产物同时保留为 GitHub Actions Artifact，并发布到对应标签的 GitHub Release。Release 说明严格取自根目录 `CHANGELOG.md` 的对应版本章节。脚本先构建 Vue `dist/`，再使用 Go `embed` 编译进每个平台的 `water` 二进制；SQLite migration 同样嵌入二进制，运行时不需要单独的前端目录或 Nginx。
+
+Linux 包额外包含 `install.sh`、`uninstall.sh`、`water.service`、`water.env.example`、安装版 `README.md` 和项目总览 `PROJECT_README.md`。`install.sh` 会安装到 `/opt/water`，配置写入 `/etc/water/water.env`，数据默认写入 `/var/lib/water`，升级时保留配置和数据库。普通 Linux 可自动创建默认低权限账户；Synology 等缺少 `useradd` 的系统需传入已有用户和组。安装器不会自动修改工作区所有权。
 
 ## CHANGELOG 格式
 
@@ -47,6 +48,12 @@
 
 ```bash
 ./scripts/package-release.sh v0.1.0
+```
+
+本地只生成一个可运行的单体二进制：
+
+```bash
+./scripts/build-single-binary.sh dev water-be/bin/water
 ```
 
 可在打标签前预览将要发布的 Release 说明：

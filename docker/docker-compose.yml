@@ -1,7 +1,7 @@
 services:
-  water-be:
-    image: ligson/water-be:${WATER_BE_IMAGE_TAG:-latest}
-    container_name: water-be
+  water:
+    image: ligson/water:${WATER_IMAGE_TAG:-latest}
+    container_name: water
     restart: unless-stopped
     init: true
     user: "${WATER_UID:-1026}:${WATER_GID:-100}"
@@ -17,38 +17,15 @@ services:
     volumes:
       - ./data:/data
       - ${WATER_WORKSPACE_HOST_PATH:?set WATER_WORKSPACE_HOST_PATH in the remote .env file}:/workspace
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    security_opt:
-      - no-new-privileges:true
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    networks:
-      - mynetwork
-
-  water-fe:
-    image: ligson/water-fe:${WATER_FE_IMAGE_TAG:-latest}
-    container_name: water-fe
-    restart: unless-stopped
-    depends_on:
-      - water-be
     ports:
-      - "${WATER_WEB_BIND_ADDRESS:-127.0.0.1}:${WATER_WEB_PORT:-13013}:80"
+      - "${WATER_WEB_BIND_ADDRESS:-127.0.0.1}:${WATER_WEB_PORT:-13013}:8080"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 5s
     security_opt:
       - no-new-privileges:true
-    networks:
-      - mynetwork
-
-networks:
-  mynetwork:
-    external: true

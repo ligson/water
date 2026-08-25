@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-25
+
+- 将前端生产构建通过 Go `embed` 内嵌到单个 Water 二进制；新增单体构建脚本，统一提供 Vue 页面、HTTP API 和两个 WebSocket 通道。
+- 发版包和 Docker Compose 收敛为单体部署：每个平台提供一个包含前端的 `water` 二进制，不再依赖独立前端容器或 Nginx 静态资源目录。
+- Linux 发版包新增 `install.sh`、`uninstall.sh`、systemd unit、环境示例和安装说明；安装/升级默认保留配置与 SQLite 数据。
+- 发布打包禁用 macOS 扩展属性，避免 Linux 解压时出现 `LIBARCHIVE.xattr` 警告。
+
 ## [0.1.1] - 2026-08-16
 
 - GitHub Release 说明改为从 `CHANGELOG.md` 的对应版本章节严格提取；缺少版本章节时发版工作流会失败，避免发布空白或仅包含提交列表的说明。

@@ -39,7 +39,7 @@
 - **Harness 优先**：模型只是引擎，真正的可靠性来自工具边界、权限策略、审批、审计和可中断执行。
 - **可观测优先**：模型说了什么、调用了什么工具、写了什么文件、为何等待审批，都应该能被看到和回放。
 - **安全默认**：文件写入、命令执行、Python 执行、网络访问等高风险动作默认进入权限判断和审批流程。
-- **简单可维护**：后端保持 Go，前端保持 Vue/TypeScript，不引入不必要的复杂服务边界。
+- **简单可维护**：源码保持 Go + Vue/TypeScript 的清晰边界，生产构建将前端内嵌到 Go 二进制，不引入额外前端运行服务。
 
 ## 核心能力
 
@@ -94,9 +94,9 @@
 
 ```mermaid
 flowchart LR
-  User["用户 / 浏览器"] --> FE["water-fe<br/>Vue 3 + TypeScript"]
-  FE -->|HTTP JSON Envelope| API["water-be API<br/>Go"]
-  FE <-->|WebSocket Task Events| WS["Realtime Hub"]
+  User["用户 / 浏览器"] --> App["water 单体二进制<br/>Go + embedded Vue"]
+  App -->|HTTP JSON Envelope| API["API Router"]
+  App <-->|WebSocket Task Events| WS["Realtime Hub"]
   API --> Store["SQLite<br/>workspace / task / event / approval"]
   API --> Agent["Agent Loop"]
   Agent --> Harness["Harness<br/>权限 / 工具 / 审批 / 审计"]
@@ -167,6 +167,15 @@ WATER_ACCESS_PIN=123456 ./scripts/start-all.sh
 
 ### 手动启动
 
+生产/单体模式会把前端构建产物编译进同一个 Go 二进制：
+
+```bash
+./scripts/build-single-binary.sh dev water-be/bin/water
+WATER_ACCESS_PIN=123456 ./water-be/bin/water
+```
+
+打开 `http://127.0.0.1:8080` 即可同时访问前端、HTTP API 和 WebSocket。`go run ./cmd/water` 适合后端开发调试；如果尚未准备 embed 资源，根路径会提示先执行单体构建脚本。
+
 后端：
 
 ```bash
@@ -184,11 +193,10 @@ VITE_API_BASE=http://127.0.0.1:8080 npm run dev
 
 ### Docker 部署
 
-仓库提供独立的后端与前端镜像，以及 `docker/docker-compose.yml` 部署模板。真实访问 PIN、宿主机工作区路径和运行数据只保存在部署主机，不进入 Git：
+仓库提供包含前后端单体二进制的镜像，以及 `docker/docker-compose.yml` 部署模板。真实访问 PIN、宿主机工作区路径和运行数据只保存在部署主机，不进入 Git：
 
 ```bash
-docker build --platform linux/amd64 -f water-be/docker/Dockerfile -t ligson/water-be:latest .
-docker build --platform linux/amd64 -f water-fe/Dockerfile -t ligson/water-fe:latest .
+docker build --platform linux/amd64 --build-arg VERSION=dev -f water-be/docker/Dockerfile -t ligson/water:latest .
 ```
 
 部署时必须显式挂载一个受控工作区目录。不要挂载宿主机根目录、Docker Socket 或 SSH 私钥目录。完整配置、升级和备份说明见 [Docker 部署](docs/docker-deployment.md)。
@@ -252,6 +260,7 @@ water/
 - [前端说明](water-fe/README.md)
 - [开发脚本](scripts/README.md)
 - [Docker 部署](docs/docker-deployment.md)
+- [Linux systemd 部署](docs/systemd-deployment.md)
 - [发版流程](docs/releasing.md)
 
 ## 开发命令
@@ -275,6 +284,8 @@ npm run build
 推送 `vMAJOR.MINOR.PATCH` 标签会触发 GitHub Actions：运行后端测试，构建 Linux/macOS 的 amd64、arm64 后端包和架构无关的前端静态包，生成 SHA-256，并使用 `CHANGELOG.md` 对应版本章节发布 GitHub Release。
 
 完整版本规则、产物列表和本地打包方式见 [发版流程](docs/releasing.md)。
+
+Linux Release 包包含 `install.sh` 和 systemd 服务文件。解压后可以按包内 `INSTALL.md` 安装为 `water.service`；安装器会保留 `/etc/water/water.env` 和 SQLite 数据，升级时只替换二进制。
 
 ## 安全模型
 

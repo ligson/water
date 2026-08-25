@@ -16,10 +16,13 @@ import (
 	"github.com/ligson/water/water-be/internal/store"
 )
 
+var buildVersion = "dev"
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+	logger.Info("若水 starting", "version", buildVersion)
 
 	cfg := config.Load()
 
