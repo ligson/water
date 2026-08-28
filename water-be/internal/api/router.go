@@ -17,22 +17,24 @@ import (
 	"github.com/ligson/water/water-be/internal/event"
 	"github.com/ligson/water/water-be/internal/realtime"
 	"github.com/ligson/water/water-be/internal/requestid"
+	"github.com/ligson/water/water-be/internal/schedule"
 	"github.com/ligson/water/water-be/internal/skill"
 	"github.com/ligson/water/water-be/internal/task"
 	"github.com/ligson/water/water-be/internal/web"
 )
 
 type Router struct {
-	db       *sql.DB
-	cfg      config.Config
-	logger   *slog.Logger
-	hub      *realtime.Hub
-	agent    *agent.Runner
-	auth     *auth.Store
-	skills   *skill.Store
-	frontend http.Handler
-	mu       sync.Mutex
-	cancel   map[string]taskRun
+	db        *sql.DB
+	cfg       config.Config
+	logger    *slog.Logger
+	hub       *realtime.Hub
+	agent     *agent.Runner
+	auth      *auth.Store
+	skills    *skill.Store
+	scheduler *schedule.Scheduler
+	frontend  http.Handler
+	mu        sync.Mutex
+	cancel    map[string]taskRun
 }
 
 type taskRun struct {
@@ -53,6 +55,23 @@ func NewRouter(db *sql.DB, cfg config.Config, logger *slog.Logger) http.Handler 
 	}
 	r.agent = agent.NewRunner(db, r.appendTaskEvent, agent.WithDocumentConfig(cfg.DocumentEngine, cfg.DocumentPython))
 	r.recoverInterruptedRunningTurns(context.Background())
+	scheduleStore := schedule.NewStore(db)
+	if err := scheduleStore.RecoverStaleRuns(context.Background()); err != nil {
+		logger.Error("recover scheduled task runs", "error", err)
+	}
+	r.scheduler = schedule.NewScheduler(
+		scheduleStore,
+		r.executeScheduledRun,
+		logger,
+		schedule.WithResultResolver(func(ctx context.Context, taskID string) string {
+			return latestScheduledResult(ctx, r, taskID)
+		}),
+	)
+	if items, err := scheduleStore.List(context.Background(), ""); err != nil {
+		logger.Error("load scheduled tasks", "error", err)
+	} else if len(items) > 0 {
+		r.scheduler.Start(context.Background())
+	}
 
 	return requestid.Middleware(corsMiddleware(r))
 }
@@ -75,6 +94,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.handleWorkspaces(w, req)
 	case "/api/skills":
 		r.handleSkills(w, req)
+	case "/api/scheduled-tasks":
+		r.handleScheduledTasks(w, req)
 	case "/api/skills/install":
 		if req.Method != http.MethodPost {
 			WriteError(req.Context(), w, http.StatusMethodNotAllowed, "method not allowed")
@@ -108,6 +129,14 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		if strings.HasPrefix(req.URL.Path, "/api/tasks/") {
 			r.handleTaskByID(w, req, strings.TrimPrefix(req.URL.Path, "/api/tasks/"))
+			return
+		}
+		if strings.HasPrefix(req.URL.Path, "/api/scheduled-tasks/") {
+			r.handleScheduledTaskByID(w, req, strings.TrimPrefix(req.URL.Path, "/api/scheduled-tasks/"))
+			return
+		}
+		if strings.HasPrefix(req.URL.Path, "/api/scheduled-task-runs/") {
+			r.handleScheduledTaskRunByID(w, req, strings.TrimPrefix(req.URL.Path, "/api/scheduled-task-runs/"))
 			return
 		}
 		if strings.HasPrefix(req.URL.Path, "/api/approvals/") {

@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { message } from 'ant-design-vue'
 import {
   ArrowRight,
+  CalendarClock,
   ChevronLeft,
   ChevronDown,
   CheckCircle,
@@ -38,6 +39,7 @@ import {
 import MarkdownIt from 'markdown-it'
 import WaterAuthScene from './components/auth/WaterAuthScene.vue'
 import ServerTerminalPanel from './components/terminal/ServerTerminalPanel.vue'
+import ScheduledTasksPanel from './components/schedule/ScheduledTasksPanel.vue'
 import {
   api,
   clearAccessToken,
@@ -2586,6 +2588,20 @@ async function refreshEvents() {
   connectTaskSocket()
 }
 
+async function openScheduledTask(taskId: string) {
+  try {
+    const data = await api.listTasks(selectedWorkspaceId.value)
+    tasks.value = data.items
+    if (!tasks.value.some((item) => item.id === taskId)) {
+      message.warning('对应任务已被删除或不属于当前工作区')
+      return
+    }
+    selectedTaskId.value = taskId
+  } catch (err) {
+    showError(err)
+  }
+}
+
 function selectProviderModel(item: ProviderModelOption) {
   providerForm.model = item.id
 }
@@ -4482,6 +4498,21 @@ onBeforeUnmount(() => {
               :workspace-id="selectedWorkspaceId"
               :workspace-name="selectedWorkspace?.name"
               :active="rightTab === 'terminal' && !rightPanelCollapsed"
+            />
+          </a-tab-pane>
+
+          <a-tab-pane key="schedule">
+            <template #tab>
+              <span class="right-tab-label">
+                <CalendarClock :size="14" />
+                自动
+              </span>
+            </template>
+            <ScheduledTasksPanel
+              :workspace-id="selectedWorkspaceId"
+              :workspaces="workspaces"
+              :active="rightTab === 'schedule' && !rightPanelCollapsed"
+              @open-task="openScheduledTask"
             />
           </a-tab-pane>
 

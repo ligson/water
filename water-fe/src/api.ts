@@ -68,6 +68,43 @@ export interface TaskEvent {
   payloadJson?: string
 }
 
+export interface ScheduledTask {
+  id: string
+  workspaceId: string
+  name: string
+  prompt: string
+  scheduleType: 'daily' | 'interval'
+  scheduleExpression: string
+  timezone: string
+  enabled: boolean
+  concurrencyPolicy: 'skip'
+  approvalPolicy: 'pause'
+  maxRetries: number
+  retryIntervalSeconds: number
+  nextRunAt?: string
+  lastRunAt?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ScheduledTaskRun {
+  id: string
+  scheduledTaskId: string
+  taskId?: string
+  turnId?: string
+  triggerType: 'scheduled' | 'manual' | 'retry'
+  status: string
+  scheduledAt: string
+  startedAt?: string
+  finishedAt?: string
+  attempt: number
+  promptSnapshot: string
+  resultSummary: string
+  errorMessage: string
+  createdAt: string
+  updatedAt: string
+}
+
 export interface TurnAttachmentInput {
   name: string
   mimeType: string
@@ -333,6 +370,43 @@ export const api = {
     }),
   listTaskEvents: (taskId: string) =>
     request<{ items: TaskEvent[] }>(`/api/tasks/${taskId}/events`),
+
+  listScheduledTasks: (workspaceId = '') =>
+    request<{ items: ScheduledTask[] }>(
+      `/api/scheduled-tasks${workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''}`,
+    ),
+  createScheduledTask: (body: Record<string, unknown>) =>
+    request<ScheduledTask>('/api/scheduled-tasks', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateScheduledTask: (scheduledTaskId: string, body: Record<string, unknown>) =>
+    request<ScheduledTask>(`/api/scheduled-tasks/${scheduledTaskId}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  deleteScheduledTask: (scheduledTaskId: string) =>
+    request<Record<string, never>>(`/api/scheduled-tasks/${scheduledTaskId}`, {
+      method: 'DELETE',
+    }),
+  setScheduledTaskEnabled: (scheduledTaskId: string, enabled: boolean) =>
+    request<ScheduledTask>(`/api/scheduled-tasks/${scheduledTaskId}/${enabled ? 'enable' : 'disable'}`, {
+      method: 'POST',
+    }),
+  runScheduledTaskNow: (scheduledTaskId: string) =>
+    request<ScheduledTaskRun>(`/api/scheduled-tasks/${scheduledTaskId}/run-now`, {
+      method: 'POST',
+    }),
+  listScheduledTaskRuns: (scheduledTaskId: string, limit = 50) =>
+    request<{ items: ScheduledTaskRun[] }>(
+      `/api/scheduled-tasks/${scheduledTaskId}/runs?limit=${limit}`,
+    ),
+  getScheduledTaskRun: (runId: string) =>
+    request<ScheduledTaskRun>(`/api/scheduled-task-runs/${runId}`),
+  cancelScheduledTaskRun: (runId: string) =>
+    request<ScheduledTaskRun>(`/api/scheduled-task-runs/${runId}/cancel`, {
+      method: 'POST',
+    }),
 
   listApprovals: (workspaceId: string, status = 'pending') =>
     request<{ items: Approval[] }>(`/api/workspaces/${workspaceId}/approvals?status=${status}`),
